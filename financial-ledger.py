@@ -317,9 +317,15 @@ if st.sidebar.button("✏️ Edit Transaction", use_container_width=True):
 
 st.sidebar.divider()
 
-light_mode_toggle = st.sidebar.toggle("Light Mode", value=st.session_state.light_mode)
-if light_mode_toggle != st.session_state.light_mode:
-    st.session_state.light_mode = light_mode_toggle
+theme_choice = st.sidebar.select_slider(
+    "Theme Mode", 
+    options=["Dark", "Light"], 
+    value="Light" if st.session_state.light_mode else "Dark"
+)
+
+new_light_mode = (theme_choice == "Light")
+if new_light_mode != st.session_state.light_mode:
+    st.session_state.light_mode = new_light_mode
     st.rerun()
 
 st.sidebar.title("Financial Accounts")
