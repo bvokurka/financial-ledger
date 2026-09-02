@@ -22,105 +22,28 @@ conn = st.connection("supabase", type=SupabaseConnection)
 
 st.set_page_config(page_title="Multi-Account Financial Ledger", layout="wide")
 
-# --- THEME STATE MANAGEMENT ---
-if "light_mode" not in st.session_state:
-    st.session_state.light_mode = False
-
-# Define theme colors based on toggle state
-if st.session_state.light_mode:
-    bg_color = "#ffffff"
-    container_bg = "#f9fafb"
-    border_color = "#e5e7eb"
-    text_color = "#111827"
-    sub_text = "#4b5563"
-    grid_header_bg = "#f3f4f6"
-    widget_bg = "#ffffff"
-else:
-    bg_color = "#0e1117"
-    container_bg = "#161b22"
-    border_color = "#30363d"
-    text_color = "#e6edf3"
-    sub_text = "#8b949e"
-    grid_header_bg = "#161b22"
-    widget_bg = "#0e1117"
-
-# --- CUSTOM CSS FOR SPREADSHEET GRID, THEMES, AND WIDGET OVERRIDES ---
-st.markdown(f"""
+# --- CUSTOM CSS FOR STRUCTURAL FIXES ---
+st.markdown("""
 <style>
-/* App background */
-.stApp {{
-    background-color: {bg_color} !important;
-}}
-
-/* Force typography colors across all elements */
-.stApp p, .stApp h1, .stApp h2, .stApp h3, .stApp span, .stApp label, .stApp div {{
-    color: {text_color};
-}}
-
-/* Fix Sidebar Background */
-[data-testid="stSidebar"] {{
-    background-color: {container_bg} !important;
-    border-right: 1px solid {border_color} !important;
-}}
-
-/* Fix Metrics */
-[data-testid="stMetricValue"] div, [data-testid="stMetricLabel"] p, [data-testid="stMetricDelta"] div {{
-    color: {text_color} !important;
-}}
-
-/* Fix Alerts */
-div[data-testid="stAlert"] p, div[data-testid="stAlert"] span {{
-    color: {text_color} !important; 
-}}
-
-/* Calendar Container & Border Overrides */
-[data-testid="stVerticalBlockBorderWrapper"] {{
-    background-color: {container_bg} !important;
-    border: 1px solid {border_color} !important;
-    border-radius: 0px !important;
-    padding: 2px !important;
-    margin: -1px !important;
-    min-height: 110px !important;
-}}
-
-[data-testid="stVerticalBlockBorderWrapper"] p, [data-testid="stVerticalBlockBorderWrapper"] span {{
-    color: {text_color} !important;
-}}
-
 /* Reduce column gaps so cells touch like Excel */
-[data-testid="stHorizontalBlock"] {{
+[data-testid="stHorizontalBlock"] {
     gap: 0px !important;
-}}
+}
 
 /* Custom style for the green Add Transaction button */
-[data-testid="stSidebar"] button[kind="primary"] {{
+[data-testid="stSidebar"] button[kind="primary"] {
     background-color: #2ea043 !important;
     color: #ffffff !important;
     border-color: #2ea043 !important;
     font-weight: bold !important;
-}}
-[data-testid="stSidebar"] button[kind="primary"]:hover {{
+}
+[data-testid="stSidebar"] button[kind="primary"]:hover {
     background-color: #2c974b !important;
     color: #ffffff !important;
-}}
-
-/* Fix Selectboxes and Inputs */
-[data-baseweb="select"] > div, [data-testid="stSelectbox"] div[data-baseweb="select"] {{
-    background-color: {widget_bg} !important;
-    color: {text_color} !important;
-    border-color: {border_color} !important;
-}}
-
-/* DataFrame Wrapper Theming */
-.dataframe-container {{
-    background-color: {widget_bg};
-    border: 1px solid {border_color};
-    padding: 8px;
-    border-radius: 4px;
-}}
+}
 
 /* Hide the Streamlit helper text input without breaking React */
-div[data-testid="stTextInput"]:has(input[aria-label*="sync_merchant_"]) {{
+div[data-testid="stTextInput"]:has(input[aria-label*="sync_merchant_"]) {
     position: absolute !important;
     opacity: 0 !important;
     width: 1px !important;
@@ -129,7 +52,7 @@ div[data-testid="stTextInput"]:has(input[aria-label*="sync_merchant_"]) {{
     pointer-events: none !important;
     margin: 0 !important;
     padding: 0 !important;
-}}
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -152,14 +75,14 @@ def merchant_autocomplete_input(default_value="", key_suffix=""):
     unique_id = f"merchant_dl_{key_suffix}"
     sync_key = f"sync_merchant_{key_suffix}"
     
-    st.markdown(f"""
+    st.markdown("""
         <div style="margin-bottom: 4px;">
-            <label style="font-size: 14px; font-weight: 400; color: {text_color};">Merchant</label>
+            <label style="font-size: 14px; font-weight: 400; color: var(--text-color);">Merchant</label>
         </div>
     """, unsafe_allow_html=True)
     
     html_code = f"""
-        <input list="{unique_id}" id="input_{unique_id}" value="{default_value}" placeholder="Type or select merchant..." style="width: 100%; padding: 8px 12px; background-color: {container_bg}; color: {text_color}; border: 1px solid {border_color}; border-radius: 4px; font-size: 16px; box-sizing: border-box;">
+        <input list="{unique_id}" id="input_{unique_id}" value="{default_value}" placeholder="Type or select merchant..." style="width: 100%; padding: 8px 12px; background-color: var(--background-color); color: var(--text-color); border: 1px solid var(--secondary-background-color); border-radius: 4px; font-size: 16px; box-sizing: border-box;">
         <datalist id="{unique_id}">
             {options_html}
         </datalist>
@@ -324,17 +247,6 @@ if st.sidebar.button("✏️ Edit Transaction", use_container_width=True):
 
 st.sidebar.divider()
 
-theme_choice = st.sidebar.select_slider(
-    "Theme Mode", 
-    options=["Dark", "Light"], 
-    value="Light" if st.session_state.light_mode else "Dark"
-)
-
-new_light_mode = (theme_choice == "Light")
-if new_light_mode != st.session_state.light_mode:
-    st.session_state.light_mode = new_light_mode
-    st.rerun()
-
 st.sidebar.title("Financial Accounts")
 account_selection = st.sidebar.selectbox(
     "Select Account",
@@ -356,7 +268,7 @@ if account_selection == "Primary Checking":
         days_of_week = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         header_cols = st.columns(7)
         for i, col in enumerate(header_cols):
-            col.markdown(f"<div style='text-align: center; font-weight: bold; color: {sub_text}; border: 1px solid {border_color}; background-color: {grid_header_bg}; padding: 4px;'>{days_of_week[i]}</div>", unsafe_allow_html=True)
+            col.markdown(f"<div style='text-align: center; font-weight: bold; border: 1px solid var(--secondary-background-color); background-color: var(--secondary-background-color); padding: 4px;'>{days_of_week[i]}</div>", unsafe_allow_html=True)
 
         response = conn.table("Transactions").select("*").execute()
         
@@ -393,15 +305,15 @@ if account_selection == "Primary Checking":
                         elif '-' in net_val and net_val != '$0.00':
                             net_color = '#f85149'
                         else:
-                            net_color = sub_text
+                            net_color = 'gray'
 
                         with st.container(border=True):
-                            st.markdown(f"<span style='font-weight:bold; color:{text_color};'>{day_num}</span> <span style='float:right; color:#58a6ff; font-size:0.85em; font-weight:600;'>${4500 - (day_num*10):,.2f}</span>", unsafe_allow_html=True)
-                            st.markdown(f"<div style='font-size:0.75em; color:{sub_text}; min-height:24px; padding-top:2px;'>{data['items']}</div>", unsafe_allow_html=True)
+                            st.markdown(f"<span style='font-weight:bold;'>{day_num}</span> <span style='float:right; color:#58a6ff; font-size:0.85em; font-weight:600;'>${4500 - (day_num*10):,.2f}</span>", unsafe_allow_html=True)
+                            st.markdown(f"<div style='font-size:0.75em; color: gray; min-height:24px; padding-top:2px;'>{data['items']}</div>", unsafe_allow_html=True)
                             st.markdown(f"<div style='text-align: right; color:{net_color}; font-weight:700; font-size:0.8em;'>{net_val}</div>", unsafe_allow_html=True)
                     else:
                         with st.container(border=True):
-                            st.markdown(f"<span style='color:{border_color};'>-</span>", unsafe_allow_html=True)
+                            st.markdown("<span style='color: gray;'>-</span>", unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
         st.success("**Projected Month-End Balance:** $4,850.00 *(Computed via actuals + future budget rules)*")
@@ -424,9 +336,7 @@ if account_selection == "Primary Checking":
     else:
         checking_data = pd.DataFrame(columns=["Date", "Merchant", "Category", "Amount", "Type"])
 
-    st.markdown(f'<div class="dataframe-container">', unsafe_allow_html=True)
     st.dataframe(checking_data, use_container_width=True, hide_index=True)
-    st.markdown(f'</div>', unsafe_allow_html=True)
 
 # --- SAVINGS ACCOUNT LAYOUT ---
 elif account_selection == "Emergency Savings":
