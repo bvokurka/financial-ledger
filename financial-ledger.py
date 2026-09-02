@@ -107,9 +107,14 @@ div[data-testid="stAlert"] p, div[data-testid="stAlert"] span {{
     border-color: {border_color} !important;
 }}
 
-/* Fix Data Editor / Table container elements */
+/* Fix Data Editor / Table container elements & theme compliance */
 [data-testid="stDataEditor"], [data-testid="stTable"] {{
     background-color: {widget_bg} !important;
+    color: {text_color} !important;
+}}
+
+[data-testid="stDataEditor"] div, [data-testid="stDataEditor"] span {{
+    color: {text_color} !important;
 }}
 
 /* Hide the Streamlit helper text input without breaking React */
