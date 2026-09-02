@@ -107,13 +107,9 @@ div[data-testid="stAlert"] p, div[data-testid="stAlert"] span {{
     border-color: {border_color} !important;
 }}
 
-/* Fix Data Editor / Table container elements & theme compliance */
-[data-testid="stDataEditor"], [data-testid="stTable"] {{
+/* Fix Table / DataFrame theme compliance */
+[data-testid="stDataFrame"] {{
     background-color: {widget_bg} !important;
-    color: {text_color} !important;
-}}
-
-[data-testid="stDataEditor"] div, [data-testid="stDataEditor"] span {{
     color: {text_color} !important;
 }}
 
@@ -422,7 +418,7 @@ if account_selection == "Primary Checking":
     else:
         checking_data = pd.DataFrame(columns=["Date", "Merchant", "Category", "Amount", "Type"])
 
-    st.data_editor(checking_data, use_container_width=True, hide_index=True)
+    st.dataframe(checking_data, use_container_width=True, hide_index=True)
 
 # --- SAVINGS ACCOUNT LAYOUT ---
 elif account_selection == "Emergency Savings":
