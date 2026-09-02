@@ -1,4 +1,8 @@
 import streamlit as st
+from st_supabase_connection import SupabaseConnection
+import pandas as pd
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -13,13 +17,6 @@ if not st.session_state.authenticated:
         st.error("Incorrect password")
     st.stop()
     
-from st_supabase_connection import SupabaseConnection
-import pandas as pd
-from datetime import datetime
-
-import streamlit as st
-st.write(f"Current Streamlit Version: {st.__version__}")
-
 # Initialize connection once at the top
 conn = st.connection("supabase", type=SupabaseConnection)
 
@@ -143,9 +140,13 @@ def add_transaction_dialog():
             elif not final_merchant:
                 st.error("Please provide a valid merchant name.")
             else:
+                local_tz = ZoneInfo("America/New_York")
+                naive_dt = datetime.combine(tx_date, tx_time)
+                localized_dt = naive_dt.replace(tzinfo=local_tz)
+
                 data = {
                     "date": str(tx_date),
-                    "time": str(tx_time),
+                    "time": localized_dt.strftime("%H:%M:%S %Z%z"),
                     "amount": amount,
                     "merchant": final_merchant,
                     "category": category,
@@ -217,9 +218,13 @@ def edit_transaction_dialog():
             if not final_merchant:
                 st.error("Please provide a valid merchant name.")
             else:
+                local_tz = ZoneInfo("America/New_York")
+                naive_dt = datetime.combine(tx_date, tx_time)
+                localized_dt = naive_dt.replace(tzinfo=local_tz)
+
                 updated_data = {
                     "date": str(tx_date),
-                    "time": str(tx_time),
+                    "time": localized_dt.strftime("%H:%M:%S %Z%z"),
                     "amount": amount,
                     "merchant": final_merchant,
                     "category": category,
