@@ -17,6 +17,9 @@ from st_supabase_connection import SupabaseConnection
 import pandas as pd
 from datetime import datetime
 
+import streamlit as st
+st.write(f"Current Streamlit Version: {st.__version__}")
+
 # Initialize connection once at the top
 conn = st.connection("supabase", type=SupabaseConnection)
 
