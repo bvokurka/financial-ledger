@@ -35,7 +35,6 @@ if st.session_state.light_mode:
     sub_text = "#4b5563"
     grid_header_bg = "#f3f4f6"
     widget_bg = "#ffffff"
-    editor_theme = "light"
 else:
     bg_color = "#0e1117"
     container_bg = "#161b22"
@@ -44,7 +43,6 @@ else:
     sub_text = "#8b949e"
     grid_header_bg = "#161b22"
     widget_bg = "#0e1117"
-    editor_theme = "dark"
 
 # --- CUSTOM CSS FOR SPREADSHEET GRID, THEMES, AND WIDGET OVERRIDES ---
 st.markdown(f"""
@@ -419,7 +417,7 @@ if account_selection == "Primary Checking":
     else:
         checking_data = pd.DataFrame(columns=["Date", "Merchant", "Category", "Amount", "Type"])
 
-    st.data_editor(checking_data, use_container_width=True, hide_index=True, theme=editor_theme)
+    st.data_editor(checking_data, use_container_width=True, hide_index=True)
 
 # --- SAVINGS ACCOUNT LAYOUT ---
 elif account_selection == "Emergency Savings":
