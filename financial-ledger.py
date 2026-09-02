@@ -144,9 +144,13 @@ def add_transaction_dialog():
                 naive_dt = datetime.combine(tx_date, tx_time)
                 localized_dt = naive_dt.replace(tzinfo=local_tz)
 
+                tz_offset = localized_dt.strftime("%z")
+                formatted_offset = f"{tz_offset[:3]}:{tz_offset[3:]}" if tz_offset else ""
+                time_string = f"{tx_time.strftime('%H:%M:%S')}{formatted_offset}"
+
                 data = {
                     "date": str(tx_date),
-                    "time": localized_dt.strftime("%H:%M:%S %Z%z"),
+                    "time": time_string,
                     "amount": amount,
                     "merchant": final_merchant,
                     "category": category,
@@ -222,9 +226,13 @@ def edit_transaction_dialog():
                 naive_dt = datetime.combine(tx_date, tx_time)
                 localized_dt = naive_dt.replace(tzinfo=local_tz)
 
+                tz_offset = localized_dt.strftime("%z")
+                formatted_offset = f"{tz_offset[:3]}:{tz_offset[3:]}" if tz_offset else ""
+                time_string = f"{tx_time.strftime('%H:%M:%S')}{formatted_offset}"
+
                 updated_data = {
                     "date": str(tx_date),
-                    "time": localized_dt.strftime("%H:%M:%S %Z%z"),
+                    "time": time_string,
                     "amount": amount,
                     "merchant": final_merchant,
                     "category": category,
