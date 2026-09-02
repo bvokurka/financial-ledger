@@ -52,9 +52,9 @@ st.markdown(f"""
     background-color: {bg_color} !important;
 }}
 
-/* Force typography colors to override Streamlit's native dark mode defaults */
-.stApp p, .stApp h1, .stApp h2, .stApp h3, .stApp span, .stApp label {{
-    color: {text_color} !important;
+/* Force typography colors across all elements */
+.stApp p, .stApp h1, .stApp h2, .stApp h3, .stApp span, .stApp label, .stApp div {{
+    color: {text_color};
 }}
 
 /* Fix Sidebar Background */
@@ -63,24 +63,28 @@ st.markdown(f"""
     border-right: 1px solid {border_color} !important;
 }}
 
-/* Fix Metrics (Cash Position column) */
+/* Fix Metrics */
 [data-testid="stMetricValue"] div, [data-testid="stMetricLabel"] p, [data-testid="stMetricDelta"] div {{
     color: {text_color} !important;
 }}
 
-/* Fix the Success Alert text visibility across themes */
+/* Fix Alerts */
 div[data-testid="stAlert"] p, div[data-testid="stAlert"] span {{
     color: {text_color} !important; 
 }}
 
-/* Remove rounded card padding and create a seamless spreadsheet grid */
-[data-testid="stVerticalBlock"] [data-testid="stVerticalBlockBorderWrapper"] {{
-    background-color: {container_bg};
+/* Calendar Container & Border Overrides */
+[data-testid="stVerticalBlockBorderWrapper"] {{
+    background-color: {container_bg} !important;
     border: 1px solid {border_color} !important;
     border-radius: 0px !important;
     padding: 2px !important;
     margin: -1px !important;
     min-height: 110px !important;
+}}
+
+[data-testid="stVerticalBlockBorderWrapper"] p, [data-testid="stVerticalBlockBorderWrapper"] span {{
+    color: {text_color} !important;
 }}
 
 /* Reduce column gaps so cells touch like Excel */
@@ -100,7 +104,7 @@ div[data-testid="stAlert"] p, div[data-testid="stAlert"] span {{
     color: #ffffff !important;
 }}
 
-/* Fix Selectboxes and Input backgrounds to match theme */
+/* Fix Selectboxes and Inputs */
 [data-baseweb="select"] > div, [data-testid="stSelectbox"] div[data-baseweb="select"] {{
     background-color: {widget_bg} !important;
     color: {text_color} !important;
