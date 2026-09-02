@@ -68,9 +68,9 @@ st.markdown(f"""
     color: {text_color} !important;
 }}
 
-/* Fix the Success Alert (Projected Month-End Balance text) */
+/* Fix the Success Alert text visibility across themes */
 div[data-testid="stAlert"] p, div[data-testid="stAlert"] span {{
-    color: #000000 !important; 
+    color: {text_color} !important; 
 }}
 
 /* Remove rounded card padding and create a seamless spreadsheet grid */
@@ -91,13 +91,13 @@ div[data-testid="stAlert"] p, div[data-testid="stAlert"] span {{
 /* Custom style for the green Add Transaction button */
 [data-testid="stSidebar"] button[kind="primary"] {{
     background-color: #2ea043 !important;
-    color: #000000 !important;
+    color: #ffffff !important;
     border-color: #2ea043 !important;
     font-weight: bold !important;
 }}
 [data-testid="stSidebar"] button[kind="primary"]:hover {{
     background-color: #2c974b !important;
-    color: #000000 !important;
+    color: #ffffff !important;
 }}
 
 /* Fix Selectboxes and Input backgrounds to match theme */
