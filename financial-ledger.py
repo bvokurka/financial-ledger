@@ -1,4 +1,18 @@
 import streamlit as st
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title("Financial Ledger Login")
+    password = st.text_input("Enter Password:", type="password")
+    if password == st.secrets["APP_PASSWORD"]:
+        st.session_state.authenticated = True
+        st.rerun()
+    elif password:
+        st.error("Incorrect password")
+    st.stop()
+    
 from st_supabase_connection import SupabaseConnection
 import pandas as pd
 from datetime import datetime
