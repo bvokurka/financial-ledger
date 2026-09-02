@@ -68,6 +68,25 @@ def get_existing_merchants():
         pass
     return []
 
+# --- FETCH EXISTING CATEGORIES FROM SUPABASE & DEFAULTS ---
+@st.cache_data(ttl=60)
+def get_existing_categories():
+    base_categories = [
+        "Groceries", "Utilities", "Shopping", "Entertainment", 
+        "Home Improvement", "Pet Supplies", "Medicine", "Lunch", 
+        "Hotels/Lodging", "Dining", "Liquor", "Auto Repair", 
+        "Points Credits", "Other"
+    ]
+    try:
+        res = conn.table("Transactions").select("category").execute()
+        if res and res.data:
+            db_cats = [row.get("category") for row in res.data if row.get("category")]
+            all_cats = sorted(list(set(base_categories + db_cats)))
+            return all_cats
+    except Exception:
+        pass
+    return base_categories
+
 # --- ROBUST HTML DATALIST MERCHANT INPUT ---
 def merchant_autocomplete_input(default_value="", key_suffix=""):
     existing_merchants = get_existing_merchants()
@@ -118,27 +137,35 @@ def add_transaction_dialog():
     with st.form("transaction_form", clear_on_submit=True):
         amount = st.number_input("Amount ($)", value=None, placeholder="0.00", format="%.2f")
         merchant_name = merchant_autocomplete_input(default_value="", key_suffix="add")
-        category = st.selectbox(
-            "Category", 
-            [
-                "Groceries", "Utilities", "Shopping", "Entertainment", 
-                "Home Improvement", "Pet Supplies", "Medicine", "Lunch", 
-                "Hotels/Lodging", "Dining", "Liquor", "Auto Repair", 
-                "Points Credits", "Other"
-            ]
-        )
+        
+        categories_list = get_existing_categories()
+        cat_options = categories_list + ["➕ Add New Category..."]
+        selected_cat_option = st.selectbox("Category", cat_options)
+        
+        if selected_cat_option == "➕ Add New Category...":
+            category = st.text_input("New Category Name")
+        else:
+            category = selected_cat_option
+
         tx_date = st.date_input("Date")
-        tx_time = st.time_input("Time")
+        
+        # Default time initialized to EST
+        local_now = datetime.now(ZoneInfo("America/New_York"))
+        tx_time = st.time_input("Time", value=local_now.time())
+        
         description = st.text_input("Description")
             
         submitted = st.form_submit_button("Save Transaction")
         
         if submitted:
             final_merchant = str(merchant_name).strip()
+            final_category = str(category).strip()
             if amount is None:
                 st.error("Please enter a valid amount.")
             elif not final_merchant:
                 st.error("Please provide a valid merchant name.")
+            elif not final_category:
+                st.error("Please provide a valid category name.")
             else:
                 local_tz = ZoneInfo("America/New_York")
                 naive_dt = datetime.combine(tx_date, tx_time)
@@ -153,7 +180,7 @@ def add_transaction_dialog():
                     "time": time_string,
                     "amount": amount,
                     "merchant": final_merchant,
-                    "category": category,
+                    "category": final_category,
                     "description": description,
                     "type": workflow_type
                 }
@@ -177,13 +204,13 @@ def edit_transaction_dialog():
     selected_label = st.selectbox("Select Transaction to Edit", list(tx_options.keys()))
     selected_tx = tx_options[selected_label]
 
-    categories_list = [
-        "Groceries", "Utilities", "Shopping", "Entertainment", 
-        "Home Improvement", "Pet Supplies", "Medicine", "Lunch", 
-        "Hotels/Lodging", "Dining", "Liquor", "Auto Repair", 
-        "Points Credits", "Other"
-    ]
+    categories_list = get_existing_categories()
     current_cat = selected_tx.get("category")
+    if current_cat not in categories_list:
+        categories_list.append(current_cat)
+    categories_list = sorted(list(set(categories_list)))
+    
+    cat_options = categories_list + ["➕ Add New Category..."]
     cat_default_idx = categories_list.index(current_cat) if current_cat in categories_list else 0
 
     workflow_types = ["AMZ Card", "Direct"]
@@ -194,7 +221,12 @@ def edit_transaction_dialog():
         workflow_type = st.radio("Transaction Type", workflow_types, index=type_default_idx, horizontal=True)
         amount = st.number_input("Amount ($)", value=float(selected_tx.get("amount", 0.0)), format="%.2f")
         merchant_name = merchant_autocomplete_input(default_value=selected_tx.get("merchant", ""), key_suffix="edit")
-        category = st.selectbox("Category", categories_list, index=cat_default_idx)
+        
+        selected_cat_option = st.selectbox("Category", cat_options, index=cat_default_idx)
+        if selected_cat_option == "➕ Add New Category...":
+            category = st.text_input("New Category Name")
+        else:
+            category = selected_cat_option
         
         try:
             default_date = datetime.strptime(selected_tx.get("date"), "%Y-%m-%d").date()
@@ -205,7 +237,8 @@ def edit_transaction_dialog():
             time_str = str(selected_tx.get("time", "00:00:00"))[:8]
             default_time = datetime.strptime(time_str, "%H:%M:%S").time()
         except Exception:
-            default_time = datetime.now().time()
+            local_now = datetime.now(ZoneInfo("America/New_York"))
+            default_time = local_now.time()
 
         tx_date = st.date_input("Date", value=default_date)
         tx_time = st.time_input("Time", value=default_time)
@@ -219,8 +252,11 @@ def edit_transaction_dialog():
         
         if submitted:
             final_merchant = str(merchant_name).strip()
+            final_category = str(category).strip()
             if not final_merchant:
                 st.error("Please provide a valid merchant name.")
+            elif not final_category:
+                st.error("Please provide a valid category name.")
             else:
                 local_tz = ZoneInfo("America/New_York")
                 naive_dt = datetime.combine(tx_date, tx_time)
@@ -235,7 +271,7 @@ def edit_transaction_dialog():
                     "time": time_string,
                     "amount": amount,
                     "merchant": final_merchant,
-                    "category": category,
+                    "category": final_category,
                     "description": description,
                     "type": workflow_type
                 }
