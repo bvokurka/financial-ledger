@@ -87,21 +87,21 @@ def get_existing_categories():
         pass
     return base_categories
 
-# --- ROBUST HTML DATALIST MERCHANT INPUT ---
+# --- ROBUST HTML DATALIST MERCHANT INPUT WITH INLINE AUTO-FILL ---
 def merchant_autocomplete_input(default_value="", key_suffix=""):
     existing_merchants = get_existing_merchants()
     options_html = "".join([f'<option value="{m}">' for m in existing_merchants])
     unique_id = f"merchant_dl_{key_suffix}"
     sync_key = f"sync_merchant_{key_suffix}"
     
-    st.markdown("""
+    st.markdown(f"""
         <div style="margin-bottom: 4px;">
             <label style="font-size: 14px; font-weight: 400; color: var(--text-color);">Merchant</label>
         </div>
     """, unsafe_allow_html=True)
     
     html_code = f"""
-        <input list="{unique_id}" id="input_{unique_id}" value="{default_value}" placeholder="Type or select merchant..." style="width: 100%; padding: 8px 12px; background-color: var(--background-color); color: var(--text-color); border: 1px solid var(--secondary-background-color); border-radius: 4px; font-size: 16px; box-sizing: border-box;">
+        <input list="{unique_id}" id="input_{unique_id}" value="{default_value}" placeholder="Type to search or add new..." style="width: 100%; padding: 8px 12px; background-color: var(--background-color); color: var(--text-color); border: 1px solid var(--secondary-background-color); border-radius: 4px; font-size: 16px; box-sizing: border-box;">
         <datalist id="{unique_id}">
             {options_html}
         </datalist>
@@ -119,7 +119,33 @@ def merchant_autocomplete_input(default_value="", key_suffix=""):
                 }}
             }}
 
-            inputElem.addEventListener("input", syncToStreamlit);
+            inputElem.addEventListener("input", function(e) {{
+                // Skip auto-fill if user is pressing Backspace or Delete to allow corrections
+                if (e.inputType === 'deleteContentBackward' || e.inputType === 'deleteContentForward') {{
+                    syncToStreamlit();
+                    return;
+                }}
+                
+                const val = this.value;
+                if (!val) {{ 
+                    syncToStreamlit(); 
+                    return; 
+                }}
+                
+                // Find matching option from the datalist
+                const options = Array.from(document.getElementById("{unique_id}").options).map(opt => opt.value);
+                const match = options.find(opt => opt.toLowerCase().startsWith(val.toLowerCase()));
+                
+                if (match && match.toLowerCase() !== val.toLowerCase()) {{
+                    const start = val.length;
+                    this.value = match;
+                    // Highlight the auto-completed portion of the text
+                    this.setSelectionRange(start, match.length);
+                }}
+                
+                syncToStreamlit();
+            }});
+
             inputElem.addEventListener("change", syncToStreamlit);
             inputElem.addEventListener("blur", syncToStreamlit);
             
