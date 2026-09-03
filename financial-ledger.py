@@ -345,24 +345,26 @@ def initialize_edit_transaction_state(selected_tx: dict) -> None:
 
 
 MERCHANT_HTML = """
+<div class="ledger-merchant-autocomplete">
 <label for="merchant">Merchant</label>
-<input id="merchant" type="text" autocomplete="off" spellcheck="false"
+<input id="merchant" type="text" tabindex="0" autocomplete="off" spellcheck="false"
        aria-autocomplete="inline" aria-describedby="merchant-help"
        placeholder="Start typing a merchant..." />
 <small id="merchant-help">Tab accepts the completion. Escape dismisses it.</small>
+</div>
 """
 
 MERCHANT_CSS = """
-label { display: block; margin-bottom: .4rem; font-size: .875rem; }
-input {
+.ledger-merchant-autocomplete label { display: block; margin-bottom: .4rem; font-size: .875rem; }
+.ledger-merchant-autocomplete input {
     box-sizing: border-box; width: 100%; padding: .65rem .75rem;
     border: 1px solid var(--st-border-color, #80808066);
     border-radius: .5rem; font: inherit;
     color: var(--st-text-color);
     background: var(--st-secondary-background-color);
 }
-input:focus { outline: 2px solid var(--st-primary-color); outline-offset: -2px; }
-small { display: block; margin-top: .25rem; opacity: .7; font-size: .75rem; }
+.ledger-merchant-autocomplete input:focus { outline: 2px solid var(--st-primary-color); outline-offset: -2px; }
+.ledger-merchant-autocomplete small { display: block; margin-top: .25rem; opacity: .7; font-size: .75rem; }
 """
 
 MERCHANT_JS = r"""
@@ -458,6 +460,9 @@ def get_merchant_component():
         html=MERCHANT_HTML,
         css=MERCHANT_CSS,
         js=MERCHANT_JS,
+        # Let the dialog's focus manager discover the merchant input.
+        # CSS selectors above are scoped to this component's wrapper.
+        isolate_styles=False,
     )
 
 
@@ -488,6 +493,7 @@ def merchant_selector(prefix: str, current_merchant: str = "") -> str:
     value = by_key.get(value.casefold(), value)
     st.session_state[merchant_key] = value
     return value
+
 
 
 # ============================================================
@@ -638,6 +644,11 @@ def add_transaction_dialog():
         prefix="add",
     )
 
+    description = st.text_input(
+        "Description",
+        key="add_desc",
+    )
+
     tx_date = st.date_input(
         "Date",
         key="add_date",
@@ -646,11 +657,6 @@ def add_transaction_dialog():
     tx_time = st.time_input(
         "Time",
         key="add_time",
-    )
-
-    description = st.text_input(
-        "Description",
-        key="add_desc",
     )
 
     if st.button(
@@ -808,6 +814,11 @@ def edit_transaction_dialog():
         current_category=current_category,
     )
 
+    description = st.text_input(
+        "Description",
+        key="edit_desc",
+    )
+
     tx_date = st.date_input(
         "Date",
         key="edit_date",
@@ -816,11 +827,6 @@ def edit_transaction_dialog():
     tx_time = st.time_input(
         "Time",
         key="edit_time",
-    )
-
-    description = st.text_input(
-        "Description",
-        key="edit_desc",
     )
 
     col1, col2 = st.columns(2)
