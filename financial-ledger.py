@@ -87,6 +87,23 @@ def get_existing_categories():
         pass
     return base_categories
 
+# --- FETCH MERCHANT TO LAST CATEGORY MAPPING ---
+@st.cache_data(ttl=60)
+def get_merchant_category_map():
+    try:
+        res = conn.table("Transactions").select("merchant, category, date, time").order("date", desc=True).order("time", desc=True).execute()
+        if res and res.data:
+            mapping = {}
+            for row in res.data:
+                m = row.get("merchant")
+                c = row.get("category")
+                if m and c and m not in mapping:
+                    mapping[m] = c
+            return mapping
+    except Exception:
+        pass
+    return {}
+
 # --- ROBUST HTML DATALIST MERCHANT INPUT WITH INLINE AUTO-FILL ---
 def merchant_autocomplete_input(default_value="", key_suffix=""):
     existing_merchants = get_existing_merchants()
@@ -116,11 +133,11 @@ def merchant_autocomplete_input(default_value="", key_suffix=""):
                     const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
                     nativeInputValueSetter.call(stInput, inputElem.value);
                     stInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    stInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
                 }}
             }}
 
             inputElem.addEventListener("input", function(e) {{
-                // Skip auto-fill if user is pressing Backspace or Delete to allow corrections
                 if (e.inputType === 'deleteContentBackward' || e.inputType === 'deleteContentForward') {{
                     syncToStreamlit();
                     return;
@@ -132,14 +149,12 @@ def merchant_autocomplete_input(default_value="", key_suffix=""):
                     return; 
                 }}
                 
-                // Find matching option from the datalist
                 const options = Array.from(document.getElementById("{unique_id}").options).map(opt => opt.value);
                 const match = options.find(opt => opt.toLowerCase().startsWith(val.toLowerCase()));
                 
                 if (match && match.toLowerCase() !== val.toLowerCase()) {{
                     const start = val.length;
                     this.value = match;
-                    // Highlight the auto-completed portion of the text
                     this.setSelectionRange(start, match.length);
                 }}
                 
@@ -158,58 +173,74 @@ def merchant_autocomplete_input(default_value="", key_suffix=""):
 # --- ADD TRANSACTION POP-UP MODAL DIALOG ---
 @st.dialog("Add New Transaction", width="medium")
 def add_transaction_dialog():
-    workflow_type = st.radio("Transaction Type", ["AMZ Card", "Direct"], index=0, horizontal=True)
+    if "add_merchant_val" not in st.session_state:
+        st.session_state.add_merchant_val = ""
+
+    workflow_type = st.radio("Transaction Type", ["AMZ Card", "Direct"], index=0, horizontal=True, key="add_workflow_type")
+    amount = st.number_input("Amount ($)", value=None, placeholder="0.00", format="%.2f", key="add_amount")
     
-    with st.form("transaction_form", clear_on_submit=True):
-        amount = st.number_input("Amount ($)", value=None, placeholder="0.00", format="%.2f")
-        merchant_name = merchant_autocomplete_input(default_value="", key_suffix="add")
-        
-        categories_list = get_existing_categories()
-        selected_cat_option = st.selectbox("Category", categories_list + ["➕ Add New Category..."])
-        custom_category = st.text_input("New Category Name", placeholder="Type here to override dropdown...")
+    merchant_name = merchant_autocomplete_input(default_value=st.session_state.add_merchant_val, key_suffix="add")
+    
+    # Check if merchant changed and auto-populate last used category
+    if merchant_name != st.session_state.add_merchant_val:
+        st.session_state.add_merchant_val = merchant_name
+        cat_map = get_merchant_category_map()
+        if merchant_name in cat_map:
+            st.session_state.add_selected_cat = cat_map[merchant_name]
+            st.rerun()
 
-        tx_date = st.date_input("Date")
+    categories_list = get_existing_categories()
+    cat_options = categories_list + ["➕ Add New Category..."]
+    
+    default_cat_idx = 0
+    if "add_selected_cat" in st.session_state and st.session_state.add_selected_cat in categories_list:
+        default_cat_idx = categories_list.index(st.session_state.add_selected_cat)
+
+    selected_cat_option = st.selectbox("Category", cat_options, index=default_cat_idx, key="add_category_select")
+    custom_category = st.text_input("New Category Name", placeholder="Type here to override dropdown...", key="add_custom_category")
+
+    tx_date = st.date_input("Date", key="add_date")
+    
+    local_now = datetime.now(ZoneInfo("America/New_York"))
+    tx_time = st.time_input("Time", value=local_now.time(), key="add_time")
+    description = st.text_input("Description", key="add_desc")
         
-        local_now = datetime.now(ZoneInfo("America/New_York"))
-        tx_time = st.time_input("Time", value=local_now.time())
-        description = st.text_input("Description")
-            
-        submitted = st.form_submit_button("Save Transaction")
+    if st.button("Save Transaction", type="primary", use_container_width=True):
+        final_merchant = str(merchant_name).strip()
+        final_category = custom_category.strip() if custom_category.strip() else selected_cat_option
         
-        if submitted:
-            final_merchant = str(merchant_name).strip()
-            final_category = custom_category.strip() if custom_category.strip() else selected_cat_option
-            
-            if amount is None:
-                st.error("Please enter a valid amount.")
-            elif not final_merchant:
-                st.error("Please provide a valid merchant name.")
-            elif final_category == "➕ Add New Category...":
-                st.error("Please type a name for your new category in the text box.")
+        if amount is None:
+            st.error("Please enter a valid amount.")
+        elif not final_merchant:
+            st.error("Please provide a valid merchant name.")
+        elif final_category == "➕ Add New Category...":
+            st.error("Please type a name for your new category in the text box.")
+        else:
+            local_tz = ZoneInfo("America/New_York")
+            naive_dt = datetime.combine(tx_date, tx_time)
+            localized_dt = naive_dt.replace(tzinfo=local_tz)
+
+            tz_offset = localized_dt.strftime("%z")
+            formatted_offset = f"{tz_offset[:3]}:{tz_offset[3:]}" if tz_offset else ""
+            time_string = f"{tx_time.strftime('%H:%M:%S')}{formatted_offset}"
+
+            data = {
+                "date": str(tx_date),
+                "time": time_string,
+                "amount": amount,
+                "merchant": final_merchant,
+                "category": final_category,
+                "description": description,
+                "type": workflow_type
+            }
+            insert_res = conn.table("Transactions").insert(data).execute()
+            if insert_res:
+                for key in ["add_merchant_val", "add_selected_cat"]:
+                    st.session_state.pop(key, None)
+                st.success(f"Successfully saved {workflow_type} transaction!")
+                st.rerun()
             else:
-                local_tz = ZoneInfo("America/New_York")
-                naive_dt = datetime.combine(tx_date, tx_time)
-                localized_dt = naive_dt.replace(tzinfo=local_tz)
-
-                tz_offset = localized_dt.strftime("%z")
-                formatted_offset = f"{tz_offset[:3]}:{tz_offset[3:]}" if tz_offset else ""
-                time_string = f"{tx_time.strftime('%H:%M:%S')}{formatted_offset}"
-
-                data = {
-                    "date": str(tx_date),
-                    "time": time_string,
-                    "amount": amount,
-                    "merchant": final_merchant,
-                    "category": final_category,
-                    "description": description,
-                    "type": workflow_type
-                }
-                insert_res = conn.table("Transactions").insert(data).execute()
-                if insert_res:
-                    st.success(f"Successfully saved {workflow_type} transaction!")
-                    st.rerun()
-                else:
-                    st.error("Failed to save transaction.")
+                st.error("Failed to save transaction.")
 
 # --- EDIT TRANSACTION POP-UP MODAL DIALOG ---
 @st.dialog("Edit Existing Transaction", width="medium")
@@ -224,6 +255,9 @@ def edit_transaction_dialog():
     selected_label = st.selectbox("Select Transaction to Edit", list(tx_options.keys()))
     selected_tx = tx_options[selected_label]
 
+    if "edit_merchant_val" not in st.session_state:
+        st.session_state.edit_merchant_val = selected_tx.get("merchant", "")
+
     categories_list = get_existing_categories()
     current_cat = selected_tx.get("category")
     if current_cat not in categories_list:
@@ -236,76 +270,90 @@ def edit_transaction_dialog():
     current_type = selected_tx.get("type", "AMZ Card")
     type_default_idx = workflow_types.index(current_type) if current_type in workflow_types else 0
 
-    with st.form("edit_transaction_form"):
-        workflow_type = st.radio("Transaction Type", workflow_types, index=type_default_idx, horizontal=True)
-        amount = st.number_input("Amount ($)", value=float(selected_tx.get("amount", 0.0)), format="%.2f")
-        merchant_name = merchant_autocomplete_input(default_value=selected_tx.get("merchant", ""), key_suffix="edit")
+    workflow_type = st.radio("Transaction Type", workflow_types, index=type_default_idx, horizontal=True, key="edit_workflow_type")
+    amount = st.number_input("Amount ($)", value=float(selected_tx.get("amount", 0.0)), format="%.2f", key="edit_amount")
+    
+    merchant_name = merchant_autocomplete_input(default_value=st.session_state.edit_merchant_val, key_suffix="edit")
+    if merchant_name != st.session_state.edit_merchant_val:
+        st.session_state.edit_merchant_val = merchant_name
+        cat_map = get_merchant_category_map()
+        if merchant_name in cat_map:
+            st.session_state.edit_selected_cat = cat_map[merchant_name]
+            st.rerun()
+
+    if "edit_selected_cat" in st.session_state and st.session_state.edit_selected_cat in categories_list:
+        cat_default_idx = categories_list.index(st.session_state.edit_selected_cat)
+
+    cat_options = categories_list + ["➕ Add New Category..."]
+    selected_cat_option = st.selectbox("Category", cat_options, index=cat_default_idx, key="edit_category_select")
+    custom_category = st.text_input("New Category Name", placeholder="Type here to override dropdown...", key="edit_custom_category")
+    
+    try:
+        default_date = datetime.strptime(selected_tx.get("date"), "%Y-%m-%d").date()
+    except Exception:
+        default_date = datetime.today().date()
+
+    try:
+        time_str = str(selected_tx.get("time", "00:00:00"))[:8]
+        default_time = datetime.strptime(time_str, "%H:%M:%S").time()
+    except Exception:
+        local_now = datetime.now(ZoneInfo("America/New_York"))
+        default_time = local_now.time()
+
+    tx_date = st.date_input("Date", value=default_date, key="edit_date")
+    tx_time = st.time_input("Time", value=default_time, key="edit_time")
+    description = st.text_input("Description", value=selected_tx.get("description", ""), key="edit_desc")
         
-        selected_cat_option = st.selectbox("Category", categories_list + ["➕ Add New Category..."], index=cat_default_idx)
-        custom_category = st.text_input("New Category Name", placeholder="Type here to override dropdown...")
+    col1, col2 = st.columns(2)
+    with col1:
+        submitted = st.button("Update Transaction", use_container_width=True, type="primary")
+    with col2:
+        deleted = st.button("🗑️ Delete Transaction", use_container_width=True, type="secondary")
+    
+    if submitted:
+        final_merchant = str(merchant_name).strip()
+        final_category = custom_category.strip() if custom_category.strip() else selected_cat_option
         
-        try:
-            default_date = datetime.strptime(selected_tx.get("date"), "%Y-%m-%d").date()
-        except Exception:
-            default_date = datetime.today().date()
+        if not final_merchant:
+            st.error("Please provide a valid merchant name.")
+        elif final_category == "➕ Add New Category...":
+            st.error("Please type a name for your new category in the text box.")
+        else:
+            local_tz = ZoneInfo("America/New_York")
+            naive_dt = datetime.combine(tx_date, tx_time)
+            localized_dt = naive_dt.replace(tzinfo=local_tz)
 
-        try:
-            time_str = str(selected_tx.get("time", "00:00:00"))[:8]
-            default_time = datetime.strptime(time_str, "%H:%M:%S").time()
-        except Exception:
-            local_now = datetime.now(ZoneInfo("America/New_York"))
-            default_time = local_now.time()
+            tz_offset = localized_dt.strftime("%z")
+            formatted_offset = f"{tz_offset[:3]}:{tz_offset[3:]}" if tz_offset else ""
+            time_string = f"{tx_time.strftime('%H:%M:%S')}{formatted_offset}"
 
-        tx_date = st.date_input("Date", value=default_date)
-        tx_time = st.time_input("Time", value=default_time)
-        description = st.text_input("Description", value=selected_tx.get("description", ""))
-            
-        col1, col2 = st.columns(2)
-        with col1:
-            submitted = st.form_submit_button("Update Transaction", use_container_width=True)
-        with col2:
-            deleted = st.form_submit_button("🗑️ Delete Transaction", use_container_width=True, type="secondary")
-        
-        if submitted:
-            final_merchant = str(merchant_name).strip()
-            final_category = custom_category.strip() if custom_category.strip() else selected_cat_option
-            
-            if not final_merchant:
-                st.error("Please provide a valid merchant name.")
-            elif final_category == "➕ Add New Category...":
-                st.error("Please type a name for your new category in the text box.")
-            else:
-                local_tz = ZoneInfo("America/New_York")
-                naive_dt = datetime.combine(tx_date, tx_time)
-                localized_dt = naive_dt.replace(tzinfo=local_tz)
-
-                tz_offset = localized_dt.strftime("%z")
-                formatted_offset = f"{tz_offset[:3]}:{tz_offset[3:]}" if tz_offset else ""
-                time_string = f"{tx_time.strftime('%H:%M:%S')}{formatted_offset}"
-
-                updated_data = {
-                    "date": str(tx_date),
-                    "time": time_string,
-                    "amount": amount,
-                    "merchant": final_merchant,
-                    "category": final_category,
-                    "description": description,
-                    "type": workflow_type
-                }
-                update_res = conn.table("Transactions").update(updated_data).eq("id", selected_tx["id"]).execute()
-                if update_res:
-                    st.success("Transaction successfully updated!")
-                    st.rerun()
-                else:
-                    st.error("Failed to update transaction.")
-                    
-        if deleted:
-            delete_res = conn.table("Transactions").delete().eq("id", selected_tx["id"]).execute()
-            if delete_res:
-                st.success("Transaction successfully deleted!")
+            updated_data = {
+                "date": str(tx_date),
+                "time": time_string,
+                "amount": amount,
+                "merchant": final_merchant,
+                "category": final_category,
+                "description": description,
+                "type": workflow_type
+            }
+            update_res = conn.table("Transactions").update(updated_data).eq("id", selected_tx["id"]).execute()
+            if update_res:
+                st.session_state.pop("edit_merchant_val", None)
+                st.session_state.pop("edit_selected_cat", None)
+                st.success("Transaction successfully updated!")
                 st.rerun()
             else:
-                st.error("Failed to delete transaction.")
+                st.error("Failed to update transaction.")
+                
+    if deleted:
+        delete_res = conn.table("Transactions").delete().eq("id", selected_tx["id"]).execute()
+        if delete_res:
+            st.session_state.pop("edit_merchant_val", None)
+            st.session_state.pop("edit_selected_cat", None)
+            st.success("Transaction successfully deleted!")
+            st.rerun()
+        else:
+            st.error("Failed to delete transaction.")
 
 # --- SIDEBAR BUTTONS & CONTROLS ---
 if st.sidebar.button("➕ Add Transaction", type="primary", use_container_width=True):
