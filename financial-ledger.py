@@ -175,25 +175,25 @@ def merchant_autocomplete_input(default_value="", key_suffix=""):
 def add_transaction_dialog():
     if "add_merchant_val" not in st.session_state:
         st.session_state.add_merchant_val = ""
+    if "add_selected_cat" not in st.session_state:
+        st.session_state.add_selected_cat = None
 
     workflow_type = st.radio("Transaction Type", ["AMZ Card", "Direct"], index=0, horizontal=True, key="add_workflow_type")
     amount = st.number_input("Amount ($)", value=None, placeholder="0.00", format="%.2f", key="add_amount")
     
     merchant_name = merchant_autocomplete_input(default_value=st.session_state.add_merchant_val, key_suffix="add")
     
-    # Check if merchant changed and auto-populate last used category
     if merchant_name != st.session_state.add_merchant_val:
         st.session_state.add_merchant_val = merchant_name
         cat_map = get_merchant_category_map()
         if merchant_name in cat_map:
             st.session_state.add_selected_cat = cat_map[merchant_name]
-            st.rerun()
 
     categories_list = get_existing_categories()
     cat_options = categories_list + ["➕ Add New Category..."]
     
     default_cat_idx = 0
-    if "add_selected_cat" in st.session_state and st.session_state.add_selected_cat in categories_list:
+    if st.session_state.add_selected_cat in categories_list:
         default_cat_idx = categories_list.index(st.session_state.add_selected_cat)
 
     selected_cat_option = st.selectbox("Category", cat_options, index=default_cat_idx, key="add_category_select")
@@ -257,14 +257,8 @@ def edit_transaction_dialog():
 
     if "edit_merchant_val" not in st.session_state:
         st.session_state.edit_merchant_val = selected_tx.get("merchant", "")
-
-    categories_list = get_existing_categories()
-    current_cat = selected_tx.get("category")
-    if current_cat not in categories_list:
-        categories_list.append(current_cat)
-    categories_list = sorted(list(set(categories_list)))
-    
-    cat_default_idx = categories_list.index(current_cat) if current_cat in categories_list else 0
+    if "edit_selected_cat" not in st.session_state:
+        st.session_state.edit_selected_cat = selected_tx.get("category", "")
 
     workflow_types = ["AMZ Card", "Direct"]
     current_type = selected_tx.get("type", "AMZ Card")
@@ -279,10 +273,14 @@ def edit_transaction_dialog():
         cat_map = get_merchant_category_map()
         if merchant_name in cat_map:
             st.session_state.edit_selected_cat = cat_map[merchant_name]
-            st.rerun()
 
-    if "edit_selected_cat" in st.session_state and st.session_state.edit_selected_cat in categories_list:
-        cat_default_idx = categories_list.index(st.session_state.edit_selected_cat)
+    categories_list = get_existing_categories()
+    current_cat = st.session_state.edit_selected_cat
+    if current_cat not in categories_list and current_cat:
+        categories_list.append(current_cat)
+    categories_list = sorted(list(set(categories_list)))
+    
+    cat_default_idx = categories_list.index(current_cat) if current_cat in categories_list else 0
 
     cat_options = categories_list + ["➕ Add New Category..."]
     selected_cat_option = st.selectbox("Category", cat_options, index=cat_default_idx, key="edit_category_select")
