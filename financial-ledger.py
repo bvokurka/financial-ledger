@@ -168,7 +168,7 @@ def merchant_autocomplete_input(default_value="", key_suffix=""):
         </script>
     """
     st.components.v1.html(html_code, height=55)
-    return st.text_input(sync_key, value=default_value, label_visibility="collapsed")
+    return st.text_input(sync_key, value=default_value, label_visibility="collapsed", key=f"text_input_{sync_key}")
 
 # --- ADD TRANSACTION POP-UP MODAL DIALOG ---
 @st.dialog("Add New Transaction", width="medium")
@@ -183,11 +183,13 @@ def add_transaction_dialog():
     
     merchant_name = merchant_autocomplete_input(default_value=st.session_state.add_merchant_val, key_suffix="add")
     
+    # Update state and trigger rerun safely if merchant changes to populate category
     if merchant_name != st.session_state.add_merchant_val:
         st.session_state.add_merchant_val = merchant_name
         cat_map = get_merchant_category_map()
         if merchant_name in cat_map:
             st.session_state.add_selected_cat = cat_map[merchant_name]
+        st.rerun()
 
     categories_list = get_existing_categories()
     cat_options = categories_list + ["➕ Add New Category..."]
@@ -205,7 +207,7 @@ def add_transaction_dialog():
     tx_time = st.time_input("Time", value=local_now.time(), key="add_time")
     description = st.text_input("Description", key="add_desc")
         
-    if st.button("Save Transaction", type="primary", use_container_width=True):
+    if st.button("Save Transaction", type="primary", use_container_width=True, key="save_add_tx"):
         final_merchant = str(merchant_name).strip()
         final_category = custom_category.strip() if custom_category.strip() else selected_cat_option
         
@@ -252,7 +254,7 @@ def edit_transaction_dialog():
 
     tx_list = response.data
     tx_options = {f"ID {t['id']} | {t['date']} | {t['merchant']} | ${t['amount']}": t for t in tx_list}
-    selected_label = st.selectbox("Select Transaction to Edit", list(tx_options.keys()))
+    selected_label = st.selectbox("Select Transaction to Edit", list(tx_options.keys()), key="edit_tx_select_dropdown")
     selected_tx = tx_options[selected_label]
 
     if "edit_merchant_val" not in st.session_state:
@@ -273,6 +275,7 @@ def edit_transaction_dialog():
         cat_map = get_merchant_category_map()
         if merchant_name in cat_map:
             st.session_state.edit_selected_cat = cat_map[merchant_name]
+        st.rerun()
 
     categories_list = get_existing_categories()
     current_cat = st.session_state.edit_selected_cat
@@ -304,9 +307,9 @@ def edit_transaction_dialog():
         
     col1, col2 = st.columns(2)
     with col1:
-        submitted = st.button("Update Transaction", use_container_width=True, type="primary")
+        submitted = st.button("Update Transaction", use_container_width=True, type="primary", key="update_tx_btn")
     with col2:
-        deleted = st.button("🗑️ Delete Transaction", use_container_width=True, type="secondary")
+        deleted = st.button("🗑️ Delete Transaction", use_container_width=True, type="secondary", key="delete_tx_btn")
     
     if submitted:
         final_merchant = str(merchant_name).strip()
