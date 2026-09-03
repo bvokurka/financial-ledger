@@ -161,6 +161,26 @@ def merchant_autocomplete_input(default_value="", key_suffix=""):
                 syncToStreamlit();
             }});
 
+            inputElem.addEventListener("keydown", function(e) {{
+                if (e.key === "Tab") {{
+                    e.preventDefault();
+                    syncToStreamlit();
+                    const parentDoc = window.parent.document;
+                    const focusables = Array.from(parentDoc.querySelectorAll('button, [href], input:not([type="hidden"]), select, textarea, [tabindex]:not([tabindex="-1"]), [data-baseweb="select"]'));
+                    const syncInput = parentDoc.querySelector('input[aria-label="{sync_key}"]');
+                    const syncIndex = focusables.indexOf(syncInput);
+                    
+                    if (syncIndex !== -1) {{
+                        const targetIndex = e.shiftKey ? syncIndex - 1 : syncIndex + 1;
+                        if (targetIndex >= 0 && targetIndex < focusables.length) {{
+                            const target = focusables[targetIndex];
+                            const focusTarget = target.querySelector('input, button, select') || target;
+                            focusTarget.focus();
+                        }}
+                    }}
+                }}
+            }});
+
             inputElem.addEventListener("change", syncToStreamlit);
             inputElem.addEventListener("blur", syncToStreamlit);
             
