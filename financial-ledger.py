@@ -1,4 +1,4 @@
-import inspect
+from uuid import uuid4
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -41,7 +41,6 @@ BASE_CATEGORIES = [
     "Other",
 ]
 
-NEW_MERCHANT_OPTION = "➕ Add New Merchant..."
 NEW_CATEGORY_OPTION = "➕ Add New Category..."
 
 
@@ -265,56 +264,8 @@ def clear_transaction_caches() -> None:
 
 
 # ============================================================
-# STREAMLIT WIDGET CAPABILITY HELPERS
+# TRANSACTION STATE HELPERS
 # ============================================================
-
-
-def selectbox_supports_new_options() -> bool:
-    """Return whether this Streamlit build exposes accept_new_options on selectbox."""
-    try:
-        return "accept_new_options" in inspect.signature(st.selectbox).parameters
-    except (TypeError, ValueError):
-        return False
-
-
-# ============================================================
-# MERCHANT / CATEGORY STATE HELPERS
-# ============================================================
-
-
-def _category_key_for_merchant_change(prefix: str) -> str:
-    return f"{prefix}_category"
-
-
-def _custom_category_key(prefix: str) -> str:
-    return f"{prefix}_custom_category"
-
-
-def handle_merchant_change(prefix: str) -> None:
-    """When merchant changes, set category to that merchant's latest category."""
-    merchant_key = f"{prefix}_merchant"
-    merchant = st.session_state.get(merchant_key, "")
-
-    if merchant == NEW_MERCHANT_OPTION:
-        merchant = st.session_state.get(f"{prefix}_new_merchant", "")
-
-    merchant = str(merchant or "").strip()
-
-    category_key = _category_key_for_merchant_change(prefix)
-    custom_key = _custom_category_key(prefix)
-
-    latest_category = get_last_category_for_merchant(merchant)
-
-    if latest_category:
-        st.session_state[category_key] = latest_category
-    else:
-        categories = list(get_existing_categories())
-        if categories:
-            st.session_state[category_key] = categories[0]
-
-    # A manual custom-category override from a prior merchant should not silently
-    # override the newly selected merchant's default.
-    st.session_state[custom_key] = ""
 
 
 def reset_add_transaction_state() -> None:
@@ -323,7 +274,7 @@ def reset_add_transaction_state() -> None:
         "add_workflow_type",
         "add_amount",
         "add_merchant",
-        "add_new_merchant",
+        "add_last_merchant_signature",
         "add_category",
         "add_custom_category",
         "add_date",
@@ -334,6 +285,7 @@ def reset_add_transaction_state() -> None:
     for key in keys_to_clear:
         st.session_state.pop(key, None)
 
+    st.session_state["add_merchant_instance"] = uuid4().hex
     st.session_state["add_workflow_type"] = "AMZ Card"
     st.session_state["add_category"] = list(get_existing_categories())[0]
 
@@ -372,6 +324,7 @@ def initialize_edit_transaction_state(selected_tx: dict) -> None:
     except Exception:
         edit_time = datetime.now(LOCAL_TZ).time().replace(microsecond=0)
 
+    st.session_state["edit_merchant_instance"] = uuid4().hex
     st.session_state["edit_loaded_tx_id"] = tx_id
     st.session_state["edit_workflow_type"] = current_type
     st.session_state["edit_amount"] = float(selected_tx.get("amount", 0.0) or 0.0)
@@ -391,81 +344,150 @@ def initialize_edit_transaction_state(selected_tx: dict) -> None:
 # ============================================================
 
 
-def merchant_selector(
-    prefix: str,
-    current_merchant: str = "",
-) -> str:
-    """
-    Native Streamlit merchant selector.
+MERCHANT_HTML = """
+<label for="merchant">Merchant</label>
+<input id="merchant" type="text" autocomplete="off" spellcheck="false"
+       aria-autocomplete="inline" aria-describedby="merchant-help"
+       placeholder="Start typing a merchant..." />
+<small id="merchant-help">Tab accepts the completion. Escape dismisses it.</small>
+"""
 
-    On newer Streamlit versions, accept_new_options=True provides the desired
-    "search existing or type a new merchant" experience.
+MERCHANT_CSS = """
+label { display: block; margin-bottom: .4rem; font-size: .875rem; }
+input {
+    box-sizing: border-box; width: 100%; padding: .65rem .75rem;
+    border: 1px solid var(--st-border-color, #80808066);
+    border-radius: .5rem; font: inherit;
+    color: var(--st-text-color);
+    background: var(--st-secondary-background-color);
+}
+input:focus { outline: 2px solid var(--st-primary-color); outline-offset: -2px; }
+small { display: block; margin-top: .25rem; opacity: .7; font-size: .75rem; }
+"""
 
-    On older versions, the selector falls back to an explicit New Merchant field.
-    No JavaScript or DOM/React manipulation is used.
-    """
-    existing_merchants = list(get_existing_merchants())
+MERCHANT_JS = r"""
+export default function({ parentElement, data, setStateValue }) {
+    const input = parentElement.querySelector('input');
+    const merchants = data.merchants;
+    // Preserve an uncommitted draft if another widget causes a rerender.
+    // Python gives each newly opened/selected transaction a fresh component key.
+    if (!input.dataset.initialized) {
+        input.value = data.value || '';
+        input.dataset.initialized = 'true';
+        input.dataset.committed = input.value.trim();
+    }
 
-    if current_merchant:
-        normalized = current_merchant.strip()
-        existing_by_key = {merchant.casefold(): merchant for merchant in existing_merchants}
-        if normalized and normalized.casefold() not in existing_by_key:
-            existing_merchants.append(normalized)
-            existing_merchants.sort(key=str.lower)
+    let suggestionStart = null;
+    let composing = false;
 
-    if selectbox_supports_new_options():
-        kwargs = {
-            "label": "Merchant",
-            "options": existing_merchants,
-            "key": f"{prefix}_merchant",
-            "accept_new_options": True,
+    function commit() {
+        suggestionStart = null;
+        const typed = input.value.trim();
+        const exact = merchants.find(
+            merchant => merchant.toLowerCase() === typed.toLowerCase()
+        );
+        const value = exact || typed;
+        input.value = value;
+        if (value !== input.dataset.committed) {
+            input.dataset.committed = value;
+            setStateValue('value', value);
         }
+    }
 
-        if current_merchant:
-            current_key = current_merchant.casefold()
-            matching_index = next(
-                (i for i, merchant in enumerate(existing_merchants)
-                 if merchant.casefold() == current_key),
-                None,
-            )
-            kwargs["index"] = matching_index
-        elif "placeholder" in inspect.signature(st.selectbox).parameters:
-            kwargs["index"] = None
-            kwargs["placeholder"] = "Search existing merchant or type a new one..."
-        else:
-            kwargs["index"] = 0 if existing_merchants else None
+    function complete() {
+        suggestionStart = null;
+        const prefix = input.value;
+        // Complete only at the end, so editing the middle remains predictable.
+        if (!prefix || input.selectionStart !== prefix.length ||
+                input.selectionEnd !== prefix.length) return;
+        const match = merchants.find(
+            merchant => merchant.toLowerCase().startsWith(prefix.toLowerCase())
+        );
+        if (match && match.length > prefix.length) {
+            // Keep typed casing until acceptance; select only the added suffix.
+            input.value = prefix + match.slice(prefix.length);
+            suggestionStart = prefix.length;
+            input.setSelectionRange(prefix.length, input.value.length);
+        }
+    }
 
-        selected = st.selectbox(**kwargs)
-        return str(selected or "").strip()
+    input.oninput = event => {
+        suggestionStart = null;
+        if (composing || event.isComposing) return;
+        // Deletion must remove text without immediately putting it back.
+        if ((event.inputType || '').startsWith('delete')) return;
+        complete();
+    };
+    input.oncompositionstart = () => { composing = true; };
+    input.oncompositionend = () => { composing = false; complete(); };
+    input.onkeydown = event => {
+        if (composing || event.isComposing) return;
+        if (event.key === 'Tab') {
+            commit();
+            // Allow the browser's normal Tab/Shift+Tab focus navigation.
+        } else if (event.key === 'Enter') {
+            event.preventDefault();
+            commit();
+            input.setSelectionRange(input.value.length, input.value.length);
+        } else if (event.key === 'Escape' && suggestionStart !== null) {
+            event.preventDefault();
+            event.stopPropagation();
+            input.value = input.value.slice(0, suggestionStart);
+            input.setSelectionRange(input.value.length, input.value.length);
+            suggestionStart = null;
+        } else if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+            suggestionStart = null;
+        }
+    };
+    input.onpointerdown = () => { suggestionStart = null; };
+    input.onblur = commit;
+}
+"""
 
-    # Compatibility fallback for older Streamlit versions.
-    options = [NEW_MERCHANT_OPTION] + existing_merchants
 
-    if current_merchant and current_merchant in options:
-        default_index = options.index(current_merchant)
-    else:
-        default_index = 0 if not current_merchant else 0
-
-    selected = st.selectbox(
-        "Merchant",
-        options,
-        index=default_index,
-        key=f"{prefix}_merchant",
-        on_change=handle_merchant_change,
-        args=(prefix,),
+@st.cache_resource
+def get_merchant_component():
+    """Register once using Streamlit's public component API."""
+    try:
+        from streamlit.components.v2 import component
+    except ImportError:
+        st.error("Merchant autocomplete requires Streamlit 1.51 or newer.")
+        st.stop()
+    return component(
+        "ledger_merchant_autocomplete",
+        html=MERCHANT_HTML,
+        css=MERCHANT_CSS,
+        js=MERCHANT_JS,
     )
 
-    if selected == NEW_MERCHANT_OPTION:
-        new_merchant = st.text_input(
-            "New Merchant Name",
-            placeholder="Enter merchant name...",
-            key=f"{prefix}_new_merchant",
-            on_change=handle_merchant_change,
-            args=(prefix,),
-        )
-        return new_merchant.strip()
 
-    return selected.strip()
+def merchant_selector(prefix: str, current_merchant: str = "") -> str:
+    """Inline prefix completion; Tab, Enter, or blur commits the merchant."""
+    merchant_key = f"{prefix}_merchant"
+    instance_key = f"{prefix}_merchant_instance"
+    if instance_key not in st.session_state:
+        st.session_state[instance_key] = uuid4().hex
+
+    # Match and deduplicate case-insensitively, with a stable suggestion order.
+    by_key = {}
+    for merchant in get_existing_merchants():
+        if merchant.strip():
+            by_key.setdefault(merchant.strip().casefold(), merchant.strip())
+    if current_merchant.strip():
+        by_key.setdefault(current_merchant.strip().casefold(), current_merchant.strip())
+    merchants = sorted(by_key.values(), key=str.casefold)
+    initial = str(st.session_state.get(merchant_key, current_merchant) or "")
+
+    result = get_merchant_component()(
+        data={"merchants": merchants, "value": initial},
+        default={"value": initial},
+        key=f"{prefix}_autocomplete_{st.session_state[instance_key]}",
+        on_value_change=lambda: None,
+    )
+    value = str(result.value if result.value is not None else initial).strip()
+    value = by_key.get(value.casefold(), value)
+    st.session_state[merchant_key] = value
+    return value
 
 
 # ============================================================
@@ -481,8 +503,8 @@ def category_selector(
     """
     Render Category and the optional New Category field.
 
-    The merchant selector's callback changes the category widget state when the
-    merchant changes. The user may then override the category normally.
+    The dialog synchronizes category state when the accepted merchant changes.
+    The user may then override the category normally.
     """
     categories = list(get_existing_categories())
 
@@ -593,12 +615,9 @@ def add_transaction_dialog():
         key="add_amount",
     )
 
-    # The current code uses the native selector. In the accept_new_options case,
-    # the user can type a new merchant directly; changing the merchant itself will
-    # trigger a Streamlit rerun, and the category state is synchronized below.
     merchant_name = merchant_selector("add")
 
-    # Detect a merchant change for the native accept_new_options selector.
+    # Apply category defaults only when the accepted merchant changes.
     merchant_signature = str(merchant_name or "").strip().casefold()
     previous_signature = st.session_state.get("add_last_merchant_signature")
 
@@ -608,7 +627,7 @@ def add_transaction_dialog():
 
         if latest_category and latest_category in categories:
             st.session_state["add_category"] = latest_category
-        elif categories and "add_category" not in st.session_state:
+        elif categories:
             st.session_state["add_category"] = categories[0]
 
         st.session_state["add_custom_category"] = ""
@@ -760,7 +779,7 @@ def edit_transaction_dialog():
         current_merchant=original_merchant,
     )
 
-    # Explicit merchant-change detection for the native selector path.
+    # Preserve the saved category until the accepted merchant changes.
     merchant_signature = str(merchant_name or "").strip().casefold()
     previous_signature = st.session_state.get("edit_last_merchant_signature")
 
@@ -915,6 +934,7 @@ if st.sidebar.button(
     "✏️ Edit Transaction",
     use_container_width=True,
 ):
+    st.session_state.pop("edit_loaded_tx_id", None)
     edit_transaction_dialog()
 
 
@@ -1143,5 +1163,3 @@ elif account_selection == "Direct PLUS Loan":
     l1.metric("Remaining Principal", "$12,350.00")
     l2.metric("Interest Rate", "6.8%")
     l3.metric("Next Payment Due", "Sep 15, 2026")
-
-
