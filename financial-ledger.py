@@ -139,33 +139,27 @@ def add_transaction_dialog():
         merchant_name = merchant_autocomplete_input(default_value="", key_suffix="add")
         
         categories_list = get_existing_categories()
-        cat_options = categories_list + ["➕ Add New Category..."]
-        selected_cat_option = st.selectbox("Category", cat_options)
-        
-        if selected_cat_option == "➕ Add New Category...":
-            category = st.text_input("New Category Name")
-        else:
-            category = selected_cat_option
+        selected_cat_option = st.selectbox("Category", categories_list + ["➕ Add New Category..."])
+        custom_category = st.text_input("New Category Name", placeholder="Type here to override dropdown...")
 
         tx_date = st.date_input("Date")
         
-        # Default time initialized to EST
         local_now = datetime.now(ZoneInfo("America/New_York"))
         tx_time = st.time_input("Time", value=local_now.time())
-        
         description = st.text_input("Description")
             
         submitted = st.form_submit_button("Save Transaction")
         
         if submitted:
             final_merchant = str(merchant_name).strip()
-            final_category = str(category).strip()
+            final_category = custom_category.strip() if custom_category.strip() else selected_cat_option
+            
             if amount is None:
                 st.error("Please enter a valid amount.")
             elif not final_merchant:
                 st.error("Please provide a valid merchant name.")
-            elif not final_category:
-                st.error("Please provide a valid category name.")
+            elif final_category == "➕ Add New Category...":
+                st.error("Please type a name for your new category in the text box.")
             else:
                 local_tz = ZoneInfo("America/New_York")
                 naive_dt = datetime.combine(tx_date, tx_time)
@@ -210,7 +204,6 @@ def edit_transaction_dialog():
         categories_list.append(current_cat)
     categories_list = sorted(list(set(categories_list)))
     
-    cat_options = categories_list + ["➕ Add New Category..."]
     cat_default_idx = categories_list.index(current_cat) if current_cat in categories_list else 0
 
     workflow_types = ["AMZ Card", "Direct"]
@@ -222,11 +215,8 @@ def edit_transaction_dialog():
         amount = st.number_input("Amount ($)", value=float(selected_tx.get("amount", 0.0)), format="%.2f")
         merchant_name = merchant_autocomplete_input(default_value=selected_tx.get("merchant", ""), key_suffix="edit")
         
-        selected_cat_option = st.selectbox("Category", cat_options, index=cat_default_idx)
-        if selected_cat_option == "➕ Add New Category...":
-            category = st.text_input("New Category Name")
-        else:
-            category = selected_cat_option
+        selected_cat_option = st.selectbox("Category", categories_list + ["➕ Add New Category..."], index=cat_default_idx)
+        custom_category = st.text_input("New Category Name", placeholder="Type here to override dropdown...")
         
         try:
             default_date = datetime.strptime(selected_tx.get("date"), "%Y-%m-%d").date()
@@ -252,11 +242,12 @@ def edit_transaction_dialog():
         
         if submitted:
             final_merchant = str(merchant_name).strip()
-            final_category = str(category).strip()
+            final_category = custom_category.strip() if custom_category.strip() else selected_cat_option
+            
             if not final_merchant:
                 st.error("Please provide a valid merchant name.")
-            elif not final_category:
-                st.error("Please provide a valid category name.")
+            elif final_category == "➕ Add New Category...":
+                st.error("Please type a name for your new category in the text box.")
             else:
                 local_tz = ZoneInfo("America/New_York")
                 naive_dt = datetime.combine(tx_date, tx_time)
