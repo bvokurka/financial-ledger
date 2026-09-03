@@ -161,26 +161,6 @@ def merchant_autocomplete_input(default_value="", key_suffix=""):
                 syncToStreamlit();
             }});
 
-            inputElem.addEventListener("keydown", function(e) {{
-                if (e.key === "Tab") {{
-                    e.preventDefault();
-                    syncToStreamlit();
-                    const parentDoc = window.parent.document;
-                    const focusables = Array.from(parentDoc.querySelectorAll('button, [href], input:not([type="hidden"]), select, textarea, [tabindex]:not([tabindex="-1"]), [data-baseweb="select"]'));
-                    const syncInput = parentDoc.querySelector('input[aria-label="{sync_key}"]');
-                    const syncIndex = focusables.indexOf(syncInput);
-                    
-                    if (syncIndex !== -1) {{
-                        const targetIndex = e.shiftKey ? syncIndex - 1 : syncIndex + 1;
-                        if (targetIndex >= 0 && targetIndex < focusables.length) {{
-                            const target = focusables[targetIndex];
-                            const focusTarget = target.querySelector('input, button, select') || target;
-                            focusTarget.focus();
-                        }}
-                    }}
-                }}
-            }});
-
             inputElem.addEventListener("change", syncToStreamlit);
             inputElem.addEventListener("blur", syncToStreamlit);
             
@@ -193,22 +173,28 @@ def merchant_autocomplete_input(default_value="", key_suffix=""):
 # --- ADD TRANSACTION POP-UP MODAL DIALOG ---
 @st.dialog("Add New Transaction", width="medium")
 def add_transaction_dialog():
-    workflow_type = st.radio("Transaction Type", ["AMZ Card", "Direct"], index=0, horizontal=True, key="add_workflow_type")
-    amount = st.number_input("Amount ($)", value=None, placeholder="0.00", format="%.2f", key="add_amount")
-    
-    merchant_name = merchant_autocomplete_input(key_suffix="add")
-    
     categories_list = get_existing_categories()
     cat_options = categories_list + ["➕ Add New Category..."]
     cat_map = get_merchant_category_map()
-    
-    default_cat_idx = 0
-    if merchant_name and merchant_name in cat_map:
-        target_cat = cat_map[merchant_name]
-        if target_cat in categories_list:
-            default_cat_idx = categories_list.index(target_cat)
 
-    selected_cat_option = st.selectbox("Category", cat_options, index=default_cat_idx)
+    if "add_merchant_val" not in st.session_state:
+        st.session_state.add_merchant_val = ""
+    if "add_category_val" not in st.session_state:
+        st.session_state.add_category_val = categories_list[0]
+
+    workflow_type = st.radio("Transaction Type", ["AMZ Card", "Direct"], index=0, horizontal=True, key="add_workflow_type")
+    amount = st.number_input("Amount ($)", value=None, placeholder="0.00", format="%.2f", key="add_amount")
+    
+    merchant_name = merchant_autocomplete_input(default_value=st.session_state.add_merchant_val, key_suffix="add")
+    
+    if merchant_name != st.session_state.add_merchant_val:
+        st.session_state.add_merchant_val = merchant_name
+        if merchant_name in cat_map:
+            target_cat = cat_map[merchant_name]
+            if target_cat in categories_list:
+                st.session_state.add_category_val = target_cat
+
+    selected_cat_option = st.selectbox("Category", cat_options, key="add_category_val")
     custom_category = st.text_input("New Category Name", placeholder="Type here to override dropdown...", key="add_custom_category")
 
     tx_date = st.date_input("Date", key="add_date")
@@ -265,6 +251,11 @@ def edit_transaction_dialog():
     selected_label = st.selectbox("Select Transaction to Edit", list(tx_options.keys()), key="edit_tx_select_dropdown")
     selected_tx = tx_options[selected_label]
 
+    if "edit_active_id" not in st.session_state or st.session_state.edit_active_id != selected_tx["id"]:
+        st.session_state.edit_active_id = selected_tx["id"]
+        st.session_state.edit_merchant_val = selected_tx.get("merchant", "")
+        st.session_state.edit_category_val = selected_tx.get("category", "")
+
     workflow_types = ["AMZ Card", "Direct"]
     current_type = selected_tx.get("type", "AMZ Card")
     type_default_idx = workflow_types.index(current_type) if current_type in workflow_types else 0
@@ -272,26 +263,24 @@ def edit_transaction_dialog():
     workflow_type = st.radio("Transaction Type", workflow_types, index=type_default_idx, horizontal=True, key="edit_workflow_type")
     amount = st.number_input("Amount ($)", value=float(selected_tx.get("amount", 0.0)), format="%.2f", key="edit_amount")
     
-    merchant_name = merchant_autocomplete_input(default_value=selected_tx.get("merchant", ""), key_suffix="edit")
+    merchant_name = merchant_autocomplete_input(default_value=st.session_state.edit_merchant_val, key_suffix="edit")
 
     categories_list = get_existing_categories()
-    current_cat = selected_tx.get("category", "")
-    if current_cat not in categories_list and current_cat:
-        categories_list.append(current_cat)
+    if st.session_state.edit_category_val not in categories_list and st.session_state.edit_category_val:
+        categories_list.append(st.session_state.edit_category_val)
     categories_list = sorted(list(set(categories_list)))
     
     cat_map = get_merchant_category_map()
-    default_cat_idx = 0
-    target_cat = current_cat
     
-    if merchant_name != selected_tx.get("merchant", "") and merchant_name in cat_map:
-        target_cat = cat_map[merchant_name]
-        
-    if target_cat in categories_list:
-        default_cat_idx = categories_list.index(target_cat)
+    if merchant_name != st.session_state.edit_merchant_val:
+        st.session_state.edit_merchant_val = merchant_name
+        if merchant_name in cat_map:
+            target_cat = cat_map[merchant_name]
+            if target_cat in categories_list:
+                st.session_state.edit_category_val = target_cat
 
     cat_options = categories_list + ["➕ Add New Category..."]
-    selected_cat_option = st.selectbox("Category", cat_options, index=default_cat_idx)
+    selected_cat_option = st.selectbox("Category", cat_options, key="edit_category_val")
     custom_category = st.text_input("New Category Name", placeholder="Type here to override dropdown...", key="edit_custom_category")
     
     try:
