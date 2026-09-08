@@ -827,6 +827,10 @@ def edit_transaction_dialog():
 
     selected_tx = tx_options[selected_label]
     initialize_edit_transaction_state(selected_tx)
+    if selected_tx.get('card_budget_week'):
+        paid_week = load_card_weeks().get(str(selected_tx['card_budget_week']))
+        if paid_week:
+            st.info('This card entry has been reconciled. Amount, direction, date, type and deletion are locked; merchant, description and category can still be edited.')
 
     workflow_types = ["AMZ Card", "Direct"]
 
@@ -1032,15 +1036,15 @@ def week_ending(day):
     return day + timedelta(days=(5 - day.weekday()) % 7)
 
 
-def calendar_balances(transactions, settings, first, last, as_of=None):
+def calendar_balances(transactions, settings, first, last, as_of=None, reconciled=None):
     """Roll balances forward from the latest explicit opening balance.
 
     Amounts are nonnegative; direction defines income or expense.
     AMZ Card expenses minus card income/refunds are settled on Saturday.
-    Reserve remaining budget through Saturday. After Saturday, release it from
-    checking projections and report it separately as completed-week surplus.
+    Open weeks reserve their budget on Saturday until explicitly reconciled.
+    Closed weeks deduct their frozen payment on its actual date and retain surplus.
     """
-    as_of = as_of or datetime.now(LOCAL_TZ).date()
+    reconciled = reconciled or {}
     anchors = [key for key in settings if key.startswith('opening:')
                and date.fromisoformat(key.split(':', 1)[1]) <= first]
     if not anchors:
@@ -1048,12 +1052,19 @@ def calendar_balances(transactions, settings, first, last, as_of=None):
     anchor = max(anchors)
     start = date.fromisoformat(anchor.split(':', 1)[1])
     balance = money(settings[anchor]['amount'])
-    direct, card = {}, {}
+    direct, card, payments = {}, {}, {}
+    for closed in reconciled.values():
+        payment_day = date.fromisoformat(closed['payment_date'])
+        payments.setdefault(payment_day, []).append(closed)
     for row in transactions:
         day = date.fromisoformat(str(row['date'])[:10])
         amount = money(row.get('amount', 0))
         kind = row.get('type')
-        effective = week_ending(day) if kind == 'AMZ Card' else day
+        assigned_week = (date.fromisoformat(str(row['card_budget_week']))
+                         if row.get('card_budget_week') else week_ending(day))
+        if kind == 'AMZ Card' and assigned_week.isoformat() in reconciled:
+            continue  # Its immutable payment is counted separately, once.
+        effective = assigned_week if kind == 'AMZ Card' else day
         if effective < start or effective > last:
             continue
         direction = row.get('direction')
@@ -1061,7 +1072,7 @@ def calendar_balances(transactions, settings, first, last, as_of=None):
             raise ValueError(f"Classify transaction {row.get('id')} as Income or Expense with a nonnegative amount.")
         if kind == 'AMZ Card':
             amount = amount if direction == 'Expense' else -amount
-            saturday = week_ending(day)
+            saturday = assigned_week
             card[saturday] = card.get(saturday, Decimal(0)) + amount
         elif kind == 'Direct':
             amount = amount if direction == 'Income' else -amount
@@ -1071,23 +1082,28 @@ def calendar_balances(transactions, settings, first, last, as_of=None):
     days = {}
     day = start
     while day <= last:
-        net = direct.get(day, Decimal(0))
+        net = direct.get(day, Decimal(0)) - sum((money(row['paid_amount']) for row in payments.get(day, [])), Decimal(0))
         spent, remaining, budget = Decimal(0), Decimal(0), Decimal(0)
         surplus = Decimal(0)
-        completed = day.weekday() == 5 and day < as_of
+        completed = day.isoformat() in reconciled
         if day.weekday() == 5:
             spent = card.get(day, Decimal(0))
             budget_key = 'budget:' + day.isoformat()
             budget = money(settings.get(budget_key, {}).get('amount', 0))
             remaining = max(budget - spent, Decimal(0))
-            surplus = remaining if completed and budget_key in settings else Decimal(0)
-            reserved = Decimal(0) if completed else remaining
-            net -= max(spent + reserved, Decimal(0))
+            if completed:
+                snapshot = reconciled[day.isoformat()]
+                spent = money(snapshot['paid_amount'])
+                budget = money(snapshot['budget_amount'])
+                remaining = max(budget - spent, Decimal(0))
+                surplus = remaining
+            else:
+                net -= max(spent + remaining, Decimal(0))
         balance += net
         if day >= first:
             days[day] = dict(balance=balance, net=net, spent=spent,
                              remaining=remaining, budget=budget,
-                             surplus=surplus, completed=completed)
+                             surplus=surplus, completed=completed, payments=payments.get(day, []))
         day += timedelta(days=1)
     return days, start
 
@@ -1126,6 +1142,89 @@ def save_calendar_setting(key, amount, previous):
         return False
 
 
+def load_card_weeks():
+    records, offset = {}, 0
+    while True:
+        response = conn.table('LedgerCardWeeks').select('*').order('week_ending').range(offset, offset + 499).execute()
+        if response.data is None:
+            raise RuntimeError('Card reconciliation records could not be loaded.')
+        records.update({row['week_ending']: row for row in response.data})
+        if len(response.data) < 500:
+            return records
+        offset += 500
+
+
+@st.dialog('Reconcile and mark card paid', width='large')
+def reconcile_card_dialog():
+    require_session()
+    try:
+        clear_transaction_caches()
+        rows = get_transactions_cached()
+        settings = load_calendar_settings()
+        closed = load_card_weeks()
+    except Exception:
+        st.error('Could not load card weeks. Apply card_reconciliation.sql and check the connection.')
+        return
+    candidates = {str(row['card_budget_week']) for row in rows
+                  if row.get('type') == 'AMZ Card' and row.get('card_budget_week')}
+    candidates.update(key.split(':', 1)[1] for key in settings if key.startswith('budget:'))
+    if closed:
+        candidates.add((date.fromisoformat(max(closed)) + timedelta(days=7)).isoformat())
+    candidates = sorted(candidates - set(closed))
+    if not candidates:
+        st.info('Save a weekly budget or add a card transaction first.')
+        return
+    week = st.selectbox('Budget week ending Saturday', candidates)
+    included = sorted([row for row in rows if row.get('type') == 'AMZ Card'
+                       and str(row.get('card_budget_week')) == week], key=lambda row: int(row['id']))
+    st.dataframe(pd.DataFrame(included), use_container_width=True, hide_index=True)
+    if any(row.get('direction') not in ('Expense','Income') or money(row['amount']) < 0 for row in included):
+        st.error('Classify all included purchases and credits before closing this week.')
+        return
+    budget_key = 'budget:' + week
+    if budget_key not in settings:
+        st.info('Set this week’s budget first. This also lets you set a budget outside the displayed month.')
+        with st.form('reconcile_new_budget_' + week):
+            new_budget = st.number_input('Weekly card budget', min_value=0.0, format='%.2f')
+            save_budget = st.form_submit_button('Save weekly budget')
+        if save_budget and save_calendar_setting(budget_key, new_budget, None):
+            st.rerun()
+        return
+    budget = money(settings[budget_key]['amount'])
+    total = sum((money(row['amount']) * (1 if row['direction']=='Expense' else -1)
+                 for row in included), Decimal(0))
+    if total < 0:
+        st.error('This week has a net card credit; review it before marking a payment.')
+        return
+    st.write(f'Payment to record: **${total:,.2f}** · Budget surplus: **${max(budget-total, Decimal(0)):,.2f}**')
+    st.caption('This records a payment you already made; it does not send money. '
+               'The listed amounts, dates and budget assignments will be locked. '
+               'New card entries will go to the following budget week, regardless of their date.')
+    with st.form('confirm_card_payment_' + week):
+        payment_date = st.date_input('Actual payment date', value=datetime.now(LOCAL_TZ).date(),
+                                    max_value=datetime.now(LOCAL_TZ).date())
+        confirmed = st.checkbox('I reconciled these transactions and paid the amount shown.')
+        submitted = st.form_submit_button('Reconcile and mark paid', type='primary')
+    if submitted:
+        if not confirmed:
+            st.error('Confirm the reviewed transactions and payment first.')
+            return
+        try:
+            expected = [{'id': row['id'], 'amount': float(money(row['amount'])),
+                         'direction': row['direction']} for row in included]
+            response = conn.rpc('ledger_reconcile_card_week', {
+                'p_week': week, 'p_payment_date': payment_date.isoformat(),
+                'p_expected': expected, 'p_expected_budget': float(budget),
+            }).execute()
+            if not response.data:
+                raise RuntimeError('Payment was not confirmed.')
+            clear_transaction_caches()
+            st.rerun()
+        except Exception as exc:
+            # Database errors here are deliberate validation messages, not credentials.
+            st.error(f'Could not confirm reconciliation: {getattr(exc, "message", "Reload and review this week again.")}')
+
+
 def calendar_entry_html(row):
     """Read-only signed amount with an escaped, browser-native hover tooltip."""
     amount = money(row['amount'])
@@ -1151,9 +1250,10 @@ def render_editable_calendar():
     try:
         settings = load_calendar_settings()
         transactions = get_transactions_cached()
+        reconciled = load_card_weeks()
     except Exception:
         logger.exception('Unable to load editable calendar.')
-        st.error('The calendar could not be loaded. Run calendar_setup.sql once in Supabase, '
+        st.error('The calendar could not be loaded. Apply calendar_setup.sql and card_reconciliation.sql in Supabase, '
                  'then check that the app connection can access LedgerCalendarSettings.')
         return
 
@@ -1183,18 +1283,23 @@ def render_editable_calendar():
         st.info('Enter the opening balance above to enable the calendar.')
         return
     try:
-        balances, anchor = calendar_balances(transactions, settings, first, last)
+        balances, anchor = calendar_balances(transactions, settings, first, last, reconciled=reconciled)
     except (ValueError, KeyError, TypeError) as exc:
         st.error(f'The calendar cannot calculate balances: {exc}')
         return
 
     st.caption('Hover over a transaction amount for its description and merchant. '
                'Use the sidebar to add or edit transactions. Card purchases are '
-               'entered as positive AMZ Card transactions and deducted on Saturday. '
+               'entered as positive AMZ Card transactions and assigned to a budget week. '
                'Do not enter the same card payment again as a Direct expense.')
-    st.caption('Through Saturday, the day net reserves card spending plus remaining budget. '
-               'After Saturday, only card spending is deducted; unused budget is shown as surplus '
-               'and remains available in later balances. No offsetting income entry is needed.')
+    st.caption('Open card weeks reserve spending plus remaining budget on Saturday. '
+               'Use Reconcile card week after paying: the actual payment date then controls '
+               'the deduction, and unused budget is retained as surplus.')
+    if reconciled:
+        next_week = date.fromisoformat(max(reconciled)) + timedelta(days=7)
+        st.info(f'New card entries apply to the budget week ending {next_week:%b %d, %Y}, regardless of transaction date.')
+    if st.button('Reconcile card week', key='calendar_reconcile'):
+        reconcile_card_dialog()
     if anchor < first:
         st.caption(f'Opening balance carried forward from the saved balance on {anchor:%b %d, %Y}.')
     direct = {}
@@ -1217,17 +1322,24 @@ def render_editable_calendar():
                     st.markdown(f"**{day.day}** · **${values['balance']:,.2f}**")
                     for row in sorted(direct.get(day.isoformat(), []), key=lambda row: str(row['id'])):
                         st.markdown(calendar_entry_html(row), unsafe_allow_html=True)
+                    for payment in values['payments']:
+                        st.markdown(calendar_entry_html({
+                            'amount': payment['paid_amount'], 'direction': 'Expense',
+                            'merchant': 'Credit card payment',
+                            'description': f"Reconciled budget week ending {payment['week_ending']}",
+                        }), unsafe_allow_html=True)
                     if day.weekday() == 5:
                         key = 'budget:' + day.isoformat()
                         with st.form('budget_' + day.isoformat()):
                             budget = st.number_input('Weekly card budget', min_value=0.0,
-                                                     value=float(values['budget']), format='%.2f')
-                            saved = st.form_submit_button('Save budget')
+                                                     value=float(values['budget']), format='%.2f', disabled=values['completed'])
+                            saved = st.form_submit_button('Save budget', disabled=values['completed'])
                         if saved and save_calendar_setting(key, budget, settings.get(key)):
                             st.rerun()
                         if key not in settings:
                             st.caption('Budget not set; actual spending still deducted.')
                         if values['completed']:
+                            st.caption('Reconciled · paid ' + reconciled[day.isoformat()]['payment_date'])
                             if key in settings:
                                 st.write(f"Budget surplus: ${values['surplus']:,.2f}")
                             else:
@@ -1246,7 +1358,7 @@ def render_editable_calendar():
     st.metric('Monthly budget surplus — completed weeks', f"${monthly_surplus:,.2f}")
     st.caption('Includes completed weeks whose Saturday falls in this month. '
                'Over-budget weeks show zero surplus and are flagged above. '
-               'Corrections to saved budgets or purchases update these totals on refresh.')
+               'Reconciled payments and budget surplus are preserved from the saved reconciliation.')
     st.divider()
     st.subheader('Transaction Register & Schedule Mapping')
     st.dataframe(pd.DataFrame(transactions), use_container_width=True, hide_index=True)
@@ -1271,6 +1383,10 @@ if st.sidebar.button(
 ):
     st.session_state.pop("edit_loaded_tx_id", None)
     edit_transaction_dialog()
+
+
+if st.sidebar.button('Reconcile card week', use_container_width=True):
+    reconcile_card_dialog()
 
 
 st.sidebar.divider()
@@ -1341,3 +1457,4 @@ elif account_selection == "Direct PLUS Loan":
     l1.metric("Remaining Principal", "$12,350.00")
     l2.metric("Interest Rate", "6.8%")
     l3.metric("Next Payment Due", "Sep 15, 2026")
+
