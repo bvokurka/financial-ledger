@@ -1037,8 +1037,8 @@ def calendar_balances(transactions, settings, first, last, as_of=None):
 
     Amounts are nonnegative; direction defines income or expense.
     AMZ Card expenses minus card income/refunds are settled on Saturday.
-    Remaining budget is displayed for every week, including past weeks.
-    Only current/future weeks reserve unspent budget in checking projections.
+    Reserve remaining budget through Saturday. After Saturday, release it from
+    checking projections and report it separately as completed-week surplus.
     """
     as_of = as_of or datetime.now(LOCAL_TZ).date()
     anchors = [key for key in settings if key.startswith('opening:')
@@ -1073,17 +1073,21 @@ def calendar_balances(transactions, settings, first, last, as_of=None):
     while day <= last:
         net = direct.get(day, Decimal(0))
         spent, remaining, budget = Decimal(0), Decimal(0), Decimal(0)
+        surplus = Decimal(0)
+        completed = day.weekday() == 5 and day < as_of
         if day.weekday() == 5:
             spent = card.get(day, Decimal(0))
-            budget = money(settings.get('budget:' + day.isoformat(), {}).get('amount', 0))
+            budget_key = 'budget:' + day.isoformat()
+            budget = money(settings.get(budget_key, {}).get('amount', 0))
             remaining = max(budget - spent, Decimal(0))
-            # Historical budget availability remains visible, but is not a payment.
-            reserved = remaining if day >= as_of else Decimal(0)
+            surplus = remaining if completed and budget_key in settings else Decimal(0)
+            reserved = Decimal(0) if completed else remaining
             net -= max(spent + reserved, Decimal(0))
         balance += net
         if day >= first:
             days[day] = dict(balance=balance, net=net, spent=spent,
-                             remaining=remaining, budget=budget)
+                             remaining=remaining, budget=budget,
+                             surplus=surplus, completed=completed)
         day += timedelta(days=1)
     return days, start
 
@@ -1188,10 +1192,9 @@ def render_editable_calendar():
                'Use the sidebar to add or edit transactions. Card purchases are '
                'entered as positive AMZ Card transactions and deducted on Saturday. '
                'Do not enter the same card payment again as a Direct expense.')
-    st.caption('Balances include remaining weekly budget reservations. They are projected '
-               'checking balances until that spending occurs. After Saturday, unused budget '
-               'is released automatically and only recorded card spending is deducted. '
-               'Remaining still shows how much of that week’s budget was unspent.')
+    st.caption('Through Saturday, the day net reserves card spending plus remaining budget. '
+               'After Saturday, only card spending is deducted; unused budget is shown as surplus '
+               'and remains available in later balances. No offsetting income entry is needed.')
     if anchor < first:
         st.caption(f'Opening balance carried forward from the saved balance on {anchor:%b %d, %Y}.')
     direct = {}
@@ -1224,7 +1227,13 @@ def render_editable_calendar():
                             st.rerun()
                         if key not in settings:
                             st.caption('Budget not set; actual spending still deducted.')
-                        st.write(f"Remaining: ${values['remaining']:,.2f}")
+                        if values['completed']:
+                            if key in settings:
+                                st.write(f"Budget surplus: ${values['surplus']:,.2f}")
+                            else:
+                                st.caption('Budget surplus: not available without a saved budget.')
+                        else:
+                            st.write(f"Remaining: ${values['remaining']:,.2f}")
                         st.markdown(
                             '<div style="background:#00b4e6;color:#002b36;padding:6px;'
                             'border-radius:3px;font-weight:600">'
@@ -1233,6 +1242,11 @@ def render_editable_calendar():
                             st.caption(f"Over budget: ${values['spent'] - values['budget']:,.2f}")
                     st.caption(f"Day net: ${values['net']:,.2f}")
     st.metric('Projected month-end balance', f"${balances[last]['balance']:,.2f}")
+    monthly_surplus = sum((values['surplus'] for values in balances.values()), Decimal(0))
+    st.metric('Monthly budget surplus — completed weeks', f"${monthly_surplus:,.2f}")
+    st.caption('Includes completed weeks whose Saturday falls in this month. '
+               'Over-budget weeks show zero surplus and are flagged above. '
+               'Corrections to saved budgets or purchases update these totals on refresh.')
     st.divider()
     st.subheader('Transaction Register & Schedule Mapping')
     st.dataframe(pd.DataFrame(transactions), use_container_width=True, hide_index=True)
