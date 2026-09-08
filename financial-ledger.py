@@ -1037,7 +1037,8 @@ def calendar_balances(transactions, settings, first, last, as_of=None):
 
     Amounts are nonnegative; direction defines income or expense.
     AMZ Card expenses minus card income/refunds are settled on Saturday.
-    Remaining budget plus net card spending equals max(budget, spending).
+    Remaining budget is displayed for every week, including past weeks.
+    Only current/future weeks reserve unspent budget in checking projections.
     """
     as_of = as_of or datetime.now(LOCAL_TZ).date()
     anchors = [key for key in settings if key.startswith('opening:')
@@ -1075,8 +1076,10 @@ def calendar_balances(transactions, settings, first, last, as_of=None):
         if day.weekday() == 5:
             spent = card.get(day, Decimal(0))
             budget = money(settings.get('budget:' + day.isoformat(), {}).get('amount', 0))
-            remaining = max(budget - spent, Decimal(0)) if day >= as_of else Decimal(0)
-            net -= max(spent + remaining, Decimal(0))
+            remaining = max(budget - spent, Decimal(0))
+            # Historical budget availability remains visible, but is not a payment.
+            reserved = remaining if day >= as_of else Decimal(0)
+            net -= max(spent + reserved, Decimal(0))
         balance += net
         if day >= first:
             days[day] = dict(balance=balance, net=net, spent=spent,
@@ -1187,7 +1190,8 @@ def render_editable_calendar():
                'Do not enter the same card payment again as a Direct expense.')
     st.caption('Balances include remaining weekly budget reservations. They are projected '
                'checking balances until that spending occurs. After Saturday, unused budget '
-               'is released automatically and only recorded card spending is deducted.')
+               'is released automatically and only recorded card spending is deducted. '
+               'Remaining still shows how much of that week’s budget was unspent.')
     if anchor < first:
         st.caption(f'Opening balance carried forward from the saved balance on {anchor:%b %d, %Y}.')
     direct = {}
@@ -1323,4 +1327,3 @@ elif account_selection == "Direct PLUS Loan":
     l1.metric("Remaining Principal", "$12,350.00")
     l2.metric("Interest Rate", "6.8%")
     l3.metric("Next Payment Due", "Sep 15, 2026")
-
