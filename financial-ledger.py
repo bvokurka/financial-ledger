@@ -1,4 +1,5 @@
 from uuid import uuid4
+from html import escape
 import logging
 import math
 from datetime import datetime
@@ -1118,56 +1119,21 @@ def save_calendar_setting(key, amount, previous):
         return False
 
 
-def render_direct_entry(day, row=None):
-    """A separate save per entry avoids partially saved multi-row batches."""
-    identifier = str(row['id']) if row else 'new'
-    prefix = f'calendar_{day}_{identifier}'
-    with st.form(prefix, clear_on_submit=row is None):
-        direction = st.selectbox('Income / Expense', ['Expense', 'Income'],
-                                 index=(['Expense', 'Income'].index(row['direction'])
-                                        if row and row.get('direction') in ('Expense', 'Income') else (None if row else 0)),
-                                 key=prefix + '_direction')
-        amount = st.number_input(
-            'Amount', value=float(row['amount']) if row else None,
-            format='%.2f', step=1.0, key=prefix + '_amount',
-            label_visibility='collapsed', placeholder='Positive amount',
-        )
-        description = st.text_input(
-            'Description', value=(row.get('description') or row.get('merchant') or '') if row else '',
-            key=prefix + '_description', label_visibility='collapsed',
-            placeholder='Description',
-        )
-        save = st.form_submit_button('Save entry' if row else 'Add entry')
-    if not save:
-        return
-    if amount is None or amount < 0 or direction not in ('Income', 'Expense') or not description.strip():
-        st.error('Choose Income/Expense, and enter a nonnegative amount and description.')
-        return
-    try:
-        amount = money(amount)
-        if row:
-            # Preserve merchant, category, and date when editing calendar fields.
-            query = (conn.table('Transactions').update({
-                'amount': float(amount), 'description': description.strip(), 'direction': direction,
-            }).eq('id', row['id']).eq('amount', row['amount']))
-            query = (query.is_('direction', 'null') if row.get('direction') is None
-                     else query.eq('direction', row['direction']))
-            original_description = row.get('description')
-            query = (query.is_('description', 'null') if original_description is None
-                     else query.eq('description', original_description))
-            response = query.execute()
-        else:
-            response = conn.table('Transactions').insert({
-                'date': day.isoformat(), 'time': build_time_string(day, datetime.min.time()),
-                'amount': float(amount), 'merchant': description.strip(),
-                'description': description.strip(), 'category': 'Other', 'type': 'Direct', 'direction': direction,
-            }).execute()
-        if transaction_write_succeeded(response, 'calendar save'):
-            clear_transaction_caches()
-            st.rerun()
-    except Exception:
-        logger.exception('Unable to save calendar entry.')
-        st.error('Save could not be confirmed. Check the register before retrying.')
+def calendar_entry_html(row):
+    """Read-only signed amount with an escaped, browser-native hover tooltip."""
+    amount = money(row['amount'])
+    is_income = row.get('direction') == 'Income'
+    displayed = f"{'+' if is_income else '−'}${amount:,.2f}"
+    description = str(row.get('description') or 'Not provided')
+    merchant = str(row.get('merchant') or 'Not provided')
+    tooltip = f"Amount: {displayed}\nDescription: {description}\nMerchant: {merchant}"
+    color = '#238636' if is_income else '#d14343'
+    return (
+        f'<span tabindex="0" title="{escape(tooltip, quote=True)}" '
+        f'aria-label="{escape(tooltip, quote=True)}" '
+        f'style="display:block;cursor:help;color:{color};padding:3px 0;'
+        f'font-variant-numeric:tabular-nums;">{escape(displayed)}</span>'
+    )
 
 
 def render_editable_calendar():
@@ -1215,8 +1181,8 @@ def render_editable_calendar():
         st.error(f'The calendar cannot calculate balances: {exc}')
         return
 
-    st.caption('Edit amounts and descriptions inside each day, then save the entry. '
-               'Choose Income or Expense and enter positive amounts. Card purchases are '
+    st.caption('Hover over a transaction amount for its description and merchant. '
+               'Use the sidebar to add or edit transactions. Card purchases are '
                'entered as positive AMZ Card transactions and deducted on Saturday. '
                'Do not enter the same card payment again as a Direct expense.')
     st.caption('Balances include remaining weekly budget reservations. They are projected '
@@ -1243,9 +1209,7 @@ def render_editable_calendar():
                 with st.container(border=True):
                     st.markdown(f"**{day.day}** · **${values['balance']:,.2f}**")
                     for row in sorted(direct.get(day.isoformat(), []), key=lambda row: str(row['id'])):
-                        render_direct_entry(day, row)
-                    with st.expander('＋ Entry'):
-                        render_direct_entry(day)
+                        st.markdown(calendar_entry_html(row), unsafe_allow_html=True)
                     if day.weekday() == 5:
                         key = 'budget:' + day.isoformat()
                         with st.form('budget_' + day.isoformat()):
