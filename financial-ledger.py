@@ -1,11 +1,14 @@
 from uuid import uuid4
 import logging
+import math
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
-from st_supabase_connection import SupabaseConnection
+from supabase import create_client
+from time import monotonic
+from copy import deepcopy
 
 
 # ============================================================
@@ -54,35 +57,85 @@ if not logger.handlers:
 
 
 # ============================================================
-# SUPABASE CONNECTION
+# AUTHENTICATION — one Supabase client per browser session
 # ============================================================
 
-conn = st.connection("supabase", type=SupabaseConnection)
+ALLOWED_USER_ID = "5a9e2156-a5cb-4f65-9a7c-db8e0f92bf1d"
 
 
-# ============================================================
-# AUTHENTICATION
-# ============================================================
-
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
+def clear_login_state():
+    for key in list(st.session_state):
+        del st.session_state[key]
 
 
-if not st.session_state.authenticated:
-    st.title("Financial Ledger Login")
+def new_supabase_client():
+    config = st.secrets.get('connections', {}).get('supabase', {})
+    url = config.get('SUPABASE_URL') or config.get('url') or st.secrets.get('SUPABASE_URL')
+    key = config.get('SUPABASE_KEY') or config.get('key') or st.secrets.get('SUPABASE_KEY')
+    if not url or not key:
+        raise ValueError('Supabase connection settings are missing.')
+    # Reject administrative credentials: this app must use user-scoped RLS.
+    if str(key).startswith('sb_secret_'):
+        raise ValueError('Use the anon/public or publishable key, not a secret key.')
+    if str(key).startswith('eyJ'):
+        # This is only a configuration check, never a JWT authentication check.
+        import base64
+        import json
+        payload = str(key).split('.')[1]
+        role = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4))).get('role')
+        if role != 'anon':
+            raise ValueError('Use the anon/public key.')
+    return create_client(str(url), str(key))
 
-    password = st.text_input(
-        "Enter Password:",
-        type="password",
-    )
 
-    if password == st.secrets["APP_PASSWORD"]:
-        st.session_state.authenticated = True
-        st.rerun()
-    elif password:
-        st.error("Incorrect password")
-
+if 'ledger_client' not in st.session_state:
+    st.title('Financial Ledger Login')
+    with st.form('ledger_login', clear_on_submit=True):
+        email = st.text_input('Email')
+        password = st.text_input('Password', type='password')
+        submitted = st.form_submit_button('Sign in', type='primary')
+    if submitted:
+        try:
+            client = new_supabase_client()
+            result = client.auth.sign_in_with_password({'email': email.strip(), 'password': password})
+            if not result.user or str(result.user.id) != ALLOWED_USER_ID:
+                try:
+                    client.auth.sign_out()
+                finally:
+                    raise ValueError('Account is not authorized.')
+            clear_login_state()
+            st.session_state['ledger_client'] = client
+            st.session_state['last_activity'] = monotonic()
+            st.rerun()
+        except Exception:
+            # Do not log credentials, authentication responses, or tokens.
+            st.error('Sign-in failed. Check your email, password, and app connection settings.')
     st.stop()
+
+conn = st.session_state['ledger_client']
+def require_session():
+    if monotonic() - st.session_state.get('last_activity', 0) > 1800:
+        try:
+            conn.auth.sign_out()
+        except Exception:
+            pass
+        clear_login_state()
+        st.info('Your session expired. Sign in again.')
+        st.stop()
+    
+    try:
+        # get_user validates with the Auth server, rather than trusting local state.
+        verified = conn.auth.get_user()
+        if not verified.user or str(verified.user.id) != ALLOWED_USER_ID:
+            raise ValueError('Unauthorized account.')
+    except Exception:
+        clear_login_state()
+        st.error('Your session could not be verified. Reload and sign in again.')
+        st.stop()
+    st.session_state['last_activity'] = monotonic()
+
+
+require_session()
 
 
 # ============================================================
@@ -132,16 +185,22 @@ def _show_or_log_database_error(message: str, exc: Exception) -> None:
     )
 
 
-@st.cache_data(ttl=10, show_spinner=False)
 def get_transactions_cached() -> list[dict]:
-    """Fetch transactions once and reuse the result across the current cache window."""
+    """Session-local cache; never share financial records between logins."""
+    cached = st.session_state.get('ledger_rows')
+    if cached and monotonic() - cached['at'] < 10:
+        return deepcopy(cached['rows'])
     try:
-        response = (
-            conn
-            .table("Transactions")
-            .select("*")
-            .execute()
-        )
+        rows, offset = [], 0
+        while True:
+            response = (conn.table("Transactions").select("*").order("id")
+                        .range(offset, offset + 499).execute())
+            if response is None or getattr(response, "error", None) or response.data is None:
+                raise RuntimeError("Supabase did not return transaction data.")
+            rows.extend(response.data)
+            if len(response.data) < 500:
+                break
+            offset += 500
 
         if response is None:
             raise RuntimeError("Supabase returned no response.")
@@ -152,7 +211,8 @@ def get_transactions_cached() -> list[dict]:
         if response_error:
             raise RuntimeError(str(response_error))
 
-        return response.data or []
+        st.session_state['ledger_rows'] = {'at': monotonic(), 'rows': deepcopy(rows)}
+        return rows
 
     except Exception as exc:
         logger.exception("Unable to fetch Transactions table.")
@@ -173,7 +233,6 @@ def get_transactions() -> list[dict]:
         return []
 
 
-@st.cache_data(ttl=10, show_spinner=False)
 def get_existing_merchants() -> list[str]:
     """Return unique merchants from the cached transaction dataset."""
     transactions = get_transactions_cached()
@@ -187,7 +246,6 @@ def get_existing_merchants() -> list[str]:
     return sorted(merchants, key=str.lower)
 
 
-@st.cache_data(ttl=10, show_spinner=False)
 def get_existing_categories() -> list[str]:
     """Return default categories plus categories found in transactions."""
     transactions = get_transactions_cached()
@@ -204,7 +262,6 @@ def get_existing_categories() -> list[str]:
     )
 
 
-@st.cache_data(ttl=10, show_spinner=False)
 def get_merchant_category_map() -> dict[str, str]:
     """
     Return merchant -> most recently used category.
@@ -257,10 +314,7 @@ def get_last_category_for_merchant(merchant_name: str | None) -> str | None:
 
 def clear_transaction_caches() -> None:
     """Invalidate all caches that depend on Transactions."""
-    get_transactions_cached.clear()
-    get_existing_merchants.clear()
-    get_existing_categories.clear()
-    get_merchant_category_map.clear()
+    st.session_state.pop('ledger_rows', None)
 
 
 # ============================================================
@@ -272,6 +326,7 @@ def reset_add_transaction_state() -> None:
     """Reset the Add Transaction dialog to a clean state."""
     keys_to_clear = [
         "add_workflow_type",
+        "add_direction",
         "add_amount",
         "add_merchant",
         "add_last_merchant_signature",
@@ -287,6 +342,7 @@ def reset_add_transaction_state() -> None:
 
     st.session_state["add_merchant_instance"] = uuid4().hex
     st.session_state["add_workflow_type"] = "AMZ Card"
+    st.session_state["add_direction"] = "Expense"
     st.session_state["add_category"] = list(get_existing_categories())[0]
 
     now = datetime.now(LOCAL_TZ)
@@ -327,6 +383,7 @@ def initialize_edit_transaction_state(selected_tx: dict) -> None:
     st.session_state["edit_merchant_instance"] = uuid4().hex
     st.session_state["edit_loaded_tx_id"] = tx_id
     st.session_state["edit_workflow_type"] = current_type
+    st.session_state["edit_direction"] = selected_tx.get("direction")
     st.session_state["edit_amount"] = float(selected_tx.get("amount", 0.0) or 0.0)
     st.session_state["edit_merchant"] = merchant
     st.session_state["edit_category"] = category or list(get_existing_categories())[0]
@@ -603,6 +660,7 @@ def build_time_string(tx_date, tx_time) -> str:
 
 @st.dialog("Add New Transaction", width="medium")
 def add_transaction_dialog():
+    require_session()
     if "add_workflow_type" not in st.session_state:
         reset_add_transaction_state()
 
@@ -612,6 +670,12 @@ def add_transaction_dialog():
         horizontal=True,
         key="add_workflow_type",
     )
+
+    direction = st.selectbox(
+        "Income / Expense", ["Expense", "Income"],
+        key="add_direction", placeholder="Classify this transaction",
+    )
+    st.caption("Enter a positive amount. AMZ Card income represents a refund or card credit.")
 
     amount = st.number_input(
         "Amount ($)",
@@ -665,6 +729,9 @@ def add_transaction_dialog():
         use_container_width=True,
         key="save_add_tx",
     ):
+        if direction not in ("Expense", "Income") or amount is None or not math.isfinite(amount) or amount < 0:
+            st.error("Choose Income or Expense and enter a nonnegative amount.")
+            return
         final_merchant = str(merchant_name or "").strip()
         final_category = (
             custom_category.strip()
@@ -692,6 +759,7 @@ def add_transaction_dialog():
             "category": final_category,
             "description": description,
             "type": workflow_type,
+            "direction": direction,
         }
 
         try:
@@ -723,6 +791,7 @@ def add_transaction_dialog():
 
 @st.dialog("Edit Existing Transaction", width="medium")
 def edit_transaction_dialog():
+    require_session()
     transactions = get_transactions()
 
     if not transactions:
@@ -769,6 +838,12 @@ def edit_transaction_dialog():
         horizontal=True,
         key="edit_workflow_type",
     )
+
+    direction = st.selectbox(
+        "Income / Expense", ["Expense", "Income"],
+        key="edit_direction", placeholder="Classify this transaction",
+    )
+    st.caption("Enter a positive amount. AMZ Card income represents a refund or card credit.")
 
     amount = st.number_input(
         "Amount ($)",
@@ -852,6 +927,9 @@ def edit_transaction_dialog():
     # ========================================================
 
     if submitted:
+        if direction not in ("Expense", "Income") or amount is None or not math.isfinite(amount) or amount < 0:
+            st.error("Choose Income or Expense and enter a nonnegative amount.")
+            return
         final_merchant = str(merchant_name or "").strip()
         final_category = (
             custom_category.strip()
@@ -875,6 +953,7 @@ def edit_transaction_dialog():
             "category": final_category,
             "description": description,
             "type": workflow_type,
+            "direction": direction,
         }
 
         try:
@@ -924,6 +1003,274 @@ def edit_transaction_dialog():
 
 
 # ============================================================
+# EDITABLE CASH FLOW CALENDAR
+# ============================================================
+
+from calendar import Calendar, monthrange
+from datetime import date, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
+# Match the supplied September calendar; month navigation remains a later feature.
+CALENDAR_YEAR = 2026
+CALENDAR_MONTH = 9
+
+
+def money(value):
+    """Use cents throughout balance calculations; reject invalid database values."""
+    try:
+        result = Decimal(str(value)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError('Enter a valid dollar amount.') from exc
+    if not result.is_finite() or abs(result) > Decimal('999999999.99'):
+        raise ValueError('Dollar amount is outside the supported range.')
+    return result
+
+
+def week_ending(day):
+    """Sunday through Saturday, including weeks spanning two months."""
+    return day + timedelta(days=(5 - day.weekday()) % 7)
+
+
+def calendar_balances(transactions, settings, first, last, as_of=None):
+    """Roll balances forward from the latest explicit opening balance.
+
+    Amounts are nonnegative; direction defines income or expense.
+    AMZ Card expenses minus card income/refunds are settled on Saturday.
+    Remaining budget plus net card spending equals max(budget, spending).
+    """
+    as_of = as_of or datetime.now(LOCAL_TZ).date()
+    anchors = [key for key in settings if key.startswith('opening:')
+               and date.fromisoformat(key.split(':', 1)[1]) <= first]
+    if not anchors:
+        raise ValueError('Set the opening checking balance to start this calendar.')
+    anchor = max(anchors)
+    start = date.fromisoformat(anchor.split(':', 1)[1])
+    balance = money(settings[anchor]['amount'])
+    direct, card = {}, {}
+    for row in transactions:
+        day = date.fromisoformat(str(row['date'])[:10])
+        amount = money(row.get('amount', 0))
+        kind = row.get('type')
+        effective = week_ending(day) if kind == 'AMZ Card' else day
+        if effective < start or effective > last:
+            continue
+        direction = row.get('direction')
+        if direction not in ('Income', 'Expense') or amount < 0:
+            raise ValueError(f"Classify transaction {row.get('id')} as Income or Expense with a nonnegative amount.")
+        if kind == 'AMZ Card':
+            amount = amount if direction == 'Expense' else -amount
+            saturday = week_ending(day)
+            card[saturday] = card.get(saturday, Decimal(0)) + amount
+        elif kind == 'Direct':
+            amount = amount if direction == 'Income' else -amount
+            direct[day] = direct.get(day, Decimal(0)) + amount
+        else:
+            raise ValueError(f"Transaction {row.get('id')} has an unsupported type.")
+    days = {}
+    day = start
+    while day <= last:
+        net = direct.get(day, Decimal(0))
+        spent, remaining, budget = Decimal(0), Decimal(0), Decimal(0)
+        if day.weekday() == 5:
+            spent = card.get(day, Decimal(0))
+            budget = money(settings.get('budget:' + day.isoformat(), {}).get('amount', 0))
+            remaining = max(budget - spent, Decimal(0)) if day >= as_of else Decimal(0)
+            net -= max(spent + remaining, Decimal(0))
+        balance += net
+        if day >= first:
+            days[day] = dict(balance=balance, net=net, spent=spent,
+                             remaining=remaining, budget=budget)
+        day += timedelta(days=1)
+    return days, start
+
+
+def load_calendar_settings():
+    rows, offset = [], 0
+    while True:
+        response = (conn.table('LedgerCalendarSettings').select('*')
+                    .order('key').range(offset, offset + 499).execute())
+        if getattr(response, 'error', None) or response.data is None:
+            raise RuntimeError('Calendar settings could not be loaded.')
+        rows.extend(response.data)
+        if len(response.data) < 500:
+            return {row['key']: row for row in rows}
+        offset += 500
+
+
+def save_calendar_setting(key, amount, previous):
+    """Compare revisions to avoid overwriting a change from another open tab."""
+    payload = {'key': key, 'amount': str(money(amount)),
+               'revision': (previous['revision'] + 1) if previous else 1}
+    try:
+        table = conn.table('LedgerCalendarSettings')
+        if previous:
+            response = (table.update(payload).eq('key', key)
+                        .eq('revision', previous['revision']).execute())
+        else:
+            response = table.insert(payload).execute()
+        if not response.data or getattr(response, 'error', None):
+            st.error('The setting was not saved. Reload to check for another edit.')
+            return False
+        return True
+    except Exception:
+        logger.exception('Unable to save calendar setting.')
+        st.error('The setting could not be saved. Reload and check the connection.')
+        return False
+
+
+def render_direct_entry(day, row=None):
+    """A separate save per entry avoids partially saved multi-row batches."""
+    identifier = str(row['id']) if row else 'new'
+    prefix = f'calendar_{day}_{identifier}'
+    with st.form(prefix, clear_on_submit=row is None):
+        direction = st.selectbox('Income / Expense', ['Expense', 'Income'],
+                                 index=(['Expense', 'Income'].index(row['direction'])
+                                        if row and row.get('direction') in ('Expense', 'Income') else (None if row else 0)),
+                                 key=prefix + '_direction')
+        amount = st.number_input(
+            'Amount', value=float(row['amount']) if row else None,
+            format='%.2f', step=1.0, key=prefix + '_amount',
+            label_visibility='collapsed', placeholder='Positive amount',
+        )
+        description = st.text_input(
+            'Description', value=(row.get('description') or row.get('merchant') or '') if row else '',
+            key=prefix + '_description', label_visibility='collapsed',
+            placeholder='Description',
+        )
+        save = st.form_submit_button('Save entry' if row else 'Add entry')
+    if not save:
+        return
+    if amount is None or amount < 0 or direction not in ('Income', 'Expense') or not description.strip():
+        st.error('Choose Income/Expense, and enter a nonnegative amount and description.')
+        return
+    try:
+        amount = money(amount)
+        if row:
+            # Preserve merchant, category, and date when editing calendar fields.
+            query = (conn.table('Transactions').update({
+                'amount': float(amount), 'description': description.strip(), 'direction': direction,
+            }).eq('id', row['id']).eq('amount', row['amount']))
+            query = (query.is_('direction', 'null') if row.get('direction') is None
+                     else query.eq('direction', row['direction']))
+            original_description = row.get('description')
+            query = (query.is_('description', 'null') if original_description is None
+                     else query.eq('description', original_description))
+            response = query.execute()
+        else:
+            response = conn.table('Transactions').insert({
+                'date': day.isoformat(), 'time': build_time_string(day, datetime.min.time()),
+                'amount': float(amount), 'merchant': description.strip(),
+                'description': description.strip(), 'category': 'Other', 'type': 'Direct', 'direction': direction,
+            }).execute()
+        if transaction_write_succeeded(response, 'calendar save'):
+            clear_transaction_caches()
+            st.rerun()
+    except Exception:
+        logger.exception('Unable to save calendar entry.')
+        st.error('Save could not be confirmed. Check the register before retrying.')
+
+
+def render_editable_calendar():
+    first = date(CALENDAR_YEAR, CALENDAR_MONTH, 1)
+    last = date(CALENDAR_YEAR, CALENDAR_MONTH, monthrange(CALENDAR_YEAR, CALENDAR_MONTH)[1])
+    st.title('Checking Account: Cash Flow Calendar')
+    st.subheader(first.strftime('%B %Y'))
+    try:
+        settings = load_calendar_settings()
+        transactions = get_transactions_cached()
+    except Exception:
+        logger.exception('Unable to load editable calendar.')
+        st.error('The calendar could not be loaded. Run calendar_setup.sql once in Supabase, '
+                 'then check that the app connection can access LedgerCalendarSettings.')
+        return
+
+    unclassified = [row for row in transactions if row.get('direction') not in ('Income', 'Expense')]
+    if unclassified:
+        st.warning(f"{len(unclassified)} existing transactions need Income/Expense classification. Use Edit Transaction in the sidebar to review and save each one.")
+        st.dataframe(pd.DataFrame(unclassified), hide_index=True, use_container_width=True)
+
+    opening_key = 'opening:' + first.isoformat()
+    anchors = [key for key in settings if key.startswith('opening:')
+               and key.split(':', 1)[1] <= first.isoformat()]
+    with st.expander('Opening balance', expanded=not anchors):
+        st.caption('Enter the checking balance immediately before the first day’s transactions. '
+                   'When an earlier month has an opening balance, its ending balance carries '
+                   'forward automatically. Saving here creates an override for this month.')
+        with st.form('calendar_opening'):
+            opening = st.number_input('Opening checking balance', format='%.2f',
+                                      value=float(settings[opening_key]['amount'])
+                                      if opening_key in settings else None)
+            save_opening = st.form_submit_button('Save opening balance')
+        if save_opening:
+            if opening is None:
+                st.error('Enter the opening checking balance.')
+            elif save_calendar_setting(opening_key, opening, settings.get(opening_key)):
+                st.rerun()
+    if not anchors:
+        st.info('Enter the opening balance above to enable the calendar.')
+        return
+    try:
+        balances, anchor = calendar_balances(transactions, settings, first, last)
+    except (ValueError, KeyError, TypeError) as exc:
+        st.error(f'The calendar cannot calculate balances: {exc}')
+        return
+
+    st.caption('Edit amounts and descriptions inside each day, then save the entry. '
+               'Choose Income or Expense and enter positive amounts. Card purchases are '
+               'entered as positive AMZ Card transactions and deducted on Saturday. '
+               'Do not enter the same card payment again as a Direct expense.')
+    st.caption('Balances include remaining weekly budget reservations. They are projected '
+               'checking balances until that spending occurs. After Saturday, unused budget '
+               'is released automatically and only recorded card spending is deducted.')
+    if anchor < first:
+        st.caption(f'Opening balance carried forward from the saved balance on {anchor:%b %d, %Y}.')
+    direct = {}
+    for row in transactions:
+        if row.get('type') == 'Direct':
+            direct.setdefault(str(row['date'])[:10], []).append(row)
+    headers = st.columns(7)
+    for col, name in zip(headers, ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']):
+        col.markdown(f'**{name}**')
+    # Calendar supplies a sixth row when necessary, so August 31 is never omitted.
+    for week in Calendar(firstweekday=6).monthdatescalendar(first.year, first.month):
+        cols = st.columns(7)
+        for col, day in zip(cols, week):
+            with col:
+                if day.month != first.month:
+                    st.caption(day.strftime('%b %d'))
+                    continue
+                values = balances[day]
+                with st.container(border=True):
+                    st.markdown(f"**{day.day}** · **${values['balance']:,.2f}**")
+                    for row in sorted(direct.get(day.isoformat(), []), key=lambda row: str(row['id'])):
+                        render_direct_entry(day, row)
+                    with st.expander('＋ Entry'):
+                        render_direct_entry(day)
+                    if day.weekday() == 5:
+                        key = 'budget:' + day.isoformat()
+                        with st.form('budget_' + day.isoformat()):
+                            budget = st.number_input('Weekly card budget', min_value=0.0,
+                                                     value=float(values['budget']), format='%.2f')
+                            saved = st.form_submit_button('Save budget')
+                        if saved and save_calendar_setting(key, budget, settings.get(key)):
+                            st.rerun()
+                        if key not in settings:
+                            st.caption('Budget not set; actual spending still deducted.')
+                        st.write(f"Remaining: ${values['remaining']:,.2f}")
+                        st.markdown(
+                            '<div style="background:#00b4e6;color:#002b36;padding:6px;'
+                            'border-radius:3px;font-weight:600">'
+                            f"Card spent: ${values['spent']:,.2f}</div>", unsafe_allow_html=True)
+                        if values['spent'] > values['budget'] and key in settings:
+                            st.caption(f"Over budget: ${values['spent'] - values['budget']:,.2f}")
+                    st.caption(f"Day net: ${values['net']:,.2f}")
+    st.metric('Projected month-end balance', f"${balances[last]['balance']:,.2f}")
+    st.divider()
+    st.subheader('Transaction Register & Schedule Mapping')
+    st.dataframe(pd.DataFrame(transactions), use_container_width=True, hide_index=True)
+
+
+# ============================================================
 # SIDEBAR BUTTONS & ACCOUNT CONTROLS
 # ============================================================
 
@@ -961,7 +1308,11 @@ account_selection = st.sidebar.selectbox(
 st.sidebar.divider()
 
 if st.sidebar.button("Log Out", use_container_width=True):
-    st.session_state.authenticated = False
+    try:
+        conn.auth.sign_out()
+    except Exception:
+        st.warning('Server sign-out could not be confirmed. Local session cleared.')
+    clear_login_state()
     st.rerun()
 
 st.sidebar.info(f"Viewing: **{account_selection}**")
@@ -972,168 +1323,7 @@ st.sidebar.info(f"Viewing: **{account_selection}**")
 # ============================================================
 
 if account_selection == "Primary Checking":
-    st.title("Checking Account: Cash Flow Calendar")
-
-    main_col, side_col = st.columns([3, 1])
-
-    with main_col:
-        # Intentionally left as August 2026 placeholder UI per user's request.
-        st.subheader("August 2026 Cash Flow Calendar")
-
-        days_of_week = [
-            "Mon",
-            "Tue",
-            "Wed",
-            "Thu",
-            "Fri",
-            "Sat",
-            "Sun",
-        ]
-
-        header_cols = st.columns(7)
-        for i, col in enumerate(header_cols):
-            col.markdown(
-                f"""
-                <div style='
-                    text-align: center;
-                    font-weight: bold;
-                    border: 1px solid var(--secondary-background-color);
-                    background-color: var(--secondary-background-color);
-                    padding: 4px;'>
-                    {days_of_week[i]}
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        transactions = get_transactions()
-
-        august_grid = {}
-
-        if transactions:
-            df_sup = pd.DataFrame(transactions)
-
-            if "date" in df_sup.columns:
-                df_sup["date"] = pd.to_datetime(
-                    df_sup["date"],
-                    errors="coerce",
-                )
-
-                aug_sup = df_sup[
-                    (df_sup["date"].dt.year == 2026)
-                    & (df_sup["date"].dt.month == 8)
-                ]
-
-                for day in range(1, 32):
-                    day_txs = aug_sup[
-                        aug_sup["date"].dt.day == day
-                    ]
-
-                    if not day_txs.empty:
-                        net_sum = day_txs["amount"].fillna(0).sum()
-                        items = day_txs["merchant"].dropna().unique()
-                        items_list = ", ".join(map(str, items))
-                        sign_prefix = "+" if net_sum > 0 else ""
-
-                        august_grid[day] = {
-                            "net": f"{sign_prefix}${net_sum:,.2f}",
-                            "items": items_list,
-                        }
-
-        for week in range(5):
-            w_cols = st.columns(7)
-
-            for day in range(7):
-                day_num = week * 7 + day - 4
-
-                with w_cols[day]:
-                    if 1 <= day_num <= 31:
-                        data = august_grid.get(
-                            day_num,
-                            {"net": "$0.00", "items": ""},
-                        )
-
-                        net_val = data["net"]
-
-                        if "+" in net_val:
-                            net_color = "#3fb950"
-                        elif "-" in net_val and net_val != "$0.00":
-                            net_color = "#f85149"
-                        else:
-                            net_color = "gray"
-
-                        with st.container(border=True):
-                            st.markdown(
-                                f"<span style='font-weight:bold;'>{day_num}</span> "
-                                f"<span style='float:right; color:#58a6ff; "
-                                f"font-size:0.85em; font-weight:600;'>"
-                                f"${4500 - (day_num * 10):,.2f}</span>",
-                                unsafe_allow_html=True,
-                            )
-
-                            st.markdown(
-                                f"<div style='font-size:0.75em; color: gray; "
-                                f"min-height:24px; padding-top:2px;'>"
-                                f"{data['items']}</div>",
-                                unsafe_allow_html=True,
-                            )
-
-                            st.markdown(
-                                f"<div style='text-align: right; color:{net_color}; "
-                                f"font-weight:700; font-size:0.8em;'>"
-                                f"{net_val}</div>",
-                                unsafe_allow_html=True,
-                            )
-                    else:
-                        with st.container(border=True):
-                            st.markdown(
-                                "<span style='color: gray;'>-</span>",
-                                unsafe_allow_html=True,
-                            )
-
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.success(
-            "**Projected Month-End Balance:** $4,850.00 "
-            "*(Computed via actuals + future budget rules)*"
-        )
-
-    with side_col:
-        st.markdown("### Cash Position")
-        st.metric("Current Balance", "$3,450.00")
-        st.metric("Weekend Expected", "$3,100.00", "-$350.00")
-        st.metric("Month-End Expected", "$4,850.00", "+$1,400.00")
-        st.metric("Pending Rules", "2 Active")
-
-    st.divider()
-    st.subheader("Transaction Register & Schedule Mapping")
-
-    # Reuse the same cached transaction result rather than querying Supabase again.
-    register_data = get_transactions()
-
-    if register_data:
-        checking_data = pd.DataFrame(register_data)
-
-        if "date" in checking_data.columns and "time" in checking_data.columns:
-            checking_data = checking_data.sort_values(
-                by=["date", "time"],
-                ascending=[False, False],
-            )
-    else:
-        checking_data = pd.DataFrame(
-            columns=[
-                "Date",
-                "Merchant",
-                "Category",
-                "Amount",
-                "Type",
-            ]
-        )
-
-    st.dataframe(
-        checking_data,
-        use_container_width=True,
-        hide_index=True,
-    )
+    render_editable_calendar()
 
 
 # ============================================================
@@ -1169,3 +1359,4 @@ elif account_selection == "Direct PLUS Loan":
     l1.metric("Remaining Principal", "$12,350.00")
     l2.metric("Interest Rate", "6.8%")
     l3.metric("Next Payment Due", "Sep 15, 2026")
+
