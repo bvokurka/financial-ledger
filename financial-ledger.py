@@ -1252,6 +1252,61 @@ def calendar_entry_html(row):
     )
 
 
+def calendar_grid_html(first, balances, direct, settings):
+    """One CSS grid gives every day the height required by the busiest day."""
+    cells = []
+    for week in Calendar(firstweekday=6).monthdatescalendar(first.year, first.month):
+        for day in week:
+            if day.month != first.month:
+                cells.append('<div class="ledger-day ledger-outside"><header><span class="ledger-date">'
+                             + escape(day.strftime('%b %d')) + '</span></header><div class="ledger-body"></div><footer>&nbsp;</footer></div>')
+                continue
+            values = balances[day]
+            content = [calendar_entry_html(row) for row in sorted(direct.get(day.isoformat(), []), key=lambda row: str(row['id']))]
+            for payment in values['payments']:
+                content.append(calendar_entry_html({
+                    'amount': payment['paid_amount'], 'direction': 'Expense',
+                    'merchant': 'Credit card payment',
+                    'description': f"Reconciled budget week ending {payment['week_ending']}",
+                }))
+            if day.weekday() == 5:
+                if values['completed']:
+                    if values['surplus'] > 0:
+                        content.append(f'<div class="ledger-note">Budget surplus: ${values["surplus"]:,.2f}</div>')
+                else:
+                    content.append(calendar_entry_html({
+                        'amount': values['remaining'], 'direction': 'Expense',
+                        'merchant': 'Weekly card budget remaining',
+                        'description': f"Budget: ${values['budget']:,.2f}; spent: ${values['spent']:,.2f}",
+                    }))
+                content.append(f'<div class="ledger-card-spent" title="Card spent">${values["spent"]:,.2f}</div>')
+                if values['spent'] > values['budget'] and 'budget:' + day.isoformat() in settings:
+                    content.append(f'<div class="ledger-note">Over budget: ${values["spent"]-values["budget"]:,.2f}</div>')
+            cells.append(
+                '<div class="ledger-day"><header>'
+                f'<span class="ledger-date">{day.day}</span><span class="ledger-balance">${values["balance"]:,.2f}</span>'
+                '</header><div class="ledger-body">' + ''.join(content) + '</div>'
+                f'<footer>Day net: ${values["net"]:,.2f}</footer></div>')
+    style = '''<style>
+    .ledger-calendar-scroll {overflow-x:auto;padding-bottom:8px;}
+    .ledger-calendar {min-width:840px;color:inherit;}
+    .ledger-weekdays,.ledger-days {display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px;}
+    .ledger-weekdays {font-weight:600;margin-bottom:6px;text-align:center;}
+    .ledger-days {grid-auto-rows:1fr;}
+    .ledger-day {display:flex;flex-direction:column;min-height:240px;min-width:0;border:1px solid #8a96a5;border-radius:6px;overflow:hidden;}
+    .ledger-day header {display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:7px;border-bottom:1px solid #8a96a5;background:rgba(127,150,180,.12);}
+    .ledger-date {display:inline-flex;align-items:center;justify-content:center;min-width:30px;min-height:30px;padding:2px 5px;box-sizing:border-box;border:1px solid #8a96a5;border-radius:3px;background:rgba(127,150,180,.2);font-weight:700;}
+    .ledger-balance {font-weight:600;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;}
+    .ledger-body {padding:8px;flex:1;overflow-wrap:anywhere;}
+    .ledger-day footer {padding:7px;border-top:1px solid #8a96a5;background:rgba(127,150,180,.12);font-size:.85rem;font-variant-numeric:tabular-nums;}
+    .ledger-card-spent {background:#00b4e6;color:#002b36;padding:6px;border-radius:3px;font-weight:600;margin-top:6px;}
+    .ledger-note {font-size:.85rem;padding:4px 0;}
+    .ledger-outside {opacity:.55;}
+    </style>'''
+    names = ''.join('<div>'+name+'</div>' for name in ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'])
+    return style + '<div class="ledger-calendar-scroll"><div class="ledger-calendar"><div class="ledger-weekdays">' + names + '</div><div class="ledger-days">' + ''.join(cells) + '</div></div></div>'
+
+
 def render_editable_calendar():
     first = date(CALENDAR_YEAR, CALENDAR_MONTH, 1)
     last = date(CALENDAR_YEAR, CALENDAR_MONTH, monthrange(CALENDAR_YEAR, CALENDAR_MONTH)[1])
@@ -1331,46 +1386,7 @@ def render_editable_calendar():
                 'planned': True,
             })
     st.caption('Balances include planned items. Link a paid bill to its actual Direct transaction on the Budget page to replace the estimate.')
-    headers = st.columns(7)
-    for col, name in zip(headers, ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']):
-        col.markdown(f'**{name}**')
-    # Calendar supplies a sixth row when necessary, so August 31 is never omitted.
-    for week in Calendar(firstweekday=6).monthdatescalendar(first.year, first.month):
-        cols = st.columns(7)
-        for col, day in zip(cols, week):
-            with col:
-                if day.month != first.month:
-                    st.caption(day.strftime('%b %d'))
-                    continue
-                values = balances[day]
-                with st.container(border=True):
-                    st.markdown(f"**{day.day}** · **${values['balance']:,.2f}**")
-                    for row in sorted(direct.get(day.isoformat(), []), key=lambda row: str(row['id'])):
-                        st.markdown(calendar_entry_html(row), unsafe_allow_html=True)
-                    for payment in values['payments']:
-                        st.markdown(calendar_entry_html({
-                            'amount': payment['paid_amount'], 'direction': 'Expense',
-                            'merchant': 'Credit card payment',
-                            'description': f"Reconciled budget week ending {payment['week_ending']}",
-                        }), unsafe_allow_html=True)
-                    if day.weekday() == 5:
-                        key = 'budget:' + day.isoformat()
-                        if values['completed']:
-                            if values['surplus'] > 0:
-                                st.caption(f"Budget surplus: ${values['surplus']:,.2f}")
-                        else:
-                            st.markdown(calendar_entry_html({
-                                'amount': values['remaining'], 'direction': 'Expense',
-                                'merchant': 'Weekly card budget remaining',
-                                'description': f"Budget: ${values['budget']:,.2f}; spent: ${values['spent']:,.2f}",
-                            }), unsafe_allow_html=True)
-                        st.markdown(
-                            '<div style="background:#00b4e6;color:#002b36;padding:6px;'
-                            'border-radius:3px;font-weight:600">'
-                            f"${values['spent']:,.2f}</div>", unsafe_allow_html=True)
-                        if values['spent'] > values['budget'] and key in settings:
-                            st.caption(f"Over budget: ${values['spent'] - values['budget']:,.2f}")
-                    st.caption(f"Day net: ${values['net']:,.2f}")
+    st.markdown(calendar_grid_html(first, balances, direct, settings), unsafe_allow_html=True)
     st.metric('Projected month-end balance', f"${balances[last]['balance']:,.2f}")
     monthly_surplus = sum((values['surplus'] for values in balances.values()), Decimal(0))
     st.metric('Monthly budget surplus — completed weeks', f"${monthly_surplus:,.2f}")
@@ -1557,10 +1573,7 @@ def render_budget_page():
     visible=['Item','Amount','Day','Direction','Schedule','Include','Description','Actual transaction','Apply change','Status']
     frame=pd.DataFrame(rows)
     with st.form('unified_budget_'+month.isoformat()):
-        edited=st.data_editor(frame, hide_index=True, use_container_width=True, num_rows='dynamic',
-            key='budget_grid_'+month.isoformat()+'_'+str(st.session_state.get('budget_grid_generation',0)),
-            column_order=visible, disabled=['Status']+[c for c in frame.columns if c.startswith('_')],
-            column_config={
+        column_config={
                 'Item':st.column_config.TextColumn(required=True,max_chars=200),
                 'Amount':st.column_config.NumberColumn(min_value=0,max_value=999999999.99,format='$%.2f',required=True),
                 'Day':st.column_config.NumberColumn(min_value=1,max_value=31,step=1,required=True),
@@ -1569,7 +1582,17 @@ def render_budget_page():
                 'Include':st.column_config.CheckboxColumn(default=True),
                 'Actual transaction':st.column_config.SelectboxColumn(options=list(labels),default='Not linked'),
                 'Apply change':st.column_config.SelectboxColumn(options=['This month only','This month and future months'],default='This month only',required=True),
-            })
+            }
+        editor_options = dict(hide_index=True, use_container_width=True, column_order=visible,
+            disabled=['Status']+[c for c in frame.columns if c.startswith('_')], column_config=column_config)
+        generation = str(st.session_state.get('budget_grid_generation',0))
+        st.subheader('Budgeted bills and income')
+        edited_bills = st.data_editor(frame[frame['_kind']=='bill'].copy(), num_rows='dynamic',
+            key='budget_bills_'+month.isoformat()+'_'+generation, **editor_options)
+        st.subheader('Weekly card budgets')
+        edited_weekly = st.data_editor(frame[frame['_kind']=='weekly'].copy(), num_rows='fixed',
+            key='budget_weekly_'+month.isoformat()+'_'+generation, **editor_options)
+        edited = pd.concat([edited_bills, edited_weekly], ignore_index=True)
         saved=st.form_submit_button('Save changes',type='primary')
     st.caption('Link actual Direct transactions in the table to replace their planned amount and date. '
                'Card payments continue to use Reconcile card week. Days 29–31 use the last day of shorter months.')
