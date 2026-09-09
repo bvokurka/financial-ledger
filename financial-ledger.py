@@ -1036,7 +1036,7 @@ def week_ending(day):
     return day + timedelta(days=(5 - day.weekday()) % 7)
 
 
-def calendar_balances(transactions, settings, first, last, as_of=None, reconciled=None):
+def calendar_balances(transactions, settings, first, last, as_of=None, reconciled=None, planned=None):
     """Roll balances forward from the latest explicit opening balance.
 
     Amounts are nonnegative; direction defines income or expense.
@@ -1079,6 +1079,12 @@ def calendar_balances(transactions, settings, first, last, as_of=None, reconcile
             direct[day] = direct.get(day, Decimal(0)) + amount
         else:
             raise ValueError(f"Transaction {row.get('id')} has an unsupported type.")
+    for item in planned or []:
+        if not item['enabled'] or item.get('transaction_id') is not None:
+            continue
+        due = date.fromisoformat(item['due_date'])
+        amount = money(item['amount'])
+        direct[due] = direct.get(due, Decimal(0)) + (amount if item['direction'] == 'Income' else -amount)
     days = {}
     day = start
     while day <= last:
@@ -1230,6 +1236,8 @@ def calendar_entry_html(row):
     amount = money(row['amount'])
     is_income = row.get('direction') == 'Income'
     displayed = f"{'+' if is_income else '−'}${amount:,.2f}"
+    if row.get("planned"):
+        displayed += " ◦"
     description = str(row.get('description') or 'Not provided')
     merchant = str(row.get('merchant') or 'Not provided')
     tooltip = f"Amount: {displayed}\nDescription: {description}\nMerchant: {merchant}"
@@ -1283,9 +1291,15 @@ def render_editable_calendar():
         st.info('Enter the opening balance above to enable the calendar.')
         return
     try:
-        balances, anchor = calendar_balances(transactions, settings, first, last, reconciled=reconciled)
-    except (ValueError, KeyError, TypeError) as exc:
-        st.error(f'The calendar cannot calculate balances: {exc}')
+        anchor_date = date.fromisoformat(max(anchors).split(':', 1)[1])
+        ensure_budget_months(anchor_date, first)
+        settings = load_calendar_settings()
+        planned = load_budget_table('LedgerBudgetItems')
+        balances, anchor = calendar_balances(transactions, settings, first, last,
+                                             reconciled=reconciled, planned=planned)
+    except Exception:
+        logger.exception('Budget calendar load failed.')
+        st.error('The calendar could not calculate. Apply budget_setup.sql and check the connection and transaction classifications.')
         return
 
     st.caption('Hover over a transaction amount for its description and merchant. '
@@ -1306,6 +1320,15 @@ def render_editable_calendar():
     for row in transactions:
         if row.get('type') == 'Direct':
             direct.setdefault(str(row['date'])[:10], []).append(row)
+    for item in planned:
+        if item['enabled'] and item.get('transaction_id') is None:
+            direct.setdefault(item['due_date'], []).append({
+                'id': 'planned-' + str(item['id']), 'amount': item['amount'],
+                'direction': item['direction'], 'merchant': item['name'],
+                'description': 'Planned: ' + (item.get('description') or item['name']),
+                'planned': True,
+            })
+    st.caption('Balances include planned items. Link a paid bill to its actual Direct transaction on the Budget page to replace the estimate.')
     headers = st.columns(7)
     for col, name in zip(headers, ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']):
         col.markdown(f'**{name}**')
@@ -1365,6 +1388,187 @@ def render_editable_calendar():
 
 
 # ============================================================
+# BUDGET DEFAULTS AND MONTHLY PLANS
+# ============================================================
+
+def load_budget_table(table):
+    rows, offset = [], 0
+    order = 'month' if table == 'LedgerBudgetMonths' else 'id'
+    while True:
+        response = conn.table(table).select('*').order(order).range(offset, offset + 499).execute()
+        if getattr(response, 'error', None) or response.data is None:
+            raise RuntimeError('Budget data could not be loaded.')
+        rows.extend(response.data)
+        if len(response.data) < 500:
+            return rows
+        offset += 500
+
+
+def ensure_budget_months(first, last):
+    """Materialize each month once, including intermediate carry-forward months."""
+    prepared = {row['month'] for row in load_budget_table('LedgerBudgetMonths')}
+    current = first.replace(day=1)
+    while current <= last:
+        if current.isoformat() not in prepared:
+            response = conn.rpc('ledger_prepare_budget_month', {'p_month': current.isoformat()}).execute()
+            if response.data is not True:
+                raise RuntimeError('The monthly budget was not prepared.')
+        current = (current.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+
+def save_budget_row(table, payload, previous=None):
+    try:
+        if previous:
+            payload = dict(payload, revision=previous['revision'] + 1)
+            response = (conn.table(table).update(payload).eq('id', previous['id'])
+                        .eq('revision', previous['revision']).execute())
+        else:
+            response = conn.table(table).insert(payload).execute()
+        if getattr(response, 'error', None) or not response.data:
+            st.error('This item changed in another tab. Reload before saving again.')
+            return False
+        clear_transaction_caches()
+        return True
+    except Exception:
+        logger.exception('Budget save failed.')
+        st.error('The item could not be saved. Reload and check that a linked transaction is not already used by another budget item.')
+        return False
+
+
+def render_budget_page():
+    st.title('Budget')
+    chosen = st.date_input('Budget month', value=date(CALENDAR_YEAR, CALENDAR_MONTH, 1),
+                           key='budget_month_choice')
+    month = chosen.replace(day=1)
+    last = month.replace(day=monthrange(month.year, month.month)[1])
+    try:
+        ensure_budget_months(month, month)
+        items = load_budget_table('LedgerBudgetItems')
+        rules = load_budget_table('LedgerBudgetRules')
+        defaults = load_budget_table('LedgerWeeklyDefaults')[0]
+        settings = load_calendar_settings()
+        closed = load_card_weeks()
+        transactions = get_transactions_cached()
+    except Exception:
+        logger.exception('Unable to load Budget page.')
+        st.error('Apply budget_setup.sql in Supabase first, then reload. If it is already installed, check the connection.')
+        return
+    monthly = sorted([item for item in items if item['month'] == month.isoformat()],
+                     key=lambda item: (item['due_date'], item['name']))
+    st.subheader(month.strftime('%B %Y'))
+    st.caption('This month has its own saved plan. Changes here affect this month only. '
+               'A circle beside a calendar amount marks an unfulfilled planned item.')
+    month_tab, weekly_tab, defaults_tab = st.tabs(['Monthly items', 'Weekly card budgets', 'Recurring defaults'])
+    with month_tab:
+        st.dataframe(pd.DataFrame([{
+            'Due': item['due_date'], 'Item': item['name'], 'Direction': item['direction'],
+            'Planned amount': float(money(item['amount'])),
+            'Status': 'Linked to actual' if item['transaction_id'] is not None else 'Planned' if item['enabled'] else 'Inactive',
+        } for item in monthly]), hide_index=True, use_container_width=True)
+        income = sum((money(i['amount']) for i in monthly if i['enabled'] and i['direction']=='Income'), Decimal(0))
+        expense = sum((money(i['amount']) for i in monthly if i['enabled'] and i['direction']=='Expense'), Decimal(0))
+        st.write(f'Planned income: **${income:,.2f}** · Planned direct expenses: **${expense:,.2f}**')
+        st.caption('These totals show the plan, excluding weekly card budgets. Calendar balances use linked actual amounts instead of their estimates.')
+        if monthly:
+            selected = st.selectbox('Item to adjust', monthly, format_func=lambda i: f"{i['due_date']} · {i['name']}", key='budget_item_select')
+            with st.form('budget_item_' + str(selected['id']) + '_' + str(selected['revision'])):
+                enabled = st.checkbox('Include in this month', value=selected['enabled'])
+                amount = st.number_input('Amount', value=float(money(selected['amount'])), min_value=0.0, max_value=999999999.99, format='%.2f')
+                due = st.date_input('Due date', value=date.fromisoformat(selected['due_date']), min_value=month, max_value=last)
+                description = st.text_input('Description', value=selected['description'])
+                used = {i['transaction_id'] for i in items if i['id'] != selected['id'] and i['transaction_id'] is not None}
+                candidates = [t for t in transactions if t.get('type')=='Direct' and t.get('direction')==selected['direction'] and t['id'] not in used]
+                candidates.sort(key=lambda t: (t['date'], t['id']), reverse=True)
+                choices = [None] + [t['id'] for t in candidates]
+                lookup = {t['id']:t for t in candidates}
+                def label(tx_id):
+                    if tx_id is None:
+                        return 'Not linked — keep the planned amount'
+                    tx = lookup[tx_id]
+                    return f"{tx['date']} · {tx.get('merchant') or 'No merchant'} · ${money(tx['amount']):,.2f} · {tx.get('description') or ''} (entry {tx_id})"
+                linked = st.selectbox('Actual transaction that fulfills this item', choices,
+                    index=choices.index(selected['transaction_id']) if selected['transaction_id'] in choices else 0,
+                    format_func=label)
+                st.caption('Enter the actual transaction using Add Transaction first, then link it here. '
+                           'Its actual amount and date replace the planned deduction. One transaction can fulfill one item. '
+                           'Unlinking or deleting that transaction restores the estimate.')
+                save = st.form_submit_button('Save this month only', type='primary')
+            if save:
+                if linked is not None and not enabled:
+                    st.error('Unlink the actual transaction before making the item inactive.')
+                elif save_budget_row('LedgerBudgetItems', {'enabled': enabled, 'amount': str(money(amount)),
+                    'due_date': due.isoformat(), 'description': description, 'transaction_id': linked}, selected):
+                    st.rerun()
+        # New defaults may be created after this month was prepared. Add them explicitly.
+        missing = [r for r in rules if r['id'] not in {i['rule_id'] for i in monthly}]
+        if missing:
+            with st.expander('Add a newly created item to this month'):
+                rule = st.selectbox('Recurring item', missing, format_func=lambda r: r['name'])
+                if st.button('Add item to this month'):
+                    payload = {'rule_id': rule['id'], 'month': month.isoformat(), 'name': rule['name'],
+                        'description': rule['description'], 'direction': rule['direction'],
+                        'due_date': month.replace(day=min(rule['due_day'], last.day)).isoformat(),
+                        'amount': str(money(rule['amount'])), 'enabled': rule['enabled'] and rule['schedule']=='monthly'}
+                    if save_budget_row('LedgerBudgetItems', payload):
+                        st.rerun()
+    with weekly_tab:
+        st.caption('These are the same weekly budgets used by the calendar and card reconciliation. '
+                   'They are not additional checking expenses. The third Saturday uses the special default.')
+        for day_number in range(1, last.day + 1):
+            saturday = month.replace(day=day_number)
+            if saturday.weekday() != 5:
+                continue
+            key = 'budget:' + saturday.isoformat()
+            previous = settings.get(key)
+            completed = closed.get(saturday.isoformat())
+            with st.form('weekly_budget_page_' + saturday.isoformat()):
+                value = completed['budget_amount'] if completed else previous['amount'] if previous else 0
+                amount = st.number_input(f'Week ending {saturday:%b %d}', value=float(money(value)),
+                                         min_value=0.0, max_value=999999999.99, format='%.2f', disabled=bool(completed))
+                save = st.form_submit_button('Save this week only', disabled=bool(completed))
+            if completed:
+                st.caption('Reconciled; its saved budget and payment are preserved.')
+            if save and save_calendar_setting(key, amount, previous):
+                st.rerun()
+    with defaults_tab:
+        st.info('Default changes apply when a month is first prepared. Months already opened keep their saved plans, '
+                'including the month shown above. Use Monthly items or Weekly card budgets to adjust those months.')
+        with st.form('weekly_defaults_' + str(defaults['revision'])):
+            regular = st.number_input('Regular weekly card budget', value=float(money(defaults['regular_amount'])), min_value=0.0, max_value=999999999.99, format='%.2f')
+            third = st.number_input('Third Saturday card budget', value=float(money(defaults['third_amount'])), min_value=0.0, max_value=999999999.99, format='%.2f')
+            save = st.form_submit_button('Change weekly recurring defaults')
+        if save and save_budget_row('LedgerWeeklyDefaults', {'regular_amount': str(money(regular)), 'third_amount': str(money(third))}, defaults):
+            st.rerun()
+        st.dataframe(pd.DataFrame([{'Item':r['name'], 'Day':r['due_day'], 'Amount':float(money(r['amount'])),
+            'Direction':r['direction'], 'Schedule':r['schedule'], 'Enabled':r['enabled']} for r in rules]),
+            hide_index=True, use_container_width=True)
+        options = [None] + sorted(rules, key=lambda r:r['name'])
+        rule = st.selectbox('Default to edit', options, format_func=lambda r: 'Add a new item' if r is None else r['name'])
+        with st.form('budget_rule_' + (rule['id'] + '_' + str(rule['revision']) if rule else 'new')):
+            name = st.text_input('Payee / item name', value=rule['name'] if rule else '', max_chars=200)
+            description = st.text_input('Default description', value=rule['description'] if rule else '')
+            direction = st.selectbox('Income / expense', ['Expense','Income'], index=1 if rule and rule['direction']=='Income' else 0)
+            schedule = st.selectbox('Schedule', ['monthly','as_needed'], index=1 if rule and rule['schedule']=='as_needed' else 0,
+                                    format_func=lambda s: 'Every month' if s=='monthly' else 'As needed — inactive until assigned for a month')
+            due_day = st.number_input('Calendar day of month', min_value=1, max_value=31, value=rule['due_day'] if rule else 1, step=1)
+            amount = st.number_input('Default amount', min_value=0.0, max_value=999999999.99, value=float(money(rule['amount'])) if rule else 0.0, format='%.2f')
+            enabled = st.checkbox('Available for future months', value=rule['enabled'] if rule else True)
+            st.caption('Days 29–31 use the last day in shorter months. As-needed items remain inactive until you include them in a specific month.')
+            save = st.form_submit_button('Change recurring default' if rule else 'Create recurring default')
+        if save:
+            if not name.strip():
+                st.error('Enter an item name.')
+            else:
+                payload = {'name':name.strip(), 'description':description, 'direction':direction,
+                           'schedule':schedule, 'due_day':due_day, 'amount':str(money(amount)), 'enabled':enabled}
+                if rule is None:
+                    payload['id'] = str(uuid4())
+                    payload['start_month'] = month.isoformat()
+                if save_budget_row('LedgerBudgetRules', payload, rule):
+                    st.rerun()
+
+
+# ============================================================
 # SIDEBAR BUTTONS & ACCOUNT CONTROLS
 # ============================================================
 
@@ -1397,6 +1601,7 @@ account_selection = st.sidebar.selectbox(
     "Select Account",
     [
         "Primary Checking",
+        "Budget",
         "Emergency Savings",
         "Direct PLUS Loan",
     ],
@@ -1428,6 +1633,9 @@ if account_selection == "Primary Checking":
 # SAVINGS ACCOUNT LAYOUT
 # ============================================================
 
+elif account_selection == "Budget":
+    render_budget_page()
+
 elif account_selection == "Emergency Savings":
     st.title("Savings Account: Goals & Growth")
 
@@ -1457,4 +1665,3 @@ elif account_selection == "Direct PLUS Loan":
     l1.metric("Remaining Principal", "$12,350.00")
     l2.metric("Interest Rate", "6.8%")
     l3.metric("Next Payment Due", "Sep 15, 2026")
-
