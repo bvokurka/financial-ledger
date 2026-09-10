@@ -1386,7 +1386,9 @@ def render_editable_calendar():
                 'planned': True,
             })
     st.caption('Balances include planned items. Link a paid bill to its actual Direct transaction on the Budget page to replace the estimate.')
-    st.markdown(calendar_grid_html(first, balances, direct, settings), unsafe_allow_html=True)
+    # Render as HTML directly: Markdown interprets dollar amounts as math and
+    # can break markup around multiline tooltip attributes.
+    st.html(calendar_grid_html(first, balances, direct, settings))
     st.metric('Projected month-end balance', f"${balances[last]['balance']:,.2f}")
     monthly_surplus = sum((values['surplus'] for values in balances.values()), Decimal(0))
     st.metric('Monthly budget surplus — completed weeks', f"${monthly_surplus:,.2f}")
@@ -1725,3 +1727,4 @@ elif account_selection == "Direct PLUS Loan":
     l1.metric("Remaining Principal", "$12,350.00")
     l2.metric("Interest Rate", "6.8%")
     l3.metric("Next Payment Due", "Sep 15, 2026")
+
