@@ -1,4 +1,7 @@
 from uuid import uuid4
+import json
+from hashlib import sha256
+from streamlit.components.v2 import component
 from html import escape
 import logging
 import math
@@ -667,7 +670,7 @@ def add_transaction_dialog():
 
     workflow_type = st.radio(
         "Transaction Type",
-        ["AMZ Card", "Direct"],
+        ["AMZ Card", "Direct", "Check"],
         horizontal=True,
         key="add_workflow_type",
     )
@@ -832,7 +835,7 @@ def edit_transaction_dialog():
         if paid_week:
             st.info('This card entry has been reconciled. Amount, direction, date, type and deletion are locked; merchant, description and category can still be edited.')
 
-    workflow_types = ["AMZ Card", "Direct"]
+    workflow_types = ["AMZ Card", "Direct", "Check"]
 
     if st.session_state["edit_workflow_type"] not in workflow_types:
         st.session_state["edit_workflow_type"] = workflow_types[0]
@@ -1074,7 +1077,7 @@ def calendar_balances(transactions, settings, first, last, as_of=None, reconcile
             amount = amount if direction == 'Expense' else -amount
             saturday = assigned_week
             card[saturday] = card.get(saturday, Decimal(0)) + amount
-        elif kind == 'Direct':
+        elif kind in ('Direct', 'Check'):
             amount = amount if direction == 'Income' else -amount
             direct[day] = direct.get(day, Decimal(0)) + amount
         else:
@@ -1162,6 +1165,89 @@ def load_card_weeks():
         offset += 500
 
 
+
+# Direct HTML in a supported v2 component enables events without Markdown parsing.
+LEDGER_INTERACTION_JS = r"""
+export default function({parentElement, data, setTriggerValue}) {
+    const root = parentElement.querySelector('.ledger-interactive-root');
+    root.innerHTML = data.html;
+    root.onclick = event => {
+        const button = event.target.closest('button[data-check],button[data-review]');
+        if (!button || !root.contains(button)) return;
+        if (button.dataset.check) {
+            root.querySelectorAll('button[data-check]').forEach(b => b.disabled = true);
+            setTriggerValue('action', {id: button.dataset.check, revision: button.dataset.revision});
+        } else {
+            setTriggerValue('action', {review: button.dataset.review});
+        }
+    };
+}
+"""
+ledger_interaction = component('ledger_interaction',
+    html='<div class="ledger-interactive-root"></div>', js=LEDGER_INTERACTION_JS)
+
+
+def render_check_calendar(first, balances, direct, settings):
+    markup = calendar_grid_html(first, balances, direct, settings)
+    st.caption('Checks: yellow = uncleared; green = cleared. Click a yellow check after it clears. '
+               'Checks affect the projected balance once on their transaction date, including check income. '
+               'Clearing changes status only. Editing its amount, date, direction or payee resets it to uncleared.')
+    if not any(r.get('type') == 'Check' for rows in direct.values() for r in rows):
+        st.html(markup)
+        return
+    event = ledger_interaction(data={'html': markup}, key='check_calendar',
+                               on_action_change=lambda: None).action
+    if event:
+        require_session()
+        try:
+            # The database verifies the owner, type and displayed revision atomically.
+            response = conn.rpc('ledger_clear_check', {
+                'p_id': int(event['id']), 'p_revision': int(event['revision'])}).execute()
+            if response.data is not True:
+                raise RuntimeError('Clear not confirmed.')
+            clear_transaction_caches()
+            st.rerun()
+        except Exception:
+            clear_transaction_caches()
+            st.error('Could not confirm this check cleared. Reload and review it again; '
+                     'it may have changed in another tab. Confirm check_update.sql is installed.')
+
+
+def review_signature(row):
+    # A changed row loses its marker; row positions never identify a transaction.
+    return sha256(json.dumps(row, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def render_review_rows(included, week):
+    key = 'reviewed_card_rows_' + week
+    valid = {review_signature(row) for row in included}
+    reviewed = set(st.session_state.get(key, [])) & valid
+    st.session_state[key] = sorted(reviewed)
+    st.caption('Click a row to toggle its green review marker. Markers last for this signed-in session; '
+               'changed rows need review again. These markers do not close the week or make a payment.')
+    parts = ['<div style="display:grid;gap:4px">']
+    for row in included:
+        signature = review_signature(row)
+        marked = signature in reviewed
+        text = ' · '.join(str(row.get(field) or '') for field in ('date','merchant','category','description','direction'))
+        text += f" · ${money(row['amount']):,.2f} · entry {row['id']}"
+        parts.append(f'<button type="button" data-review="{signature}" aria-pressed="{str(marked).lower()}" '
+                     f'style="text-align:left;white-space:normal;padding:10px;border:1px solid #84948b;'
+                     f'border-radius:4px;font:inherit;background:{"#b9e5c3" if marked else "#f4f6f5"};color:#17221a">'
+                     f'{"✓ Reviewed · " if marked else ""}{escape(text)}</button>')
+    parts.append('</div>')
+    if not included:
+        st.info('No transactions in this week.')
+        return
+    event = ledger_interaction(data={'html': ''.join(parts)}, key='review_rows_' + week,
+                               on_action_change=lambda: None).action
+    if event and event.get('review') in valid:
+        reviewed.symmetric_difference_update({event['review']})
+        st.session_state[key] = sorted(reviewed)
+        st.rerun(scope='fragment')
+    st.caption(f'{len(reviewed)} of {len(included)} transactions marked reviewed.')
+
+
 @st.dialog('Reconcile and mark card paid', width='large')
 def reconcile_card_dialog():
     require_session()
@@ -1185,7 +1271,7 @@ def reconcile_card_dialog():
     week = st.selectbox('Budget week ending Saturday', candidates)
     included = sorted([row for row in rows if row.get('type') == 'AMZ Card'
                        and str(row.get('card_budget_week')) == week], key=lambda row: int(row['id']))
-    st.dataframe(pd.DataFrame(included), use_container_width=True, hide_index=True)
+    render_review_rows(included, week)
     if any(row.get('direction') not in ('Expense','Income') or money(row['amount']) < 0 for row in included):
         st.error('Classify all included purchases and credits before closing this week.')
         return
@@ -1243,7 +1329,19 @@ def calendar_entry_html(row):
     description = str(row.get('description') or 'Not provided')
     merchant = str(row.get('merchant') or 'Not provided')
     tooltip = f"Amount: {displayed}\nDescription: {description}\nMerchant: {merchant}"
-    color = '#238636' if is_income else '#d14343'
+    if row.get('type') == 'Check':
+        cleared = bool(row.get('check_cleared_at'))
+        status = 'Cleared' if cleared else 'Uncleared — click to mark cleared'
+        tooltip += '\nCheck: ' + status
+        background = '#b9e5c3' if cleared else '#ffe28a'
+        action = '' if cleared else f' data-check="{int(row["id"])}" data-revision="{int(row["check_revision"])}"'
+        return (f'<button type="button"{action} title="{escape(tooltip, quote=True)}" '
+                f'aria-label="{escape(tooltip, quote=True)}" '
+                f'style="display:block;width:100%;text-align:left;border:1px solid #6b7280;'
+                f'border-radius:3px;padding:6px;margin:3px 0;background:{background};color:#17221a;'
+                f'font:inherit;cursor:{"default" if cleared else "pointer"};">'
+                f'{escape(displayed)} {"✓" if cleared else ""}</button>')
+    color = '#238636' if is_income else '#d14343' 
     return (
         f'<span tabindex="0" title="{escape(tooltip, quote=True)}" '
         f'aria-label="{escape(tooltip, quote=True)}" '
@@ -1310,7 +1408,9 @@ def calendar_grid_html(first, balances, direct, settings):
 def render_editable_calendar():
     first = date(CALENDAR_YEAR, CALENDAR_MONTH, 1)
     last = date(CALENDAR_YEAR, CALENDAR_MONTH, monthrange(CALENDAR_YEAR, CALENDAR_MONTH)[1])
-    st.title('Checking Account: Cash Flow Calendar')
+    heading, summary = st.columns([3, 2], gap='large')
+    heading.title('Checking Account: Cash Flow Calendar')
+    summary_slot = summary.empty()
     st.subheader(first.strftime('%B %Y'))
     try:
         settings = load_calendar_settings()
@@ -1369,13 +1469,11 @@ def render_editable_calendar():
     if reconciled:
         next_week = date.fromisoformat(max(reconciled)) + timedelta(days=7)
         st.info(f'New card entries apply to the budget week ending {next_week:%b %d, %Y}, regardless of transaction date.')
-    if st.button('Reconcile card week', key='calendar_reconcile'):
-        reconcile_card_dialog()
     if anchor < first:
         st.caption(f'Opening balance carried forward from the saved balance on {anchor:%b %d, %Y}.')
     direct = {}
     for row in transactions:
-        if row.get('type') == 'Direct':
+        if row.get('type') in ('Direct', 'Check'):
             direct.setdefault(str(row['date'])[:10], []).append(row)
     for item in planned:
         if item['enabled'] and item.get('transaction_id') is None:
@@ -1385,13 +1483,14 @@ def render_editable_calendar():
                 'description': 'Planned: ' + (item.get('description') or item['name']),
                 'planned': True,
             })
-    st.caption('Balances include planned items. Link a paid bill to its actual Direct transaction on the Budget page to replace the estimate.')
+    st.caption('Balances include planned items. Link a paid bill to its actual Direct or Check transaction on the Budget page to replace the estimate.')
     # Render as HTML directly: Markdown interprets dollar amounts as math and
     # can break markup around multiline tooltip attributes.
-    st.html(calendar_grid_html(first, balances, direct, settings))
-    st.metric('Projected month-end balance', f"${balances[last]['balance']:,.2f}")
-    monthly_surplus = sum((values['surplus'] for values in balances.values()), Decimal(0))
-    st.metric('Monthly budget surplus — completed weeks', f"${monthly_surplus:,.2f}")
+    render_check_calendar(first, balances, direct, settings)
+    with summary_slot.container():
+        st.metric('Projected month-end balance', f"${balances[last]['balance']:,.2f}")
+        monthly_surplus = sum((values['surplus'] for values in balances.values()), Decimal(0))
+        st.metric('Monthly budget surplus — completed weeks', f"${monthly_surplus:,.2f}")
     st.caption('Includes completed weeks whose Saturday falls in this month. '
                'Over-budget weeks show zero surplus and are flagged above. '
                'Reconciled payments and budget surplus are preserved from the saved reconciliation.')
@@ -1531,7 +1630,7 @@ def render_budget_page():
         rules = {r['id']:r for r in data['rules']}
         labels = {'Not linked': None}
         for tx in data['transactions']:
-            if tx.get('type') == 'Direct' and tx.get('direction') in ('Income','Expense'):
+            if tx.get('type') in ('Direct', 'Check') and tx.get('direction') in ('Income','Expense'):
                 label = f"{tx['date']} · {tx.get('merchant') or 'No merchant'} · {tx['direction']} ${money(tx['amount']):,.2f} · entry {tx['id']}"
                 labels[label] = tx['id']
         reverse = {v:k for k,v in labels.items()}
@@ -1596,7 +1695,7 @@ def render_budget_page():
             key='budget_weekly_'+month.isoformat()+'_'+generation, **editor_options)
         edited = pd.concat([edited_bills, edited_weekly], ignore_index=True)
         saved=st.form_submit_button('Save changes',type='primary')
-    st.caption('Link actual Direct transactions in the table to replace their planned amount and date. '
+    st.caption('Link actual Direct or Check transactions in the table to replace their planned amount and date. '
                'Card payments continue to use Reconcile card week. Days 29–31 use the last day of shorter months.')
     if saved:
         try:
@@ -1727,4 +1826,5 @@ elif account_selection == "Direct PLUS Loan":
     l1.metric("Remaining Principal", "$12,350.00")
     l2.metric("Interest Rate", "6.8%")
     l3.metric("Next Payment Due", "Sep 15, 2026")
+
 
