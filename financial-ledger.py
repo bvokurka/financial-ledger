@@ -386,6 +386,7 @@ def initialize_edit_transaction_state(selected_tx: dict) -> None:
 
     st.session_state["edit_merchant_instance"] = uuid4().hex
     st.session_state["edit_loaded_tx_id"] = tx_id
+    st.session_state["edit_original_row"] = deepcopy(selected_tx)
     st.session_state["edit_workflow_type"] = current_type
     st.session_state["edit_direction"] = selected_tx.get("direction")
     st.session_state["edit_amount"] = float(selected_tx.get("amount", 0.0) or 0.0)
@@ -822,6 +823,14 @@ def edit_transaction_dialog():
         for t in tx_list
     }
 
+    requested_id = st.session_state.pop('calendar_edit_id', None)
+    if requested_id is not None:
+        match = next((label for label, row in tx_options.items() if str(row['id']) == str(requested_id)), None)
+        if match is None:
+            st.error('This transaction is no longer available. Reload the calendar.')
+            return
+        st.session_state['edit_tx_select_dropdown'] = match
+        st.session_state.pop('edit_loaded_tx_id', None)
     selected_label = st.selectbox(
         "Select Transaction to Edit",
         list(tx_options.keys()),
@@ -830,6 +839,8 @@ def edit_transaction_dialog():
 
     selected_tx = tx_options[selected_label]
     initialize_edit_transaction_state(selected_tx)
+    selected_tx = deepcopy(st.session_state["edit_original_row"])
+    render_check_clearance(selected_tx)
     if selected_tx.get('card_budget_week'):
         paid_week = load_card_weeks().get(str(selected_tx['card_budget_week']))
         if paid_week:
@@ -970,6 +981,7 @@ def edit_transaction_dialog():
                 .table("Transactions")
                 .update(updated_data)
                 .eq("id", selected_tx["id"])
+                .eq("check_revision", selected_tx["check_revision"])
                 .execute()
             )
 
@@ -995,6 +1007,7 @@ def edit_transaction_dialog():
                 .table("Transactions")
                 .delete()
                 .eq("id", selected_tx["id"])
+                .eq("check_revision", selected_tx["check_revision"])
                 .execute()
             )
 
@@ -1172,11 +1185,12 @@ export default function({parentElement, data, setTriggerValue}) {
     const root = parentElement.querySelector('.ledger-interactive-root');
     root.innerHTML = data.html;
     root.onclick = event => {
-        const button = event.target.closest('button[data-check],button[data-review]');
+        const button = event.target.closest('button[data-transaction],button[data-planned],button[data-review]');
         if (!button || !root.contains(button)) return;
-        if (button.dataset.check) {
-            root.querySelectorAll('button[data-check]').forEach(b => b.disabled = true);
-            setTriggerValue('action', {id: button.dataset.check, revision: button.dataset.revision});
+        if (button.dataset.transaction) {
+            setTriggerValue('action', {id: button.dataset.transaction});
+        } else if (button.dataset.planned) {
+            setTriggerValue('action', {planned: button.dataset.planned});
         } else {
             setTriggerValue('action', {review: button.dataset.review});
         }
@@ -1187,30 +1201,102 @@ ledger_interaction = component('ledger_interaction',
     html='<div class="ledger-interactive-root"></div>', js=LEDGER_INTERACTION_JS)
 
 
+@st.dialog('Edit planned amount for this month', width='medium')
+def planned_occurrence_dialog(item_id):
+    require_session()
+    key = 'occurrence_edit_' + str(item_id)
+    if key not in st.session_state:
+        try:
+            item = next(r for r in load_budget_table('LedgerBudgetItems') if r['id'] == item_id)
+            rule = next(r for r in load_budget_table('LedgerBudgetRules') if r['id'] == item['rule_id'])
+            st.session_state[key] = (item, rule)
+        except Exception:
+            st.error('The planned item could not be loaded. Reload the calendar.')
+            return
+    item, rule = st.session_state[key]
+    if not item['enabled'] or item.get('transaction_id') is not None:
+        st.error('This estimate is inactive or linked. Reload the calendar to open the actual transaction.')
+        return
+    st.write(item['name'])
+    st.caption('Only ' + item['month'][:7] + ' changes. Recurring defaults and other months stay unchanged.')
+    with st.form(key + '_form'):
+        amount = st.number_input('Amount ($)', min_value=0.0, max_value=999999999.99,
+                                 value=float(money(item['amount'])), format='%.2f')
+        save = st.form_submit_button('Save this month')
+    if save:
+        try:
+            payload = occurrence_change(item, rule, amount)
+            response = conn.rpc('ledger_save_budget_edits', {'p_month': item['month'], 'p_changes': [payload]}).execute()
+            if response.data is not True:
+                raise RuntimeError('Save not confirmed')
+            invalidate_budget_views()
+            st.session_state.pop(key, None)
+            st.rerun()
+        except Exception:
+            st.error('Nothing was saved. The item may have changed. Close and reopen it before trying again.')
+
+
+def occurrence_change(item, rule, amount):
+    return dict(kind='bill', scope='This month only', id=item['id'], revision=item['revision'],
+                rule_revision=rule['revision'], name=item['name'], description=item.get('description') or '',
+                amount=str(money(amount)), day=item.get('due_day') or date.fromisoformat(item['due_date']).day,
+                direction=item['direction'], schedule='As needed' if item.get('schedule') == 'as_needed' else 'Monthly',
+                enabled=item['enabled'], transaction_id=item.get('transaction_id'))
+
+
+def invalidate_budget_views():
+    clear_transaction_caches()
+    for key in list(st.session_state):
+        if key.startswith('budget_grid_snapshot_'):
+            st.session_state.pop(key, None)
+    st.session_state['budget_grid_generation'] = st.session_state.get('budget_grid_generation', 0) + 1
+
+
+def render_check_clearance(row):
+    if row.get('type') != 'Check':
+        return
+    st.caption('Check status: ' + ('Cleared' if row.get('check_cleared_at') else 'Uncleared'))
+    st.caption('Mark cleared applies to the saved check shown below, not unsaved edits. '
+               'Save changes first if you are correcting this check.')
+    if row.get('check_cleared_at'):
+        return
+    if st.button('Mark cleared', key='clear_saved_check_' + str(row['id'])):
+        require_session()
+        try:
+            result = conn.rpc('ledger_clear_check', {
+                'p_id': int(row['id']), 'p_revision': int(row['check_revision'])}).execute()
+            if result.data is not True:
+                raise RuntimeError('Clearance not confirmed.')
+            clear_transaction_caches()
+            st.session_state.pop('edit_loaded_tx_id', None)
+            st.rerun()
+        except Exception:
+            clear_transaction_caches()
+            st.error('Clearance could not be confirmed. Close and reopen this transaction to review the latest saved version.')
+
+
 def render_check_calendar(first, balances, direct, settings):
     markup = calendar_grid_html(first, balances, direct, settings)
-    st.caption('Checks: yellow = uncleared; green = cleared. Click a yellow check after it clears. '
-               'Checks affect the projected balance once on their transaction date, including check income. '
-               'Clearing changes status only. Editing its amount, date, direction or payee resets it to uncleared.')
-    if not any(r.get('type') == 'Check' for rows in direct.values() for r in rows):
+    st.caption('Click an actual transaction to edit it. Checks: yellow = uncleared; green = cleared. '
+               'Use Mark cleared in the edit window after a check clears. Clearing changes status only; '
+               'checks affect projections once on their transaction date. Click a planned estimate to change its amount for that month only. Card summaries are read-only.')
+    actual_ids = {str(r['id']) for rows in direct.values() for r in rows
+                  if not r.get('planned') and r.get('type') in ('Direct', 'Check', 'AMZ Card')}
+    planned_ids = {str(r['budget_item_id']) for rows in direct.values() for r in rows if r.get('planned')}
+    if not actual_ids and not planned_ids:
         st.html(markup)
         return
     event = ledger_interaction(data={'html': markup}, key='check_calendar',
                                on_action_change=lambda: None).action
-    if event:
+    if event and str(event.get('id')) in actual_ids:
         require_session()
-        try:
-            # The database verifies the owner, type and displayed revision atomically.
-            response = conn.rpc('ledger_clear_check', {
-                'p_id': int(event['id']), 'p_revision': int(event['revision'])}).execute()
-            if response.data is not True:
-                raise RuntimeError('Clear not confirmed.')
-            clear_transaction_caches()
-            st.rerun()
-        except Exception:
-            clear_transaction_caches()
-            st.error('Could not confirm this check cleared. Reload and review it again; '
-                     'it may have changed in another tab. Confirm check_update.sql is installed.')
+        clear_transaction_caches()
+        st.session_state['calendar_edit_id'] = str(event['id'])
+        edit_transaction_dialog()
+    elif event and str(event.get('planned')) in planned_ids:
+        require_session()
+        st.session_state.pop('occurrence_edit_' + str(event['planned']), None)
+        planned_occurrence_dialog(int(event['planned']))
 
 
 def review_signature(row):
@@ -1329,18 +1415,30 @@ def calendar_entry_html(row):
     description = str(row.get('description') or 'Not provided')
     merchant = str(row.get('merchant') or 'Not provided')
     tooltip = f"Amount: {displayed}\nDescription: {description}\nMerchant: {merchant}"
+    if row.get('planned') and row.get('budget_item_id') is not None:
+        return (f'<button type="button" data-planned="{int(row["budget_item_id"])}" '
+                f'title="{escape(tooltip, quote=True)}" aria-label="{escape("Edit this month: " + tooltip, quote=True)}" '
+                f'style="display:block;width:100%;text-align:left;border:0;background:transparent; '
+                f'color:{"#238636" if is_income else "#d14343"};padding:3px 0;font:inherit;cursor:pointer">'
+                f'{escape(displayed)}</button>')
     if row.get('type') == 'Check':
         cleared = bool(row.get('check_cleared_at'))
-        status = 'Cleared' if cleared else 'Uncleared — click to mark cleared'
+        status = 'Cleared' if cleared else 'Uncleared'
         tooltip += '\nCheck: ' + status
         background = '#b9e5c3' if cleared else '#ffe28a'
-        action = '' if cleared else f' data-check="{int(row["id"])}" data-revision="{int(row["check_revision"])}"'
+        action = f' data-transaction="{int(row["id"])}"'
         return (f'<button type="button"{action} title="{escape(tooltip, quote=True)}" '
                 f'aria-label="{escape(tooltip, quote=True)}" '
                 f'style="display:block;width:100%;text-align:left;border:1px solid #6b7280;'
                 f'border-radius:3px;padding:6px;margin:3px 0;background:{background};color:#17221a;'
-                f'font:inherit;cursor:{"default" if cleared else "pointer"};">'
+                f'font:inherit;cursor:pointer;">'
                 f'{escape(displayed)} {"✓" if cleared else ""}</button>')
+    if not row.get('planned') and row.get('type') in ('Direct', 'AMZ Card'):
+        return (f'<button type="button" data-transaction="{int(row["id"])}" '
+                f'title="{escape(tooltip, quote=True)}" aria-label="{escape("Edit transaction: " + tooltip, quote=True)}" '
+                f'style="display:block;width:100%;text-align:left;border:0;background:transparent;'
+                f'color:{"#238636" if is_income else "#d14343"};padding:3px 0;font:inherit;cursor:pointer;">'
+                f'{escape(displayed)}</button>')
     color = '#238636' if is_income else '#d14343' 
     return (
         f'<span tabindex="0" title="{escape(tooltip, quote=True)}" '
@@ -1460,7 +1558,7 @@ def render_editable_calendar():
         return
 
     st.caption('Hover over a transaction amount for its description and merchant. '
-               'Use the sidebar to add or edit transactions. Card purchases are '
+               'Use the sidebar to add transactions or click an actual calendar entry to edit. Card purchases are '
                'entered as positive AMZ Card transactions and assigned to a budget week. '
                'Do not enter the same card payment again as a Direct expense.')
     st.caption('Open card weeks reserve spending plus remaining budget on Saturday. '
@@ -1481,7 +1579,7 @@ def render_editable_calendar():
                 'id': 'planned-' + str(item['id']), 'amount': item['amount'],
                 'direction': item['direction'], 'merchant': item['name'],
                 'description': 'Planned: ' + (item.get('description') or item['name']),
-                'planned': True,
+                'planned': True, 'budget_item_id': item['id'],
             })
     st.caption('Balances include planned items. Link a paid bill to its actual Direct or Check transaction on the Budget page to replace the estimate.')
     # Render as HTML directly: Markdown interprets dollar amounts as math and
@@ -1565,7 +1663,9 @@ def budget_editor_changes(edited, originals, month, transaction_labels):
             'Item','Amount','Day','Direction','Schedule','Include','Description','Actual transaction','Apply change')):
             continue
         kind = previous['_kind'] if previous else 'bill'
-        scope = row.get('Apply change') or 'This month only'
+        definition_fields = [f for f in ('Item','Amount','Day','Direction','Schedule','Description')
+                             if previous is None or row.get(f) != previous.get(f)]
+        scope = ('This month and future months' if definition_fields else 'This month only') if kind == 'bill' else (row.get('Apply change') or 'This month only')
         if scope not in ('This month only','This month and future months'):
             raise ValueError('Choose which months each edit should affect.')
         amount = money(row.get('Amount'))
@@ -1605,6 +1705,8 @@ def budget_editor_changes(edited, originals, month, transaction_labels):
             payload.update(id=previous['_id'] if previous else None,
                 revision=previous['_revision'] if previous else None,
                 rule_revision=previous['_rule_revision'] if previous else None)
+        if kind == 'bill':
+            payload['definition_fields'] = definition_fields
         changes.append(payload)
     return changes
 
@@ -1666,7 +1768,7 @@ def render_budget_page():
         st.error('Could not load the budget. Install budget_editor_update.sql after the previous budget setup, then reload.')
         return
     st.subheader(month.strftime('%B %Y'))
-    st.caption('Edit directly in the rows, choose Apply change for each changed row, then Save changes. '
+    st.caption('Bills and income definition edits apply to this month and future months. For a one-month amount, click the calendar estimate. Include and actual links apply only to this month. '
                'Add a bill or income item using the blank row at the bottom. To remove an expense from the plan, clear Include.')
     st.caption('Permanent changes begin in this month. Earlier months, linked payments, reconciled card weeks, '
                'and saved month-only exceptions are preserved. For weekly rows, edit only Amount and Apply change; '
@@ -1689,7 +1791,9 @@ def render_budget_page():
         generation = str(st.session_state.get('budget_grid_generation',0))
         st.subheader('Budgeted bills and income')
         edited_bills = st.data_editor(frame[frame['_kind']=='bill'].copy(), num_rows='dynamic',
-            key='budget_bills_'+month.isoformat()+'_'+generation, **editor_options)
+            key='budget_bills_'+month.isoformat()+'_'+generation, **dict(editor_options,
+                column_order=[c for c in visible if c != 'Apply change'],
+                column_config=dict(column_config, **{'Apply change': None})))
         st.subheader('Weekly card budgets')
         edited_weekly = st.data_editor(frame[frame['_kind']=='weekly'].copy(), num_rows='fixed',
             key='budget_weekly_'+month.isoformat()+'_'+generation, **editor_options)
@@ -1706,7 +1810,7 @@ def render_budget_page():
             if not changes:
                 st.info('No changes to save.')
                 return
-            result=conn.rpc('ledger_save_budget_edits',{'p_month':month.isoformat(),'p_changes':changes}).execute()
+            result=conn.rpc('ledger_save_budget_table_edits',{'p_month':month.isoformat(),'p_changes':changes}).execute()
             if result.data is not True: raise RuntimeError('Save not confirmed.')
             for key in list(st.session_state):
                 if key.startswith('budget_grid_snapshot_'): st.session_state.pop(key,None)
@@ -1826,5 +1930,4 @@ elif account_selection == "Direct PLUS Loan":
     l1.metric("Remaining Principal", "$12,350.00")
     l2.metric("Interest Rate", "6.8%")
     l3.metric("Next Payment Due", "Sep 15, 2026")
-
 
