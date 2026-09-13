@@ -1184,11 +1184,19 @@ LEDGER_INTERACTION_JS = r"""
 export default function({parentElement, data, setTriggerValue}) {
     const root = parentElement.querySelector('.ledger-interactive-root');
     root.innerHTML = data.html;
+    root.onkeydown = event => {
+        if ((event.key === 'Enter' || event.key === ' ') && event.target.closest('tr[data-review]')) {
+            event.preventDefault();
+            root.onclick(event);
+        }
+    };
     root.onclick = event => {
-        const button = event.target.closest('button[data-transaction],button[data-planned],button[data-review]');
+        const button = event.target.closest('button[data-transaction],button[data-planned],button[data-payday],[data-review]');
         if (!button || !root.contains(button)) return;
         if (button.dataset.transaction) {
             setTriggerValue('action', {id: button.dataset.transaction});
+        } else if (button.dataset.payday) {
+            setTriggerValue('action', {payday: button.dataset.payday});
         } else if (button.dataset.planned) {
             setTriggerValue('action', {planned: button.dataset.planned});
         } else {
@@ -1247,7 +1255,7 @@ def occurrence_change(item, rule, amount):
 def invalidate_budget_views():
     clear_transaction_caches()
     for key in list(st.session_state):
-        if key.startswith('budget_grid_snapshot_'):
+        if key.startswith(('budget_grid_snapshot_', 'payday_snapshot_')):
             st.session_state.pop(key, None)
     st.session_state['budget_grid_generation'] = st.session_state.get('budget_grid_generation', 0) + 1
 
@@ -1256,14 +1264,13 @@ def render_check_clearance(row):
     if row.get('type') != 'Check':
         return
     st.caption('Check status: ' + ('Cleared' if row.get('check_cleared_at') else 'Uncleared'))
-    st.caption('Mark cleared applies to the saved check shown below, not unsaved edits. '
+    st.caption('Clearance actions apply to the saved check shown below, not unsaved edits. '
                'Save changes first if you are correcting this check.')
-    if row.get('check_cleared_at'):
-        return
-    if st.button('Mark cleared', key='clear_saved_check_' + str(row['id'])):
+    cleared = bool(row.get('check_cleared_at'))
+    if st.button('Mark uncleared' if cleared else 'Mark cleared', key='clear_saved_check_' + str(row['id'])):
         require_session()
         try:
-            result = conn.rpc('ledger_clear_check', {
+            result = conn.rpc('ledger_unclear_check' if cleared else 'ledger_clear_check', {
                 'p_id': int(row['id']), 'p_revision': int(row['check_revision'])}).execute()
             if result.data is not True:
                 raise RuntimeError('Clearance not confirmed.')
@@ -1278,12 +1285,13 @@ def render_check_clearance(row):
 def render_check_calendar(first, balances, direct, settings):
     markup = calendar_grid_html(first, balances, direct, settings)
     st.caption('Click an actual transaction to edit it. Checks: yellow = uncleared; green = cleared. '
-               'Use Mark cleared in the edit window after a check clears. Clearing changes status only; '
+               'Use Mark cleared or Mark uncleared in the edit window. Clearance changes status only; '
                'checks affect projections once on their transaction date. Click a planned estimate to change its amount for that month only. Card summaries are read-only.')
     actual_ids = {str(r['id']) for rows in direct.values() for r in rows
                   if not r.get('planned') and r.get('type') in ('Direct', 'Check', 'AMZ Card')}
-    planned_ids = {str(r['budget_item_id']) for rows in direct.values() for r in rows if r.get('planned')}
-    if not actual_ids and not planned_ids:
+    planned_ids = {str(r['budget_item_id']) for rows in direct.values() for r in rows if r.get('planned') and r.get('budget_item_id') is not None}
+    payday_ids = {str(r['payday_id']) for rows in direct.values() for r in rows if r.get('payday_id') is not None}
+    if not actual_ids and not planned_ids and not payday_ids:
         st.html(markup)
         return
     event = ledger_interaction(data={'html': markup}, key='check_calendar',
@@ -1297,6 +1305,10 @@ def render_check_calendar(first, balances, direct, settings):
         require_session()
         st.session_state.pop('occurrence_edit_' + str(event['planned']), None)
         planned_occurrence_dialog(int(event['planned']))
+    elif event and str(event.get('payday')) in payday_ids:
+        require_session()
+        st.session_state.pop('payday_edit_' + str(event['payday']), None)
+        payday_occurrence_dialog(int(event['payday']))
 
 
 def review_signature(row):
@@ -1334,9 +1346,229 @@ def render_review_rows(included, week):
     st.caption(f'{len(reviewed)} of {len(included)} transactions marked reviewed.')
 
 
-@st.dialog('Reconcile and mark card paid', width='large')
+def card_month_weeks(month):
+    return [month.replace(day=n).isoformat() for n in range(1, monthrange(month.year, month.month)[1]+1)
+            if month.replace(day=n).weekday() == 5]
+
+
+def month_review_html(rows, closed, month, reviewed):
+    parts = ['<style>.card-month-scroll{overflow-x:auto}.card-month-tables{display:flex;gap:12px;align-items:flex-start}'
+             '.card-month-tables section{flex:1 0 245px;min-width:245px}.card-month-tables table{border-collapse:collapse;width:100%;font-size:.85rem}'
+             '.card-month-tables th,.card-month-tables td{border:1px solid #85958e;padding:5px;text-align:left;overflow-wrap:anywhere}'
+             '.card-month-tables tr[data-review]{cursor:pointer}.card-month-tables tr:focus{outline:2px solid #287cdb}'
+             '.card-month-tables header{padding:8px;border:1px solid #85958e;font-weight:600}</style>'
+             '<div class="card-month-scroll"><div class="card-month-tables">']
+    for number, week in enumerate(card_month_weeks(month), 1):
+        included = sorted([r for r in rows if r.get('type') == 'AMZ Card' and str(r.get('card_budget_week')) == week],
+                          key=lambda r: (str(r['date']), int(r['id'])))
+        valid = all(r.get('direction') in ('Income', 'Expense') and money(r['amount']) >= 0 for r in included)
+        total = sum((money(r['amount']) * (-1 if r.get('direction') == 'Income' else 1) for r in included), Decimal(0))
+        total_text = f'${total:,.2f}' if valid else 'Needs classification'
+        status = 'Reconciled' if week in closed else 'Open'
+        parts.append(f'<section><header>Week {number} · {escape(total_text)}<br>'
+                     f'<small>Ending {escape(week)} · {status}</small></header><table>'
+                     '<thead><tr><th>Date</th><th>Amount</th><th>Merchant</th></tr></thead><tbody>')
+        for row in included:
+            signature = review_signature(row)
+            marked = signature in reviewed.get(week, set())
+            amount = money(row['amount']) * (-1 if row.get('direction') == 'Income' else 1)
+            mark = 'Reviewed' if marked else 'Not reviewed'
+            values = [str(row['date']), f'${amount:,.2f}', str(row.get('merchant') or 'Not provided')]
+            label = escape(mark + ': ' + ' · '.join(values), quote=True)
+            parts.append(f'<tr tabindex="0" data-review="{signature}" aria-label="{label}" title="{mark}" '
+                         f'style="background:{"#b9e5c3" if marked else "transparent"};'
+                         f'color:{"#17221a" if marked else "inherit"}">' +
+                         ''.join('<td>' + escape(v) + '</td>' for v in values) + '</tr>')
+        if not included:
+            parts.append('<tr><td colspan="3">No transactions</td></tr>')
+        parts.append('</tbody></table></section>')
+    return ''.join(parts) + '</div></div>'
+
+
+def render_month_review(rows, closed, month):
+    reviewed, signature_weeks = {}, {}
+    for week in card_month_weeks(month):
+        valid = {review_signature(r) for r in rows if r.get('type') == 'AMZ Card' and str(r.get('card_budget_week')) == week}
+        key = 'reviewed_card_rows_' + week
+        reviewed[week] = set(st.session_state.get(key, [])) & valid
+        st.session_state[key] = sorted(reviewed[week])
+        signature_weeks.update({sig: week for sig in valid})
+    st.caption('Click an entry to toggle green reviewed status; keyboard users can press Enter or Space. '
+               'All weeks ending in this month are shown. Credits are negative. Markers last for this signed-in session; changed entries need review again.')
+    event = ledger_interaction(data={'html': month_review_html(rows, closed, month, reviewed)},
+                               key='month_card_review', on_action_change=lambda: None).action
+    if event and event.get('review') in signature_weeks:
+        signature = event['review']
+        week = signature_weeks[signature]
+        reviewed[week].symmetric_difference_update({signature})
+        st.session_state['reviewed_card_rows_' + week] = sorted(reviewed[week])
+        st.rerun()
+
+
+def payday_dates(first, last):
+    """Calendar dates, with no holiday adjustment; spouse cadence is continuous."""
+    result = []
+    day = first
+    while day <= last:
+        if day.weekday() == 4:
+            result.append(('Bill', day))
+        if (day - date(2026, 1, 14)).days % 14 == 0:
+            result.append(('Spouse', day))
+        day += timedelta(days=1)
+    return result
+
+
+def ensure_paydays(first, last):
+    result = conn.rpc('ledger_prepare_paydays', {'p_first': first.isoformat(), 'p_last': last.isoformat()}).execute()
+    if result.data is not True:
+        raise RuntimeError('Payday preparation failed. Install payday_review_update.sql.')
+
+
+def payday_plans(rows):
+    # Unset is not zero. A linked deposit is counted by the actual transaction.
+    return [dict(id='payday-' + str(r['id']), payday_id=r['id'], name=r['stream'] + ' payday',
+                 due_date=r['due_date'], amount=r['amount'], enabled=r['enabled'],
+                 transaction_id=r.get('transaction_id'), direction='Income', description=r.get('description') or '')
+            for r in rows if r['amount'] is not None]
+
+
+def payday_changes(edited, originals, labels):
+    changes = []
+    seen = set()
+    for raw in edited.to_dict('records'):
+        row = {k: None if pd.isna(v) else v for k, v in raw.items()}
+        key = int(row['_id'])
+        if key in seen or key not in originals:
+            raise ValueError('Payday rows changed. Reload the income tables.')
+        seen.add(key)
+        old = originals[key]
+        amount = None if row['Amount'] is None else money(row['Amount'])
+        if amount is not None and (amount < 0 or amount >= Decimal('1000000000')):
+            raise ValueError('Enter a nonnegative amount or leave it unset.')
+        link = row.get('Actual transaction') or 'Not linked'
+        if link not in labels:
+            raise ValueError('Choose an actual income transaction from the list.')
+        enabled = bool(row['Include'])
+        if labels[link] is not None and not enabled:
+            raise ValueError('Unlink the deposit before clearing Include.')
+        description = str(row.get('Description') or '')
+        original_amount = None if old['amount'] is None else money(old['amount'])
+        if (amount, enabled, description, labels[link]) == (original_amount, old['enabled'], old.get('description') or '', old.get('transaction_id')):
+            continue
+        changes.append(dict(id=key, revision=old['revision'], amount=None if amount is None else str(amount),
+                            enabled=enabled, description=description, transaction_id=labels[link]))
+    if seen != set(originals):
+        raise ValueError('Payday rows cannot be added or deleted. Reload the income tables.')
+    return changes
+
+
+def render_payday_tables(month):
+    st.subheader('Payday income')
+    st.caption('Bill: every Friday. Spouse: alternate Wednesdays, anchored to January 14, 2026. '
+               'Amounts are independent for each payday; blank means unset and is excluded from projections. '
+               'Link each actual deposit to replace its estimate. Dates do not shift for holidays.')
+    snapshot_key = 'payday_snapshot_' + month.isoformat()
+    if st.button('Reload payday income / discard unsaved changes'):
+        st.session_state.pop(snapshot_key, None)
+        st.session_state['payday_generation'] = st.session_state.get('payday_generation', 0) + 1
+        st.rerun()
+    try:
+        if snapshot_key not in st.session_state:
+            last = month.replace(day=monthrange(month.year, month.month)[1])
+            ensure_paydays(month, last)
+            clear_transaction_caches()
+            st.session_state[snapshot_key] = dict(rows=[r for r in load_budget_table('LedgerPaydays')
+                if month.isoformat() <= r['due_date'] <= last.isoformat()], transactions=get_transactions_cached())
+        snapshot = st.session_state[snapshot_key]
+        labels = {'Not linked': None}
+        for tx in snapshot['transactions']:
+            if tx.get('type') in ('Direct', 'Check') and tx.get('direction') == 'Income':
+                labels[f"{tx['date']} · {tx.get('merchant') or 'No merchant'} · ${money(tx['amount']):,.2f} · entry {tx['id']}"] = tx['id']
+        reverse = {v: k for k, v in labels.items()}
+        originals = {r['id']: r for r in snapshot['rows']}
+        display = []
+        for r in snapshot['rows']:
+            display.append({'_id': r['id'], 'Item': r['stream'], 'Date': date.fromisoformat(r['due_date']),
+                'Amount': None if r['amount'] is None else float(money(r['amount'])),
+                'Direction': 'Income', 'Schedule': 'Weekly' if r['stream'] == 'Bill' else 'Every 14 days',
+                'Include': r['enabled'], 'Description': r.get('description') or '',
+                'Actual transaction': reverse.get(r.get('transaction_id'), 'Not linked'),
+                'Status': 'Linked' if r.get('transaction_id') is not None else 'Inactive' if not r['enabled'] else 'Unset' if r['amount'] is None else 'Planned'})
+        frame = pd.DataFrame(display).sort_values(['Date', 'Item'])
+        frame['Amount'] = pd.to_numeric(frame['Amount'], errors='coerce')
+    except Exception:
+        st.error('Payday income could not be loaded. Install payday_review_update.sql and reload.')
+        return
+    with st.form('payday_income_' + month.isoformat()):
+        edits = []
+        for stream in ('Bill', 'Spouse'):
+            st.subheader(stream)
+            edits.append(st.data_editor(frame[frame['Item'] == stream].copy(), hide_index=True,
+                use_container_width=True, num_rows='fixed',
+                key='payday_' + stream + month.isoformat() + '_' + str(st.session_state.get('payday_generation', 0)),
+                disabled=['_id', 'Item', 'Date', 'Direction', 'Schedule', 'Status'],
+                column_order=['Item', 'Amount', 'Date', 'Direction', 'Schedule', 'Include', 'Description', 'Actual transaction', 'Status'],
+                column_config={'_id': None, 'Amount': st.column_config.NumberColumn(min_value=0.0,max_value=999999999.99,format='$%.2f'),
+                    'Date': st.column_config.DateColumn(format='MMM D, YYYY'),
+                    'Actual transaction': st.column_config.SelectboxColumn(options=list(labels), required=True)}))
+        saved = st.form_submit_button('Save payday income', type='primary')
+    if saved:
+        try:
+            changes = payday_changes(pd.concat(edits, ignore_index=True), originals, labels)
+            if not changes:
+                st.info('No payday changes to save.')
+                return
+            require_session()
+            result = conn.rpc('ledger_save_paydays', {'p_changes': changes}).execute()
+            if result.data is not True:
+                raise RuntimeError('Save not confirmed')
+            invalidate_budget_views()
+            st.session_state['payday_generation'] = st.session_state.get('payday_generation', 0) + 1
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+        except Exception:
+            st.error('No payday changes were saved. Reload to check for stale edits or a deposit already linked to another plan.')
+
+
+@st.dialog('Edit this payday amount', width='medium')
+def payday_occurrence_dialog(payday_id):
+    require_session()
+    key = 'payday_edit_' + str(payday_id)
+    try:
+        if key not in st.session_state:
+            st.session_state[key] = next(r for r in load_budget_table('LedgerPaydays') if r['id'] == payday_id)
+        row = st.session_state[key]
+    except Exception:
+        st.error('Payday could not be loaded. Reload the calendar.')
+        return
+    if not row['enabled'] or row.get('transaction_id') is not None:
+        st.error('This estimate is inactive or linked. Reload and open the actual deposit instead.')
+        return
+    st.write(row['stream'] + ' · ' + row['due_date'])
+    st.caption('Only this payday changes. No amount is copied to other paydays.')
+    with st.form(key + '_form'):
+        amount = st.number_input('Amount ($)', value=None if row['amount'] is None else float(money(row['amount'])),
+                                 min_value=0.0, max_value=999999999.99, format='%.2f')
+        saved = st.form_submit_button('Save this payday')
+    if saved:
+        try:
+            result = conn.rpc('ledger_save_paydays', {'p_changes': [dict(id=row['id'], revision=row['revision'],
+                amount=None if amount is None else str(money(amount)), enabled=row['enabled'],
+                description=row.get('description') or '', transaction_id=row.get('transaction_id'))]}).execute()
+            if result.data is not True:
+                raise RuntimeError('Save not confirmed')
+            invalidate_budget_views()
+            st.session_state.pop(key, None)
+            st.rerun()
+        except Exception:
+            st.error('Payday was not saved. Close and reopen it to check for another edit.')
+
+
 def reconcile_card_dialog():
     require_session()
+    st.title('Reconcile and mark card paid')
+    month = st.date_input('Review month', value=date(CALENDAR_YEAR, CALENDAR_MONTH, 1), key='card_review_month').replace(day=1)
     try:
         clear_transaction_caches()
         rows = get_transactions_cached()
@@ -1345,6 +1577,7 @@ def reconcile_card_dialog():
     except Exception:
         st.error('Could not load card weeks. Apply card_reconciliation.sql and check the connection.')
         return
+    render_month_review(rows, closed, month)
     candidates = {str(row['card_budget_week']) for row in rows
                   if row.get('type') == 'AMZ Card' and row.get('card_budget_week')}
     candidates.update(key.split(':', 1)[1] for key in settings if key.startswith('budget:'))
@@ -1357,7 +1590,10 @@ def reconcile_card_dialog():
     week = st.selectbox('Budget week ending Saturday', candidates)
     included = sorted([row for row in rows if row.get('type') == 'AMZ Card'
                        and str(row.get('card_budget_week')) == week], key=lambda row: int(row['id']))
-    render_review_rows(included, week)
+    st.caption('The selected week below is the one whose payment will be recorded. Review markers above never record a payment.')
+    if week not in card_month_weeks(month):
+        st.info('This week is outside the review month. Change Review month to include its ending Saturday before closing it.')
+        return
     if any(row.get('direction') not in ('Expense','Income') or money(row['amount']) < 0 for row in included):
         st.error('Classify all included purchases and credits before closing this week.')
         return
@@ -1380,21 +1616,27 @@ def reconcile_card_dialog():
     st.caption('This records a payment you already made; it does not send money. '
                'The listed amounts, dates and budget assignments will be locked. '
                'New card entries will go to the following budget week, regardless of their date.')
+    confirmation_key = 'card_payment_snapshot_' + week
     with st.form('confirm_card_payment_' + week):
         payment_date = st.date_input('Actual payment date', value=datetime.now(LOCAL_TZ).date(),
                                     max_value=datetime.now(LOCAL_TZ).date())
         confirmed = st.checkbox('I reconciled these transactions and paid the amount shown.')
         submitted = st.form_submit_button('Reconcile and mark paid', type='primary')
+    if not submitted:
+        st.session_state[confirmation_key] = {'rows': deepcopy(included), 'budget': str(budget)}
     if submitted:
         if not confirmed:
             st.error('Confirm the reviewed transactions and payment first.')
             return
         try:
+            snapshot = st.session_state.get(confirmation_key)
+            if not snapshot:
+                raise ValueError('Reload and review the selected week before closing.')
             expected = [{'id': row['id'], 'amount': float(money(row['amount'])),
-                         'direction': row['direction']} for row in included]
+                         'direction': row['direction']} for row in snapshot['rows']]
             response = conn.rpc('ledger_reconcile_card_week', {
                 'p_week': week, 'p_payment_date': payment_date.isoformat(),
-                'p_expected': expected, 'p_expected_budget': float(budget),
+                'p_expected': expected, 'p_expected_budget': str(money(snapshot['budget'])),
             }).execute()
             if not response.data:
                 raise RuntimeError('Payment was not confirmed.')
@@ -1415,6 +1657,11 @@ def calendar_entry_html(row):
     description = str(row.get('description') or 'Not provided')
     merchant = str(row.get('merchant') or 'Not provided')
     tooltip = f"Amount: {displayed}\nDescription: {description}\nMerchant: {merchant}"
+    if row.get('planned') and row.get('payday_id') is not None:
+        return (f'<button type="button" data-payday="{int(row["payday_id"])}" '
+                f'title="{escape(tooltip, quote=True)}" aria-label="{escape("Edit payday: " + tooltip, quote=True)}" '
+                f'style="display:block;width:100%;text-align:left;border:0;background:transparent; '
+                f'color:#238636;padding:3px 0;font:inherit;cursor:pointer">{escape(displayed)}</button>')
     if row.get('planned') and row.get('budget_item_id') is not None:
         return (f'<button type="button" data-planned="{int(row["budget_item_id"])}" '
                 f'title="{escape(tooltip, quote=True)}" aria-label="{escape("Edit this month: " + tooltip, quote=True)}" '
@@ -1550,6 +1797,9 @@ def render_editable_calendar():
         ensure_budget_months(anchor_date, first)
         settings = load_calendar_settings()
         planned = load_budget_table('LedgerBudgetItems')
+        ensure_paydays(anchor_date, last)
+        paydays = load_budget_table('LedgerPaydays')
+        planned += payday_plans(paydays)
         balances, anchor = calendar_balances(transactions, settings, first, last,
                                              reconciled=reconciled, planned=planned)
     except Exception:
@@ -1579,8 +1829,13 @@ def render_editable_calendar():
                 'id': 'planned-' + str(item['id']), 'amount': item['amount'],
                 'direction': item['direction'], 'merchant': item['name'],
                 'description': 'Planned: ' + (item.get('description') or item['name']),
-                'planned': True, 'budget_item_id': item['id'],
+                'planned': True, 'budget_item_id': None if item.get('payday_id') else item['id'],
+                'payday_id': item.get('payday_id'),
             })
+    unset = sum(1 for r in paydays if r['enabled'] and r['amount'] is None and r.get('transaction_id') is None
+                and anchor.isoformat() <= r['due_date'] <= last.isoformat())
+    if unset:
+        st.warning(f'{unset} payday amounts are unset in the balance period and excluded from projections. Enter them in Budget → Payday income.')
     st.caption('Balances include planned items. Link a paid bill to its actual Direct or Check transaction on the Budget page to replace the estimate.')
     # Render as HTML directly: Markdown interprets dollar amounts as math and
     # can break markup around multiline tooltip attributes.
@@ -1799,6 +2054,7 @@ def render_budget_page():
             key='budget_weekly_'+month.isoformat()+'_'+generation, **editor_options)
         edited = pd.concat([edited_bills, edited_weekly], ignore_index=True)
         saved=st.form_submit_button('Save changes',type='primary')
+    render_payday_tables(month)
     st.caption('Link actual Direct or Check transactions in the table to replace their planned amount and date. '
                'Card payments continue to use Reconcile card week. Days 29–31 use the last day of shorter months.')
     if saved:
@@ -1813,7 +2069,7 @@ def render_budget_page():
             result=conn.rpc('ledger_save_budget_table_edits',{'p_month':month.isoformat(),'p_changes':changes}).execute()
             if result.data is not True: raise RuntimeError('Save not confirmed.')
             for key in list(st.session_state):
-                if key.startswith('budget_grid_snapshot_'): st.session_state.pop(key,None)
+                if key.startswith(('budget_grid_snapshot_', 'payday_snapshot_')): st.session_state.pop(key,None)
             st.session_state['budget_grid_generation']=st.session_state.get('budget_grid_generation',0)+1
             clear_transaction_caches()
             st.rerun()
@@ -1847,7 +2103,7 @@ if st.sidebar.button(
 
 
 if st.sidebar.button('Reconcile card week', use_container_width=True):
-    reconcile_card_dialog()
+    st.session_state['ledger_view'] = 'Reconcile'
 
 
 st.sidebar.divider()
@@ -1870,8 +2126,8 @@ account_selection = st.sidebar.selectbox(
     key='ledger_account',
     on_change=lambda: st.session_state.update(ledger_view='Account'),
 )
-if st.session_state.get('ledger_view') == 'Budget':
-    account_selection = 'Budget'
+if st.session_state.get('ledger_view') in ('Budget', 'Reconcile'):
+    account_selection = st.session_state['ledger_view']
 
 st.sidebar.divider()
 
@@ -1897,6 +2153,9 @@ if account_selection == "Primary Checking":
 # ============================================================
 # SAVINGS ACCOUNT LAYOUT
 # ============================================================
+
+elif account_selection == "Reconcile":
+    reconcile_card_dialog()
 
 elif account_selection == "Budget":
     render_budget_page()
@@ -1930,4 +2189,5 @@ elif account_selection == "Direct PLUS Loan":
     l1.metric("Remaining Principal", "$12,350.00")
     l2.metric("Interest Rate", "6.8%")
     l3.metric("Next Payment Due", "Sep 15, 2026")
+
 
