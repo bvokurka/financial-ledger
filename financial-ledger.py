@@ -1184,16 +1184,12 @@ LEDGER_INTERACTION_JS = r"""
 export default function({parentElement, data, setTriggerValue}) {
     const root = parentElement.querySelector('.ledger-interactive-root');
     root.innerHTML = data.html;
-    root.onkeydown = event => {
-        if ((event.key === 'Enter' || event.key === ' ') && event.target.closest('tr[data-review]')) {
-            event.preventDefault();
-            root.onclick(event);
-        }
-    };
     root.onclick = event => {
-        const button = event.target.closest('button[data-transaction],button[data-planned],button[data-payday],[data-review]');
+        const button = event.target.closest('button[data-transaction],button[data-planned],button[data-payday],button[data-card-amount],button[data-review]');
         if (!button || !root.contains(button)) return;
-        if (button.dataset.transaction) {
+        if (button.dataset.cardAmount) {
+            setTriggerValue('action', {card_amount: button.dataset.cardAmount});
+        } else if (button.dataset.transaction) {
             setTriggerValue('action', {id: button.dataset.transaction});
         } else if (button.dataset.payday) {
             setTriggerValue('action', {payday: button.dataset.payday});
@@ -1355,7 +1351,8 @@ def month_review_html(rows, closed, month, reviewed):
     parts = ['<style>.card-month-scroll{overflow-x:auto}.card-month-tables{display:flex;gap:12px;align-items:flex-start}'
              '.card-month-tables section{flex:1 0 245px;min-width:245px}.card-month-tables table{border-collapse:collapse;width:100%;font-size:.85rem}'
              '.card-month-tables th,.card-month-tables td{border:1px solid #85958e;padding:5px;text-align:left;overflow-wrap:anywhere}'
-             '.card-month-tables tr[data-review]{cursor:pointer}.card-month-tables tr:focus{outline:2px solid #287cdb}'
+             '.card-month-tables button{font:inherit;color:inherit;background:transparent;border:0;padding:0;cursor:pointer;text-decoration:underline;text-underline-offset:3px;width:100%;text-align:left}'
+             '.card-month-tables button:focus-visible{outline:2px solid #287cdb;outline-offset:2px}'
              '.card-month-tables header{padding:8px;border:1px solid #85958e;font-weight:600}</style>'
              '<div class="card-month-scroll"><div class="card-month-tables">']
     for number, week in enumerate(card_month_weeks(month), 1):
@@ -1375,10 +1372,16 @@ def month_review_html(rows, closed, month, reviewed):
             mark = 'Reviewed' if marked else 'Not reviewed'
             values = [str(row['date']), f'${amount:,.2f}', str(row.get('merchant') or 'Not provided')]
             label = escape(mark + ': ' + ' · '.join(values), quote=True)
-            parts.append(f'<tr tabindex="0" data-review="{signature}" aria-label="{label}" title="{mark}" '
-                         f'style="background:{"#b9e5c3" if marked else "transparent"};'
-                         f'color:{"#17221a" if marked else "inherit"}">' +
-                         ''.join('<td>' + escape(v) + '</td>' for v in values) + '</tr>')
+            date_cell = (f'<button type="button" data-review="{signature}" aria-pressed="{str(marked).lower()}" '
+                         f'aria-label="Toggle review: {label}" title="Toggle green review marker">{escape(values[0])}</button>')
+            if week in closed:
+                amount_cell = f'<span title="Reconciled week — amount locked" aria-label="Amount locked: {escape(values[1], quote=True)}">{escape(values[1])}</span>'
+            else:
+                amount_cell = (f'<button type="button" data-card-amount="{signature}" '
+                               f'aria-label="Edit amount: {label}" title="Edit this transaction amount">{escape(values[1])}</button>')
+            parts.append(f'<tr style="background:{"#b9e5c3" if marked else "transparent"};'
+                         f'color:{"#17221a" if marked else "inherit"}">'
+                         f'<td>{date_cell}</td><td>{amount_cell}</td><td>{escape(values[2])}</td></tr>')
         if not included:
             parts.append('<tr><td colspan="3">No transactions</td></tr>')
         parts.append('</tbody></table></section>')
@@ -1393,7 +1396,8 @@ def render_month_review(rows, closed, month):
         reviewed[week] = set(st.session_state.get(key, [])) & valid
         st.session_state[key] = sorted(reviewed[week])
         signature_weeks.update({sig: week for sig in valid})
-    st.caption('Click an entry to toggle green reviewed status; keyboard users can press Enter or Space. '
+    st.caption('Click Date to toggle the green reviewed marker; click Amount to edit an open-week transaction. '
+               'Merchant is plain text. Reconciled amounts are locked. Tab to a Date or Amount button and press Enter or Space. '
                'All weeks ending in this month are shown. Credits are negative. Markers last for this signed-in session; changed entries need review again.')
     event = ledger_interaction(data={'html': month_review_html(rows, closed, month, reviewed)},
                                key='month_card_review', on_action_change=lambda: None).action
@@ -1403,6 +1407,75 @@ def render_month_review(rows, closed, month):
         reviewed[week].symmetric_difference_update({signature})
         st.session_state['reviewed_card_rows_' + week] = sorted(reviewed[week])
         st.rerun()
+    elif event and event.get('card_amount'):
+        selected = next((r for r in rows if r.get('type') == 'AMZ Card'
+                         and review_signature(r) == event['card_amount']
+                         and str(r.get('card_budget_week')) in card_month_weeks(month)), None)
+        if selected is None:
+            st.error('This transaction changed. Reload the review page before editing its amount.')
+        elif str(selected.get('card_budget_week')) in closed:
+            st.info('This week is reconciled; its amounts are locked.')
+        else:
+            card_amount_dialog(deepcopy(selected))
+
+
+def save_card_amount(original, value):
+    require_session()
+    amount = money(value)
+    if value is None or amount < 0 or amount >= Decimal('1000000000'):
+        raise ValueError('Enter a nonnegative amount below one billion.')
+    week = str(original.get('card_budget_week') or '')
+    if original.get('type') != 'AMZ Card' or not week:
+        raise ValueError('This is not an assigned card transaction.')
+    if week in load_card_weeks():
+        raise ValueError('This week has been reconciled; the amount is locked.')
+    if amount == money(original['amount']):
+        return False
+    response = (conn.table('Transactions').update({'amount': str(amount)})
+                .eq('id', original['id']).eq('check_revision', original['check_revision'])
+                .eq('type', 'AMZ Card').eq('card_budget_week', week).execute())
+    if getattr(response, 'error', None) or not response.data:
+        raise RuntimeError('The transaction changed or the update was not confirmed.')
+    # The database also rejects a closure racing this write under its shared lock.
+    reviewed_key = 'reviewed_card_rows_' + week
+    reviewed = set(st.session_state.get(reviewed_key, []))
+    reviewed.discard(review_signature(original))
+    st.session_state[reviewed_key] = sorted(reviewed)
+    st.session_state.pop('card_payment_snapshot_' + week, None)
+    clear_transaction_caches()
+    return True
+
+
+@st.dialog('Edit card transaction amount', width='medium')
+def card_amount_dialog(original):
+    require_session()
+    st.write(str(original.get('merchant') or 'No merchant') + ' · ' + str(original['date']))
+    st.caption('Enter the stored amount as a positive number or zero. '
+               'Income/refunds remain credits and display as negative in the review tables. '
+               'Only this transaction amount changes; saving removes its green review marker.')
+    try:
+        if str(original.get('card_budget_week')) in load_card_weeks():
+            st.info('This week is reconciled; its amounts are locked.')
+            return
+    except Exception:
+        st.error('Could not verify whether this week is open. Reopen the editor after reconnecting.')
+        return
+    with st.form('card_amount_form_' + str(original['id'])):
+        amount = st.number_input('Amount ($)', value=float(money(original['amount'])),
+                                 min_value=0.0, max_value=999999999.99, format='%.2f',
+                                 key='card_amount_' + str(original['id']) + '_' + str(original['check_revision']))
+        submitted = st.form_submit_button('Save amount', type='primary')
+    if submitted:
+        try:
+            if save_card_amount(original, amount):
+                st.rerun()
+            else:
+                st.info('The amount is unchanged.')
+        except ValueError as exc:
+            st.error(str(exc))
+        except Exception:
+            clear_transaction_caches()
+            st.error('The amount could not be saved. Close and reopen this editor to check for another edit or a reconciled week.')
 
 
 def payday_dates(first, last):
@@ -2189,5 +2262,4 @@ elif account_selection == "Direct PLUS Loan":
     l1.metric("Remaining Principal", "$12,350.00")
     l2.metric("Interest Rate", "6.8%")
     l3.metric("Next Payment Due", "Sep 15, 2026")
-
 
