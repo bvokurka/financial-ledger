@@ -319,6 +319,7 @@ def get_last_category_for_merchant(merchant_name: str | None) -> str | None:
 def clear_transaction_caches() -> None:
     """Invalidate all caches that depend on Transactions."""
     st.session_state.pop('ledger_rows', None)
+    st.session_state.pop('savings_snapshot', None)
 
 
 # ============================================================
@@ -338,7 +339,7 @@ def reset_add_transaction_state() -> None:
         "add_custom_category",
         "add_date",
         "add_time",
-        "add_desc",
+        "add_desc", "add_transfer_direction", "add_savings_bucket",
     ]
 
     for key in keys_to_clear:
@@ -396,6 +397,8 @@ def initialize_edit_transaction_state(selected_tx: dict) -> None:
     st.session_state["edit_date"] = edit_date
     st.session_state["edit_time"] = edit_time
     st.session_state["edit_desc"] = selected_tx.get("description", "") or ""
+    st.session_state["edit_transfer_direction"] = selected_tx.get("transfer_direction") or "To savings"
+    st.session_state["edit_savings_bucket"] = selected_tx.get("savings_bucket_id")
     # Mark the newly loaded merchant as the baseline so the first render preserves
     # the transaction's saved category. A later merchant change can then override it.
     st.session_state["edit_last_merchant_signature"] = merchant.casefold()
@@ -671,10 +674,14 @@ def add_transaction_dialog():
 
     workflow_type = st.radio(
         "Transaction Type",
-        ["AMZ Card", "Direct", "Check"],
+        ["AMZ Card", "Direct", "Check", "Savings Transfer"],
         horizontal=True,
         key="add_workflow_type",
     )
+
+    if workflow_type == "Savings Transfer":
+        savings_transfer_form("add")
+        return
 
     direction = st.selectbox(
         "Income / Expense", ["Expense", "Income"],
@@ -841,12 +848,18 @@ def edit_transaction_dialog():
     initialize_edit_transaction_state(selected_tx)
     selected_tx = deepcopy(st.session_state["edit_original_row"])
     render_check_clearance(selected_tx)
+    paid_week = None
     if selected_tx.get('card_budget_week'):
         paid_week = load_card_weeks().get(str(selected_tx['card_budget_week']))
         if paid_week:
             st.info('This card entry has been reconciled. Amount, direction, date, type and deletion are locked; merchant, description and category can still be edited.')
+            st.session_state['edit_workflow_type'] = selected_tx['type']
+            st.session_state['edit_direction'] = selected_tx['direction']
+            st.session_state['edit_amount'] = float(money(selected_tx['amount']))
+            st.session_state['edit_date'] = date.fromisoformat(str(selected_tx['date'])[:10])
+            st.session_state['edit_time'] = datetime.strptime(str(selected_tx.get('time') or '00:00:00')[:8], '%H:%M:%S').time()
 
-    workflow_types = ["AMZ Card", "Direct", "Check"]
+    workflow_types = ["AMZ Card", "Direct", "Check", "Savings Transfer"]
 
     if st.session_state["edit_workflow_type"] not in workflow_types:
         st.session_state["edit_workflow_type"] = workflow_types[0]
@@ -855,19 +868,23 @@ def edit_transaction_dialog():
         "Transaction Type",
         workflow_types,
         horizontal=True,
-        key="edit_workflow_type",
+        key="edit_workflow_type", disabled=bool(paid_week),
     )
+
+    if workflow_type == "Savings Transfer":
+        savings_transfer_form("edit", selected_tx)
+        return
 
     direction = st.selectbox(
         "Income / Expense", ["Expense", "Income"],
-        key="edit_direction", placeholder="Classify this transaction",
+        key="edit_direction", placeholder="Classify this transaction", disabled=bool(paid_week),
     )
     st.caption("Enter a positive amount. AMZ Card income represents a refund or card credit.")
 
     amount = st.number_input(
         "Amount ($)",
         format="%.2f",
-        key="edit_amount",
+        key="edit_amount", disabled=bool(paid_week),
     )
 
     original_merchant = str(
@@ -915,12 +932,12 @@ def edit_transaction_dialog():
 
     tx_date = st.date_input(
         "Date",
-        key="edit_date",
+        key="edit_date", disabled=bool(paid_week),
     )
 
     tx_time = st.time_input(
         "Time",
-        key="edit_time",
+        key="edit_time", disabled=bool(paid_week),
     )
 
     col1, col2 = st.columns(2)
@@ -938,7 +955,7 @@ def edit_transaction_dialog():
             "🗑️ Delete Transaction",
             use_container_width=True,
             type="secondary",
-            key="delete_tx_btn",
+            key="delete_tx_btn", disabled=bool(paid_week),
         )
 
     # ========================================================
@@ -975,6 +992,8 @@ def edit_transaction_dialog():
             "direction": direction,
         }
 
+        if paid_week:
+            updated_data = {k: updated_data[k] for k in ("merchant", "category", "description")}
         try:
             update_res = (
                 conn
@@ -986,7 +1005,7 @@ def edit_transaction_dialog():
             )
 
             if transaction_write_succeeded(update_res, "update"):
-                clear_transaction_caches()
+                invalidate_edited_transaction(selected_tx)
                 st.success("Transaction successfully updated!")
                 st.rerun()
 
@@ -1001,6 +1020,9 @@ def edit_transaction_dialog():
     # ========================================================
 
     if deleted:
+        if paid_week:
+            st.error("Reconciled transactions cannot be deleted.")
+            return
         try:
             delete_res = (
                 conn
@@ -1012,7 +1034,7 @@ def edit_transaction_dialog():
             )
 
             if transaction_write_succeeded(delete_res, "delete"):
-                clear_transaction_caches()
+                invalidate_edited_transaction(selected_tx)
                 st.success("Transaction successfully deleted!")
                 st.rerun()
 
@@ -1090,7 +1112,7 @@ def calendar_balances(transactions, settings, first, last, as_of=None, reconcile
             amount = amount if direction == 'Expense' else -amount
             saturday = assigned_week
             card[saturday] = card.get(saturday, Decimal(0)) + amount
-        elif kind in ('Direct', 'Check'):
+        elif kind in ('Direct', 'Check', 'Savings Transfer'):
             amount = amount if direction == 'Income' else -amount
             direct[day] = direct.get(day, Decimal(0)) + amount
         else:
@@ -1284,7 +1306,7 @@ def render_check_calendar(first, balances, direct, settings):
                'Use Mark cleared or Mark uncleared in the edit window. Clearance changes status only; '
                'checks affect projections once on their transaction date. Click a planned estimate to change its amount for that month only. Card summaries are read-only.')
     actual_ids = {str(r['id']) for rows in direct.values() for r in rows
-                  if not r.get('planned') and r.get('type') in ('Direct', 'Check', 'AMZ Card')}
+                  if not r.get('planned') and r.get('type') in ('Direct', 'Check', 'AMZ Card', 'Savings Transfer')}
     planned_ids = {str(r['budget_item_id']) for rows in direct.values() for r in rows if r.get('planned') and r.get('budget_item_id') is not None}
     payday_ids = {str(r['payday_id']) for rows in direct.values() for r in rows if r.get('payday_id') is not None}
     if not actual_ids and not planned_ids and not payday_ids:
@@ -1374,11 +1396,8 @@ def month_review_html(rows, closed, month, reviewed):
             label = escape(mark + ': ' + ' · '.join(values), quote=True)
             date_cell = (f'<button type="button" data-review="{signature}" aria-pressed="{str(marked).lower()}" '
                          f'aria-label="Toggle review: {label}" title="Toggle green review marker">{escape(values[0])}</button>')
-            if week in closed:
-                amount_cell = f'<span title="Reconciled week — amount locked" aria-label="Amount locked: {escape(values[1], quote=True)}">{escape(values[1])}</span>'
-            else:
-                amount_cell = (f'<button type="button" data-card-amount="{signature}" '
-                               f'aria-label="Edit amount: {label}" title="Edit this transaction amount">{escape(values[1])}</button>')
+            amount_cell = (f'<button type="button" data-card-amount="{signature}" '
+                           f'aria-label="Edit transaction: {label}" title="Open full transaction editor{" — financial fields locked" if week in closed else ""}">{escape(values[1])}</button>')
             parts.append(f'<tr style="background:{"#b9e5c3" if marked else "transparent"};'
                          f'color:{"#17221a" if marked else "inherit"}">'
                          f'<td>{date_cell}</td><td>{amount_cell}</td><td>{escape(values[2])}</td></tr>')
@@ -1396,7 +1415,7 @@ def render_month_review(rows, closed, month):
         reviewed[week] = set(st.session_state.get(key, [])) & valid
         st.session_state[key] = sorted(reviewed[week])
         signature_weeks.update({sig: week for sig in valid})
-    st.caption('Click Date to toggle the green reviewed marker; click Amount to edit an open-week transaction. '
+    st.caption('Click Date to toggle the green reviewed marker; click Amount to open the full transaction editor. '
                'Merchant is plain text. Reconciled amounts are locked. Tab to a Date or Amount button and press Enter or Space. '
                'All weeks ending in this month are shown. Credits are negative. Markers last for this signed-in session; changed entries need review again.')
     event = ledger_interaction(data={'html': month_review_html(rows, closed, month, reviewed)},
@@ -1413,69 +1432,23 @@ def render_month_review(rows, closed, month):
                          and str(r.get('card_budget_week')) in card_month_weeks(month)), None)
         if selected is None:
             st.error('This transaction changed. Reload the review page before editing its amount.')
-        elif str(selected.get('card_budget_week')) in closed:
-            st.info('This week is reconciled; its amounts are locked.')
         else:
-            card_amount_dialog(deepcopy(selected))
-
-
-def save_card_amount(original, value):
-    require_session()
-    amount = money(value)
-    if value is None or amount < 0 or amount >= Decimal('1000000000'):
-        raise ValueError('Enter a nonnegative amount below one billion.')
-    week = str(original.get('card_budget_week') or '')
-    if original.get('type') != 'AMZ Card' or not week:
-        raise ValueError('This is not an assigned card transaction.')
-    if week in load_card_weeks():
-        raise ValueError('This week has been reconciled; the amount is locked.')
-    if amount == money(original['amount']):
-        return False
-    response = (conn.table('Transactions').update({'amount': str(amount)})
-                .eq('id', original['id']).eq('check_revision', original['check_revision'])
-                .eq('type', 'AMZ Card').eq('card_budget_week', week).execute())
-    if getattr(response, 'error', None) or not response.data:
-        raise RuntimeError('The transaction changed or the update was not confirmed.')
-    # The database also rejects a closure racing this write under its shared lock.
-    reviewed_key = 'reviewed_card_rows_' + week
-    reviewed = set(st.session_state.get(reviewed_key, []))
-    reviewed.discard(review_signature(original))
-    st.session_state[reviewed_key] = sorted(reviewed)
-    st.session_state.pop('card_payment_snapshot_' + week, None)
-    clear_transaction_caches()
-    return True
-
-
-@st.dialog('Edit card transaction amount', width='medium')
-def card_amount_dialog(original):
-    require_session()
-    st.write(str(original.get('merchant') or 'No merchant') + ' · ' + str(original['date']))
-    st.caption('Enter the stored amount as a positive number or zero. '
-               'Income/refunds remain credits and display as negative in the review tables. '
-               'Only this transaction amount changes; saving removes its green review marker.')
-    try:
-        if str(original.get('card_budget_week')) in load_card_weeks():
-            st.info('This week is reconciled; its amounts are locked.')
-            return
-    except Exception:
-        st.error('Could not verify whether this week is open. Reopen the editor after reconnecting.')
-        return
-    with st.form('card_amount_form_' + str(original['id'])):
-        amount = st.number_input('Amount ($)', value=float(money(original['amount'])),
-                                 min_value=0.0, max_value=999999999.99, format='%.2f',
-                                 key='card_amount_' + str(original['id']) + '_' + str(original['check_revision']))
-        submitted = st.form_submit_button('Save amount', type='primary')
-    if submitted:
-        try:
-            if save_card_amount(original, amount):
-                st.rerun()
-            else:
-                st.info('The amount is unchanged.')
-        except ValueError as exc:
-            st.error(str(exc))
-        except Exception:
+            require_session()
             clear_transaction_caches()
-            st.error('The amount could not be saved. Close and reopen this editor to check for another edit or a reconciled week.')
+            st.session_state['calendar_edit_id'] = str(selected['id'])
+            edit_transaction_dialog()
+
+
+def invalidate_edited_transaction(original):
+    """All full-editor routes refresh review state only after a confirmed write."""
+    week = str(original.get('card_budget_week') or '')
+    if week:
+        key = 'reviewed_card_rows_' + week
+        reviewed = set(st.session_state.get(key, []))
+        reviewed.discard(review_signature(original))
+        st.session_state[key] = sorted(reviewed)
+        st.session_state.pop('card_payment_snapshot_' + week, None)
+    clear_transaction_caches()
 
 
 def payday_dates(first, last):
@@ -1753,7 +1726,7 @@ def calendar_entry_html(row):
                 f'border-radius:3px;padding:6px;margin:3px 0;background:{background};color:#17221a;'
                 f'font:inherit;cursor:pointer;">'
                 f'{escape(displayed)} {"✓" if cleared else ""}</button>')
-    if not row.get('planned') and row.get('type') in ('Direct', 'AMZ Card'):
+    if not row.get('planned') and row.get('type') in ('Direct', 'AMZ Card', 'Savings Transfer'):
         return (f'<button type="button" data-transaction="{int(row["id"])}" '
                 f'title="{escape(tooltip, quote=True)}" aria-label="{escape("Edit transaction: " + tooltip, quote=True)}" '
                 f'style="display:block;width:100%;text-align:left;border:0;background:transparent;'
@@ -1894,7 +1867,7 @@ def render_editable_calendar():
         st.caption(f'Opening balance carried forward from the saved balance on {anchor:%b %d, %Y}.')
     direct = {}
     for row in transactions:
-        if row.get('type') in ('Direct', 'Check'):
+        if row.get('type') in ('Direct', 'Check', 'Savings Transfer'):
             direct.setdefault(str(row['date'])[:10], []).append(row)
     for item in planned:
         if item['enabled'] and item.get('transaction_id') is None:
@@ -2154,6 +2127,207 @@ def render_budget_page():
                      'If another tab changed the budget, reload before trying again. Confirm budget_editor_update.sql is installed.')
 
 
+def savings_transfer_deltas(original, replacement):
+    deltas = {}
+    for row, multiplier in ((original, -1), (replacement, 1)):
+        if not row or row.get('type') != 'Savings Transfer':
+            continue
+        if row.get('transfer_direction') not in ('To savings', 'From savings'):
+            raise ValueError('Choose a valid transfer direction.')
+        bucket = int(row['savings_bucket_id'])
+        effect = money(row['amount']) * (1 if row['transfer_direction'] == 'To savings' else -1)
+        deltas[bucket] = deltas.get(bucket, Decimal(0)) + multiplier * effect
+    return deltas
+
+
+def validate_savings_transfer(original, replacement, buckets):
+    by_id = {b['id']: b for b in buckets}
+    for bucket_id, delta in savings_transfer_deltas(original, replacement).items():
+        b = by_id.get(bucket_id)
+        if b is None or b['balance'] is None:
+            raise ValueError('Establish this bucket balance before transferring money.')
+        after = money(b['balance']) + delta
+        if after < 0:
+            raise ValueError('Insufficient savings in ' + b['name'] + '. Reload if its balance recently changed.')
+        if after >= Decimal('1000000000'):
+            raise ValueError('Savings balance exceeds the supported limit.')
+        if not b['active'] and after != 0:
+            raise ValueError('Reactivate ' + b['name'] + ' before reversing its history.')
+    # The database repeats these checks against locked, current balances.
+
+
+def savings_transfer_payload(direction, bucket_id, amount, description, tx_date, tx_time, bucket_name):
+    if direction not in ('To savings', 'From savings') or bucket_id is None or amount is None:
+        raise ValueError('Choose transfer direction, savings bucket and amount.')
+    value = money(amount)
+    if value < 0 or value >= Decimal('1000000000'):
+        raise ValueError('Enter a nonnegative transfer amount below one billion.')
+    return dict(type='Savings Transfer', category='Savings Transfer', transfer_direction=direction,
+                savings_bucket_id=int(bucket_id), direction='Expense' if direction == 'To savings' else 'Income',
+                amount=str(value), description=str(description or ''), date=str(tx_date),
+                time=build_time_string(tx_date, tx_time), merchant='Savings Transfer — ' + bucket_name)
+
+
+def savings_transfer_form(prefix, original=None):
+    try:
+        buckets = load_budget_table('LedgerSavingsBuckets')
+    except Exception:
+        st.error('Savings buckets could not be loaded. Install savings_update.sql, then set up Savings Account.')
+        return
+    available = {r['id']: r for r in buckets if (r['active'] and r['balance'] is not None)
+                 or (original and r['id'] == original.get('savings_bucket_id'))}
+    if not available:
+        st.info('First establish General savings or a named bucket balance on the Savings Account page. Enter zero explicitly if it is empty.')
+        return
+    bucket_key = prefix + '_savings_bucket'
+    if st.session_state.get(bucket_key) not in available:
+        st.session_state[bucket_key] = next(iter(available))
+    transfer_direction = st.selectbox('Transfer direction', ['To savings', 'From savings'], key=prefix + '_transfer_direction')
+    bucket_id = st.selectbox('Savings category', list(available), key=bucket_key,
+                            format_func=lambda i: available[i]['name'] + (' (archived)' if not available[i]['active'] else ''))
+    st.caption('Category: Savings Transfer (fixed). To savings leaves checking; From savings returns money to checking. '
+               'Transfers update the chosen bucket and savings total once. Bucket balances may not become negative.')
+    amount = st.number_input('Amount ($)', value=None if original is None else float(money(original['amount'])),
+                             min_value=0.0, max_value=999999999.99, format='%.2f', key=prefix + '_amount')
+    description = st.text_input('Description', key=prefix + '_desc')
+    tx_date = st.date_input('Date', key=prefix + '_date')
+    tx_time = st.time_input('Time', key=prefix + '_time')
+    save = st.button('Update Transaction' if original else 'Save Transaction', type='primary', key=prefix + '_save_transfer')
+    delete = st.button('Delete Transaction', key=prefix + '_delete_transfer') if original else False
+    if save or delete:
+        require_session()
+        try:
+            if delete:
+                validate_savings_transfer(original, None, buckets)
+                response = (conn.table('Transactions').delete().eq('id', original['id'])
+                            .eq('check_revision', original['check_revision']).execute())
+            else:
+                payload = savings_transfer_payload(transfer_direction, bucket_id, amount, description, tx_date, tx_time, available[bucket_id]['name'])
+                validate_savings_transfer(original, payload, buckets)
+                if original:
+                    response = (conn.table('Transactions').update(payload).eq('id', original['id'])
+                                .eq('check_revision', original['check_revision']).execute())
+                else:
+                    response = conn.table('Transactions').insert(payload).execute()
+            if not response.data or getattr(response, 'error', None):
+                raise ValueError('The transaction changed. Close and reopen it before saving.')
+            if original:
+                invalidate_edited_transaction(original)
+            else:
+                clear_transaction_caches()
+            st.rerun()
+        except Exception as exc:
+            st.error('Transfer was not confirmed: ' + str(getattr(exc, 'message', None) or exc))
+            st.caption('An edit or deletion must also leave the original savings bucket nonnegative. Reload after an uncertain response before retrying.')
+
+
+def savings_totals(buckets):
+    known = sum((money(b['balance']) for b in buckets if b['balance'] is not None), Decimal(0))
+    unset = [b['name'] for b in buckets if b['active'] and b['balance'] is None]
+    return known, unset
+
+
+def savings_action(name, payload):
+    require_session()
+    try:
+        response = conn.rpc(name, payload).execute()
+        if response.data is not True:
+            raise RuntimeError('Save not confirmed.')
+        st.session_state.pop('savings_snapshot', None)
+        st.session_state['savings_generation'] = st.session_state.get('savings_generation', 0) + 1
+        clear_transaction_caches()
+        st.rerun()
+    except Exception as exc:
+        st.error('Savings change was not confirmed: ' + str(getattr(exc, 'message', None) or exc))
+        st.caption('Reload savings to check for another edit or an uncertain response before trying again.')
+
+
+def render_savings_page():
+    require_session()
+    st.title('Savings Account')
+    st.caption('General savings is unearmarked money; named categories are portions of the same account. '
+               'Balances include all recorded savings transfers, including future-dated entries. This is a ledger, not live bank synchronization.')
+    if st.button('Reload savings / discard unsaved changes'):
+        st.session_state.pop('savings_snapshot', None)
+        st.session_state['savings_generation'] = st.session_state.get('savings_generation', 0) + 1
+        st.rerun()
+    try:
+        if 'savings_snapshot' not in st.session_state:
+            st.session_state['savings_snapshot'] = load_budget_table('LedgerSavingsBuckets')
+        buckets = st.session_state['savings_snapshot']
+        audit = load_budget_table('LedgerSavingsAudit')
+    except Exception:
+        st.error('Savings could not be loaded. Install savings_update.sql and reload.')
+        return
+    by_id = {b['id']: b for b in buckets}
+    total, unset = savings_totals(buckets)
+    st.metric('Total savings account balance' if not unset else 'Established balances subtotal', f'${total:,.2f}')
+    if unset:
+        st.warning('Total savings is not yet established. Set balances for: ' + ', '.join(unset))
+    st.dataframe(pd.DataFrame([{'Category':b['name'],'Saved amount':'Not set' if b['balance'] is None else f"${money(b['balance']):,.2f}",
+                               'Status':'Active' if b['active'] else 'Archived'} for b in buckets]), hide_index=True,use_container_width=True)
+    generation = str(st.session_state.get('savings_generation', 0))
+    with st.expander('Create or manage savings categories'):
+        with st.form('savings_create_' + generation):
+            name = st.text_input('New category name')
+            create = st.form_submit_button('Create category')
+        if create:
+            savings_action('ledger_save_savings_bucket',dict(p_id=None,p_revision=None,p_name=name,p_active=True))
+        selected = st.selectbox('Category to manage',list(by_id),format_func=lambda i:by_id[i]['name'],key='manage_savings_bucket')
+        bucket = by_id[selected]
+        with st.form('savings_manage_' + str(selected) + '_' + generation):
+            name = st.text_input('Category name',value=bucket['name'],disabled=bucket['is_general'])
+            active = st.checkbox('Active',value=bucket['active'],disabled=bucket['is_general'])
+            manage = st.form_submit_button('Save category')
+        st.caption('Archived categories retain their history. Move their balance to another bucket before archiving. General savings always remains active.')
+        if manage:
+            savings_action('ledger_save_savings_bucket',dict(p_id=selected,p_revision=bucket['revision'],p_name=name,p_active=active))
+    with st.expander('Establish or correct a saved balance'):
+        st.caption('Use this for an opening amount or a documented correction. It changes the savings total but never checking. '
+                   'Do not use it to record a new checking transfer or to move money between categories. '
+                   'When setting up existing savings, enter named portions separately and only the unearmarked remainder in General savings.')
+        active_ids = [b['id'] for b in buckets if b['active']]
+        selected = st.selectbox('Bucket balance to set',active_ids,format_func=lambda i:by_id[i]['name'],key='set_savings_bucket')
+        bucket = by_id[selected]
+        with st.form('savings_set_' + str(selected) + '_' + generation):
+            balance = st.number_input('Saved amount for this bucket',value=None if bucket['balance'] is None else float(money(bucket['balance'])),
+                                      min_value=0.0,max_value=999999999.99,format='%.2f')
+            reason = st.text_input('Reason / bank balance reference')
+            confirm = st.checkbox('This is an opening balance or correction, not a new checking transfer or internal allocation.')
+            save_balance = st.form_submit_button('Record balance adjustment')
+        if save_balance:
+            if not confirm or balance is None or not reason.strip():
+                st.error('Enter the balance and reason, and confirm the adjustment.')
+            else:
+                savings_action('ledger_set_savings_balance',dict(p_id=selected,p_revision=bucket['revision'],p_balance=str(money(balance)),p_note=reason))
+    with st.expander('Allocate money between savings categories'):
+        st.caption('Move existing savings between General savings and named categories, or between two named categories. Checking and total savings stay unchanged.')
+        initialized = [b['id'] for b in buckets if b['active'] and b['balance'] is not None]
+        if len(initialized)<2:
+            st.info('Establish balances for at least two active buckets, including an explicit zero for an empty destination.')
+        else:
+            with st.form('savings_allocate_' + generation):
+                source = st.selectbox('From bucket',initialized,format_func=lambda i:by_id[i]['name'])
+                target = st.selectbox('To bucket',initialized,index=1,format_func=lambda i:by_id[i]['name'])
+                amount = st.number_input('Amount to allocate',value=None,min_value=0.01,max_value=999999999.99,format='%.2f')
+                reason = st.text_input('Allocation reason')
+                allocate = st.form_submit_button('Move within savings')
+            if allocate:
+                if source==target or amount is None or not reason.strip():
+                    st.error('Choose two different buckets, an amount and a reason.')
+                else:
+                    savings_action('ledger_allocate_savings',dict(p_from=source,p_to=target,p_from_revision=by_id[source]['revision'],
+                        p_to_revision=by_id[target]['revision'],p_amount=str(money(amount)),p_note=reason))
+    st.subheader('Savings history')
+    if audit:
+        st.dataframe(pd.DataFrame([{'Recorded':r['recorded_at'],'Category':by_id.get(r['bucket_id'],{}).get('name',str(r['bucket_id'])),
+            'Action':r['kind'],'Change':r['delta'],'Before':r['before_balance'],'After':r['after_balance'],
+            'Transaction':r['transaction_id'],'Reason':r['note'],'Operation':r['operation_id'],'Details':json.dumps(r['details'],ensure_ascii=False)}
+            for r in reversed(audit)]),hide_index=True,use_container_width=True)
+    else:
+        st.info('No savings history recorded yet.')
+
+
 # ============================================================
 # SIDEBAR BUTTONS & ACCOUNT CONTROLS
 # ============================================================
@@ -2234,20 +2408,7 @@ elif account_selection == "Budget":
     render_budget_page()
 
 elif account_selection == "Emergency Savings":
-    st.title("Savings Account: Goals & Growth")
-
-    s1, s2, s3 = st.columns(3)
-
-    s1.metric("Total Savings", "$15,400.00")
-    s2.metric("Emergency Goal", "$20,000.00", "77% reached")
-    s3.metric("Monthly Contribution", "$500.00/mo")
-
-    st.divider()
-
-    st.progress(
-        0.77,
-        text="Emergency Fund Target: 77% ($15,400 / $20,000)",
-    )
+    render_savings_page()
 
 
 # ============================================================
@@ -2262,4 +2423,5 @@ elif account_selection == "Direct PLUS Loan":
     l1.metric("Remaining Principal", "$12,350.00")
     l2.metric("Interest Rate", "6.8%")
     l3.metric("Next Payment Due", "Sep 15, 2026")
+
 
