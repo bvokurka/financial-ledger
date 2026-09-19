@@ -2391,7 +2391,9 @@ def credit_frame(rows, accounts, target):
              'New charge 1', 'New charge 2', 'New charge 3', 'Payment 1', 'Payment 2', 'Month activity',
              'Current balance', 'Current usage %', 'Future balance', 'Remaining credit', 'Target use',
              'Payment to target use', 'Planned next payment']
-    return pd.DataFrame(result, columns=order)
+    return pd.DataFrame(result, columns=order).sort_values(
+        'Account', key=lambda values: values.str.casefold(), kind='stable'
+    ).reset_index(drop=True)
 
 
 def credit_edits(edited, originals):
@@ -2445,16 +2447,9 @@ def credit_style(frame):
         styles = []
         for column in frame.columns:
             bg = '#ffffff'
-            if column.startswith('New charge'):
-                bg = '#f3d2ac'
-            elif column.startswith('Payment ') and column != 'Payment to target use':
-                bg = '#d4efd0'
-            elif column == 'Pay at least':
-                bg = '#fff4a3'
-            elif column in ('Current balance', 'Future balance'):
-                bg = '#fff0aa'
-            elif column == 'Current usage %' and not pd.isna(row[column]):
-                bg = '#d4efd0' if row[column] <= row.get('_target_percent', 29) else '#ffd6d6'
+            if column == 'Current usage %' and not pd.isna(row[column]):
+                if row[column] > row.get('_target_percent', 29):
+                    bg = '#ffd6d6'
             styles.append('background-color:' + bg + ';color:#17202a')
         return styles
     return frame.style.apply(cell_styles, axis=1)
@@ -2494,6 +2489,9 @@ def render_credit_page():
     with controls[0]:
         chosen = st.date_input('Worksheet month', value=date(2026, 9, 1), key='credit_month_picker')
     month = chosen.replace(day=1).isoformat()
+    # Match the space occupied by the date input's label above adjacent controls.
+    for control in controls[1:]:
+        control.markdown('<div aria-hidden="true" style="height:28px"></div>', unsafe_allow_html=True)
     if controls[2].button('Reload / discard unsaved changes'):
         st.session_state.pop('credit_snapshot', None)
         st.session_state['credit_generation'] = st.session_state.get('credit_generation', 0) + 1
@@ -2569,7 +2567,9 @@ def render_credit_page():
     config = {'_id': None, 'Account': st.column_config.TextColumn(width='medium'),
               'Type': st.column_config.TextColumn(width='small')}
     for label in list(CREDIT_FIELDS.values()) + CREDIT_CALCULATED:
-        config[label] = st.column_config.NumberColumn(label, format='%.2f' if '%' in label else '$%.2f', width='small')
+        header = ('🟨 ' if label.startswith('New charge ') else
+                  '🟩 ' if label in ('Payment 1', 'Payment 2') else '') + label
+        config[label] = st.column_config.NumberColumn(header, format='%.2f' if '%' in label else '$%.2f', width='small')
     config['APR %'] = st.column_config.NumberColumn('APR %', min_value=0.0, max_value=100.0, format='%.2f')
     config['Planned next payment'] = st.column_config.NumberColumn('Planned next payment', min_value=0.0, format='$%.2f', help='An additional future payment; posted payments are already included in Current balance.')
     # Styler formatting is supported for disabled/calculated columns. Editable cells use standard inputs.
@@ -2708,6 +2708,8 @@ if st.sidebar.button('View selected account', use_container_width=True):
 st.sidebar.divider()
 st.sidebar.subheader('Credit accounts')
 if st.sidebar.button('Lines of Credit', use_container_width=True):
+    if st.session_state.get('ledger_view') != 'Lines of Credit':
+        st.session_state['credit_generation'] = st.session_state.get('credit_generation', 0) + 1
     st.session_state['ledger_view'] = 'Lines of Credit'
 
 st.sidebar.title("Financial Accounts")
