@@ -1207,9 +1207,11 @@ export default function({parentElement, data, setTriggerValue}) {
     const root = parentElement.querySelector('.ledger-interactive-root');
     root.innerHTML = data.html;
     root.onclick = event => {
-        const button = event.target.closest('button[data-transaction],button[data-planned],button[data-payday],button[data-card-amount],button[data-review]');
+        const button = event.target.closest('button[data-transaction],button[data-planned],button[data-payday],button[data-card-amount],button[data-review],button[data-savings]');
         if (!button || !root.contains(button)) return;
-        if (button.dataset.cardAmount) {
+        if (button.dataset.savings) {
+            setTriggerValue('action', {savings: button.dataset.savings});
+        } else if (button.dataset.cardAmount) {
             setTriggerValue('action', {card_amount: button.dataset.cardAmount});
         } else if (button.dataset.transaction) {
             setTriggerValue('action', {id: button.dataset.transaction});
@@ -2261,11 +2263,20 @@ def render_savings_page():
         return
     by_id = {b['id']: b for b in buckets}
     total, unset = savings_totals(buckets)
-    st.metric('Total savings account balance' if not unset else 'Established balances subtotal', f'${total:,.2f}')
+    total_column, general_column = st.columns(2)
+    total_column.metric('Total savings account balance' if not unset else 'Established balances subtotal', f'${total:,.2f}')
+    general = next((b for b in buckets if b['is_general']), None)
+    general_column.metric('General savings', 'Not set' if general is None or general['balance'] is None else f"${money(general['balance']):,.2f}")
     if unset:
         st.warning('Total savings is not yet established. Set balances for: ' + ', '.join(unset))
-    st.dataframe(pd.DataFrame([{'Category':b['name'],'Saved amount':'Not set' if b['balance'] is None else f"${money(b['balance']):,.2f}",
-                               'Status':'Active' if b['active'] else 'Archived'} for b in buckets]), hide_index=True,use_container_width=True)
+    st.caption('Click a category name to open its transactions and balance history.')
+    event = ledger_interaction(data={'html': savings_table_html(buckets)}, key='savings_categories', on_action_change=lambda: None)
+    details_id = st.session_state.pop('savings_details_id', None)
+    if event.action and isinstance(event.action, dict):
+        candidate = str(event.action.get('savings', ''))
+        details_id = next((identity for identity in by_id if str(identity) == candidate), None)
+    if details_id in by_id:
+        savings_category_dialog(by_id[details_id], audit)
     generation = str(st.session_state.get('savings_generation', 0))
     with st.expander('Create or manage savings categories'):
         with st.form('savings_create_' + generation):
@@ -2329,6 +2340,340 @@ def render_savings_page():
 
 
 # ============================================================
+# LINES OF CREDIT — monthly worksheet, separate from checking
+# ============================================================
+
+CREDIT_FIELDS = {
+    'credit_limit': 'Credit limit', 'statement_balance': 'Statement balance',
+    'apr': 'APR %', 'monthly_interest': 'Monthly interest',
+    'minimum_payment': 'Pay at least',
+    'charge_1': 'New charge 1', 'charge_2': 'New charge 2', 'charge_3': 'New charge 3',
+    'payment_1': 'Payment 1', 'payment_2': 'Payment 2',
+    'planned_payment': 'Planned next payment',
+}
+CREDIT_CALCULATED = ['Month activity', 'Current balance', 'Current usage %',
+                     'Future balance', 'Remaining credit', 'Target use', 'Payment to target use']
+
+
+def credit_optional(value):
+    if value is None or pd.isna(value):
+        return None
+    return money(value)
+
+
+def credit_calculations(row, target_percent):
+    """Posted payments count once. APR estimate uses the current balance before a future payment."""
+    values = {key: credit_optional(row.get(key)) for key in CREDIT_FIELDS}
+    charges = sum((values[k] or Decimal(0) for k in ('charge_1', 'charge_2', 'charge_3')), Decimal(0))
+    payments = sum((abs(values[k] or Decimal(0)) for k in ('payment_1', 'payment_2')), Decimal(0))
+    activity = charges - payments
+    opening, limit, apr = values['statement_balance'], values['credit_limit'], values['apr']
+    balance = None if opening is None else opening + activity
+    usage = None if balance is None or not limit else (balance / limit * 100).quantize(Decimal('.01'), rounding=ROUND_HALF_UP)
+    target = None if limit is None else (limit * money(target_percent) / 100).quantize(Decimal('.01'), rounding=ROUND_HALF_UP)
+    interest = None if balance is None or apr is None else (max(balance, Decimal(0)) * apr / 1200).quantize(Decimal('.01'), rounding=ROUND_HALF_UP)
+    future = None if interest is None else balance - abs(values['planned_payment'] or Decimal(0)) + interest
+    return {'Month activity': activity, 'Current balance': balance, 'Current usage %': usage,
+            'Future balance': future, 'Remaining credit': None if balance is None or limit is None else limit - balance,
+            'Target use': target, 'Payment to target use': None if balance is None or target is None else balance - target}
+
+
+def credit_frame(rows, accounts, target):
+    names = {a['id']: a for a in accounts}
+    result = []
+    for row in rows:
+        account = names[row['account_id']]
+        entry = {'_id': row['id'], 'Account': account['name'], 'Type': account['account_type']}
+        entry.update({label: None if row.get(key) is None else float(money(row[key])) for key, label in CREDIT_FIELDS.items()})
+        entry.update({key: None if value is None else float(value) for key, value in credit_calculations(row, target).items()})
+        result.append(entry)
+    order = ['_id', 'Account', 'Type', 'Credit limit', 'Statement balance', 'APR %', 'Monthly interest', 'Pay at least',
+             'New charge 1', 'New charge 2', 'New charge 3', 'Payment 1', 'Payment 2', 'Month activity',
+             'Current balance', 'Current usage %', 'Future balance', 'Remaining credit', 'Target use',
+             'Payment to target use', 'Planned next payment']
+    return pd.DataFrame(result, columns=order)
+
+
+def credit_edits(edited, originals):
+    """Return only changed rows with the revision shown to this browser."""
+    by_id = {str(r['id']): r for r in originals}
+    result = []
+    seen = set()
+    for _, row in edited.iterrows():
+        identity = str(row['_id'])
+        if identity not in by_id or identity in seen:
+            raise ValueError('The worksheet changed. Reload it before saving.')
+        seen.add(identity)
+        previous = by_id[identity]
+        values = {}
+        changed = False
+        for key, label in CREDIT_FIELDS.items():
+            amount = credit_optional(row[label])
+            if amount is not None and key not in ('statement_balance', 'charge_1', 'charge_2', 'charge_3', 'payment_1', 'payment_2') and amount < 0:
+                raise ValueError(label + ' cannot be negative.')
+            if key == 'apr' and amount is not None and amount > 100:
+                raise ValueError('APR must be between 0 and 100 percent.')
+            if key in ('payment_1', 'payment_2') and amount is not None:
+                amount = -abs(amount)
+            old = credit_optional(previous.get(key))
+            values[key] = None if amount is None else str(amount)
+            changed = changed or amount != old
+        if changed:
+            result.append(dict(id=previous['id'], revision=previous['revision'], **values))
+    if seen != set(by_id):
+        raise ValueError('Rows cannot be removed from this worksheet. Reload it.')
+    return result
+
+
+def credit_action(name, payload):
+    require_session()
+    try:
+        result = conn.rpc(name, payload).execute()
+        if result.data is not True:
+            raise RuntimeError('Save not confirmed.')
+    except Exception as exc:
+        st.error('Credit change was not confirmed: ' + str(getattr(exc, 'message', None) or exc))
+        st.caption('Reload to check the saved values before retrying an uncertain response.')
+        return
+    st.session_state.pop('credit_snapshot', None)
+    st.session_state['credit_generation'] = st.session_state.get('credit_generation', 0) + 1
+    st.rerun()
+
+
+def credit_style(frame):
+    def cell_styles(row):
+        styles = []
+        for column in frame.columns:
+            bg = '#ffffff'
+            if column.startswith('New charge'):
+                bg = '#f3d2ac'
+            elif column.startswith('Payment ') and column != 'Payment to target use':
+                bg = '#d4efd0'
+            elif column == 'Pay at least':
+                bg = '#fff4a3'
+            elif column in ('Current balance', 'Future balance'):
+                bg = '#fff0aa'
+            elif column == 'Current usage %' and not pd.isna(row[column]):
+                bg = '#d4efd0' if row[column] <= row.get('_target_percent', 29) else '#ffd6d6'
+            styles.append('background-color:' + bg + ';color:#17202a')
+        return styles
+    return frame.style.apply(cell_styles, axis=1)
+
+
+def credit_history_rows(history, accounts):
+    names = {str(a['id']): a['name'] for a in accounts}
+    labels = dict(CREDIT_FIELDS, name='Account name', account_type='Account type', active='Include in new months', target_percent='Target use %')
+    result = []
+    for record in reversed(history):
+        before, after = record.get('before_data') or {}, record.get('after_data') or {}
+        stamp = datetime.fromisoformat(record['recorded_at'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+        for key, label in labels.items():
+            if before.get(key) == after.get(key):
+                continue
+            def display(value):
+                if value is None:
+                    return 'Not set'
+                if isinstance(value, bool):
+                    return 'Yes' if value else 'No'
+                if key in CREDIT_FIELDS or key == 'target_percent':
+                    return f'{money(value):,.2f}%' if key in ('apr', 'target_percent') else f'${money(value):,.2f}'
+                return str(value)
+            result.append({'Recorded': stamp.strftime('%Y-%m-%d %H:%M'), 'Account': names.get(str(record.get('account_id')), 'All accounts'),
+                           'Action': record['kind'], 'Field': label, 'Before': display(before.get(key)), 'After': display(after.get(key))})
+        if record['kind'] == 'Month prepared':
+            result.append({'Recorded': stamp.strftime('%Y-%m-%d %H:%M'), 'Account': names.get(str(record.get('account_id')), 'All accounts'),
+                           'Action': 'Month prepared', 'Field': 'Worksheet month', 'Before': '', 'After': record['month']})
+    return result
+
+
+def render_credit_page():
+    require_session()
+    st.title('Lines of Credit')
+    st.caption('Enter charges and payments in the monthly worksheet. Saved credit entries track these balances separately from checking.')
+    controls = st.columns([1, 1, 1])
+    with controls[0]:
+        chosen = st.date_input('Worksheet month', value=date(2026, 9, 1), key='credit_month_picker')
+    month = chosen.replace(day=1).isoformat()
+    if controls[2].button('Reload / discard unsaved changes'):
+        st.session_state.pop('credit_snapshot', None)
+        st.session_state['credit_generation'] = st.session_state.get('credit_generation', 0) + 1
+        st.rerun()
+    try:
+        snapshot = st.session_state.get('credit_snapshot')
+        if not snapshot or snapshot['month'] != month:
+            accounts = load_budget_table('LedgerCreditAccounts')
+            months = load_budget_table('LedgerCreditMonths')
+            settings = load_budget_table('LedgerCreditSettings')
+            if len(settings) != 1:
+                raise RuntimeError('Credit settings are missing.')
+            snapshot = dict(month=month, accounts=accounts, all_months=months, settings=settings[0])
+            st.session_state['credit_snapshot'] = snapshot
+        accounts, all_months, setting = snapshot['accounts'], snapshot['all_months'], snapshot['settings']
+    except Exception:
+        st.error('Lines of Credit could not be loaded. Install lines_of_credit_update.sql, then reload.')
+        return
+    generation = str(st.session_state.get('credit_generation', 0))
+    rows = [r for r in all_months if r['month'] == month]
+    target = money(setting['target_percent'])
+    with controls[1]:
+        with st.expander('Target use settings'):
+            with st.form('credit_target_' + generation):
+                percent = st.number_input('Target credit use (%)', min_value=0.0, max_value=100.0, value=float(target), step=1.0, format='%.2f')
+                save_target = st.form_submit_button('Save target percentage')
+    if save_target:
+        credit_action('ledger_save_credit_target', dict(p_revision=setting['revision'], p_target=str(money(percent))))
+    with st.expander('Add or manage a credit account', expanded=not accounts):
+        with st.form('credit_add_' + generation):
+            name = st.text_input('Account name')
+            kind = st.selectbox('Account type', ['Credit Card', 'Line of Credit', 'Lender', 'Loan'])
+            add = st.form_submit_button('Add account to this month')
+        if add:
+            if not name.strip():
+                st.error('Enter an account name.')
+            else:
+                credit_action('ledger_save_credit_account', dict(p_id=None, p_revision=None, p_name=name.strip(), p_type=kind, p_active=True, p_month=month))
+        if accounts:
+            by_id = {a['id']: a for a in accounts}
+            selected = st.selectbox('Account to manage', list(by_id), format_func=lambda i: by_id[i]['name'])
+            account = by_id[selected]
+            with st.form('credit_manage_' + str(selected) + '_' + generation):
+                name = st.text_input('Name', value=account['name'])
+                kinds = ['Credit Card', 'Line of Credit', 'Lender', 'Loan']
+                kind = st.selectbox('Type', kinds, index=kinds.index(account['account_type']))
+                active = st.checkbox('Include in new months', value=account['active'])
+                manage = st.form_submit_button('Save account details')
+            st.caption('Turning off inclusion keeps past worksheets and history. Existing month entries remain editable.')
+            if manage:
+                credit_action('ledger_save_credit_account', dict(p_id=selected, p_revision=account['revision'], p_name=name, p_type=kind, p_active=active, p_month=month))
+    missing = [a for a in accounts if a['active'] and a['id'] not in {r['account_id'] for r in rows}]
+    if missing:
+        st.info('Prepare this month to add: ' + ', '.join(a['name'] for a in missing))
+        st.caption('The immediately preceding month’s saved current balance becomes the statement balance. Limits and APR carry forward; charges, payments and planned payments start blank. Verify against each statement. Earlier worksheets stay unchanged.')
+        if st.button('Prepare this month from the previous month', type='primary'):
+            credit_action('ledger_prepare_credit_month', dict(p_month=month))
+    if not rows:
+        st.info('Add an account or prepare this month, then enter its limit, statement balance and APR. Blank means not entered; enter zero explicitly for a known zero.')
+        return
+    frame = credit_frame(rows, accounts, target)
+    calculations = [credit_calculations(row, target) for row in rows]
+    known_balance = sum((r['Current balance'] for r in calculations if r['Current balance'] is not None), Decimal(0))
+    known_limit = sum((money(r['credit_limit']) for r in rows if r.get('credit_limit') is not None), Decimal(0))
+    unknown = sum(r['Current balance'] is None for r in calculations)
+    c1, c2, c3 = st.columns(3)
+    c1.metric('Current balances' if not unknown else 'Established balance subtotal', f'${known_balance:,.2f}')
+    c2.metric('Entered credit limits', f'${known_limit:,.2f}')
+    c3.metric('Target use', f'{target:,.2f}%')
+    if unknown:
+        st.warning(f'{unknown} account(s) need a statement balance before their balance and usage can be calculated.')
+    st.caption('Click an input cell to edit. Payments may be entered with either sign and are saved as negative amounts. Negative charges record credits/refunds. Save the worksheet before changing months, target percentage or account settings. Calculations refresh after saving; scroll horizontally for the remaining columns.')
+    config = {'_id': None, 'Account': st.column_config.TextColumn(width='medium'),
+              'Type': st.column_config.TextColumn(width='small')}
+    for label in list(CREDIT_FIELDS.values()) + CREDIT_CALCULATED:
+        config[label] = st.column_config.NumberColumn(label, format='%.2f' if '%' in label else '$%.2f', width='small')
+    config['APR %'] = st.column_config.NumberColumn('APR %', min_value=0.0, max_value=100.0, format='%.2f')
+    config['Planned next payment'] = st.column_config.NumberColumn('Planned next payment', min_value=0.0, format='$%.2f', help='An additional future payment; posted payments are already included in Current balance.')
+    # Styler formatting is supported for disabled/calculated columns. Editable cells use standard inputs.
+    frame['_target_percent'] = float(target)
+    config['_target_percent'] = None
+    edited = st.data_editor(credit_style(frame), hide_index=True, num_rows='fixed', use_container_width=True,
+                            height=min(1000, 40 + len(rows) * 36),
+                            disabled=['_id', '_target_percent', 'Account', 'Type'] + CREDIT_CALCULATED,
+                            column_config=config, key='credit_sheet_' + month + '_' + generation)
+    if st.button('Save credit worksheet', type='primary'):
+        try:
+            changes = credit_edits(edited, rows)
+        except (ValueError, InvalidOperation) as exc:
+            st.error(str(exc))
+        else:
+            if changes:
+                credit_action('ledger_save_credit_months', dict(p_month=month, p_rows=changes))
+            else:
+                st.info('No worksheet changes to save.')
+    totals = {}
+    for column in ['Month activity', 'Current balance', 'Future balance', 'Remaining credit', 'Target use', 'Payment to target use']:
+        values = [r[column] for r in calculations]
+        totals[column] = None if any(v is None for v in values) else float(sum(values, Decimal(0)))
+    totals.update({'Account': 'Month totals', 'Credit limit': None if any(r.get('credit_limit') is None for r in rows) else float(known_limit)})
+    st.dataframe(pd.DataFrame([totals]), hide_index=True, use_container_width=True,
+                 column_config={k: v for k, v in config.items() if k in totals})
+    st.caption('Current balance = statement balance + new charges − recorded payments. Monthly interest and Pay at least are statement-reference fields; they are not added to the balance again. Enter a new interest charge in a New charge cell only if it is not included in the statement balance.')
+    st.caption('Future balance is an estimate: current balance − planned next payment + one month of interest (positive current balance × APR ÷ 12). It assumes no additional charges and uses the balance before the planned payment for interest. Blank APR leaves the estimate blank. Actual interest may differ because of daily balances, payment dates, fees, promotional rates and grace periods.')
+    st.caption('Target use = limit × target percentage. Payment to target use = current balance − target use: positive is the payment needed; negative means already below target. Preparing another month copies saved current balances, not this estimate; later corrections do not rewrite other months.')
+    with st.expander('Saved change history'):
+        try:
+            history = load_budget_table('LedgerCreditAudit')
+            selected_history = [h for h in history if h.get('month') == month or h.get('month') is None]
+            if selected_history:
+                st.dataframe(pd.DataFrame(credit_history_rows(selected_history, accounts)),
+                    hide_index=True, use_container_width=True)
+            else:
+                st.info('No saved changes yet.')
+        except Exception:
+            st.error('Credit history could not be loaded.')
+
+
+def savings_category_transactions(bucket_id, transactions):
+    rows = []
+    for tx in transactions:
+        if tx.get('type') != 'Savings Transfer' or str(tx.get('savings_bucket_id')) != str(bucket_id):
+            continue
+        amount = money(tx['amount']) * (1 if tx.get('transfer_direction') == 'To savings' else -1)
+        rows.append({'Date': tx['date'], 'Amount': float(amount), 'Direction': tx['transfer_direction'],
+                     'Description': tx.get('description') or '', 'Transaction': tx['id']})
+    return sorted(rows, key=lambda r: (r['Date'], str(r['Transaction'])), reverse=True)
+
+
+@st.dialog('Savings category transactions', width='large')
+def savings_category_dialog(bucket, audit):
+    require_session()
+    st.subheader(bucket['name'])
+    st.metric('Current saved amount', 'Not set' if bucket['balance'] is None else f"${money(bucket['balance']):,.2f}")
+    tabs = st.tabs(['Transactions', 'Balance history'])
+    with tabs[0]:
+        try:
+            rows = savings_category_transactions(bucket['id'], get_transactions_cached())
+        except Exception:
+            st.error('Transactions could not be loaded. Close this window and reload savings.')
+        else:
+            if rows:
+                st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True,
+                    column_config={'Amount': st.column_config.NumberColumn(format='$%.2f'), 'Transaction': None})
+            else:
+                st.info('No checking transfers are recorded for this category.')
+        st.caption('Positive amounts add to savings; negative amounts withdraw. Opening balances, corrections, allocations and deleted entries are retained in Balance history.')
+    with tabs[1]:
+        history = [r for r in audit if str(r['bucket_id']) == str(bucket['id'])]
+        if history:
+            entries = []
+            for row in reversed(history):
+                stamp = datetime.fromisoformat(row['recorded_at'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+                entries.append({'Recorded': stamp.strftime('%Y-%m-%d %H:%M'), 'Action': row['kind'],
+                    'Amount': float(money(row['delta'])), 'Balance after': None if row['after_balance'] is None else float(money(row['after_balance'])),
+                    'Description': row['note']})
+            st.dataframe(pd.DataFrame(entries), hide_index=True, use_container_width=True,
+                column_config={'Amount': st.column_config.NumberColumn(format='$%.2f'), 'Balance after': st.column_config.NumberColumn(format='$%.2f')})
+        else:
+            st.info('No balance history recorded yet.')
+    if st.button('Close category details'):
+        st.rerun()
+
+
+def savings_table_html(buckets):
+    parts = ['<style>.savings-category-table{width:100%;border-collapse:collapse;font-size:14px}'
+             '.savings-category-table th,.savings-category-table td{border:1px solid #bbb;padding:10px;text-align:left}'
+             '.savings-category-table th{background:#edf1f6;color:#17202a}'
+             '.savings-category-table button{font:inherit;color:inherit;border:0;background:transparent;padding:0;width:100%;text-align:left;cursor:pointer;text-decoration:underline}'
+             '.savings-category-table button:focus-visible{outline:2px solid #2684ff;outline-offset:3px}</style>'
+             '<table class="savings-category-table"><thead><tr><th>Category</th><th>Saved amount</th><th>Status</th></tr></thead><tbody>']
+    for bucket in buckets:
+        amount = 'Not set' if bucket['balance'] is None else f"${money(bucket['balance']):,.2f}"
+        parts.append(f'<tr><td><button type="button" data-savings="{int(bucket["id"])}">{escape(bucket["name"])}</button></td>'
+                     f'<td>{amount}</td><td>{"Active" if bucket["active"] else "Archived"}</td></tr>')
+    parts.append('</tbody></table>')
+    return ''.join(parts)
+
+
+# ============================================================
 # SIDEBAR BUTTONS & ACCOUNT CONTROLS
 # ============================================================
 
@@ -2360,6 +2705,11 @@ if st.sidebar.button('Budget', use_container_width=True):
 if st.sidebar.button('View selected account', use_container_width=True):
     st.session_state['ledger_view'] = 'Account'
 
+st.sidebar.divider()
+st.sidebar.subheader('Credit accounts')
+if st.sidebar.button('Lines of Credit', use_container_width=True):
+    st.session_state['ledger_view'] = 'Lines of Credit'
+
 st.sidebar.title("Financial Accounts")
 
 account_selection = st.sidebar.selectbox(
@@ -2373,7 +2723,7 @@ account_selection = st.sidebar.selectbox(
     key='ledger_account',
     on_change=lambda: st.session_state.update(ledger_view='Account'),
 )
-if st.session_state.get('ledger_view') in ('Budget', 'Reconcile'):
+if st.session_state.get('ledger_view') in ('Budget', 'Reconcile', 'Lines of Credit'):
     account_selection = st.session_state['ledger_view']
 
 st.sidebar.divider()
@@ -2407,6 +2757,9 @@ elif account_selection == "Reconcile":
 elif account_selection == "Budget":
     render_budget_page()
 
+elif account_selection == "Lines of Credit":
+    render_credit_page()
+
 elif account_selection == "Emergency Savings":
     render_savings_page()
 
@@ -2423,5 +2776,4 @@ elif account_selection == "Direct PLUS Loan":
     l1.metric("Remaining Principal", "$12,350.00")
     l2.metric("Interest Rate", "6.8%")
     l3.metric("Next Payment Due", "Sep 15, 2026")
-
 
