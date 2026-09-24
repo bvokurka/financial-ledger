@@ -1,3 +1,4 @@
+
 from uuid import uuid4
 import json
 from hashlib import sha256
@@ -1905,10 +1906,11 @@ def render_editable_calendar():
             ensure_unified_budget_months(max(opening_dates), first)
         transactions = get_transactions_cached()
         reconciled = load_card_weeks()
-    except Exception:
+    except Exception as exc:
         logger.exception('Unable to load editable calendar.')
-        st.error('The calendar could not be loaded. Apply calendar_setup.sql and card_reconciliation.sql in Supabase, '
-                 'then check that the app connection can access LedgerCalendarSettings.')
+        st.error('The calendar could not be loaded. A scheduled entry or database request failed.')
+        with st.expander('Error details'):
+            st.code(str(getattr(exc, 'message', None) or exc))
         return
 
     unclassified = [row for row in transactions if row.get('direction') not in ('Income', 'Expense')]
@@ -2169,6 +2171,14 @@ def save_unified_budget_action(name, payload):
         st.error('Nothing was saved: ' + str(getattr(exc, 'message', None) or exc))
 
 
+def budget_rule_effective_date(selected_month, today, existing_enabled,
+                               transaction_type, enabled, latest_card_week=None):
+    effective = max(selected_month, today + timedelta(days=1 if existing_enabled else 0))
+    if transaction_type == 'AMZ Card' and enabled and latest_card_week:
+        effective = max(effective, latest_card_week + timedelta(days=1))
+    return effective
+
+
 @st.dialog('Budget item', width='large')
 def unified_budget_item_dialog(rule, selected_month):
     require_session()
@@ -2237,8 +2247,19 @@ def unified_budget_item_dialog(rule, selected_month):
         if not paid_to or not str(paid_to).strip():
             st.error('Choose or enter a merchant.' if transaction_type != 'Transfer' else 'Choose a destination account.')
             return
-        effective = (max(selected_month, datetime.now(LOCAL_TZ).date() +
-            timedelta(days=1 if rule['enabled'] else 0)) if rule else selected_month)
+        today = datetime.now(LOCAL_TZ).date()
+        latest_card_week = None
+        if transaction_type == 'AMZ Card' and enabled:
+            try:
+                response = conn.table('LedgerCardWeeks').select('week_ending').order(
+                    'week_ending', desc=True).range(0, 0).execute()
+                if response.data:
+                    latest_card_week = date.fromisoformat(response.data[0]['week_ending'])
+            except Exception:
+                st.error('Card-week status could not be checked. Nothing was saved.')
+                return
+        effective = budget_rule_effective_date(selected_month, today,
+            bool(rule and rule['enabled']), transaction_type, enabled, latest_card_week)
         details = dict(name=name.strip(),amount=str(money(amount)),description=description,
             transaction_type=transaction_type,paid_from=paid_from,paid_to=str(paid_to).strip(),
             schedule=schedule,day_of_month=day_of_month,weekday=weekday,enabled=enabled)
@@ -2278,9 +2299,11 @@ def render_budget_page():
         rules = load_budget_table('LedgerUnifiedBudgetRules')
         occurrences = load_budget_table('LedgerUnifiedBudgetOccurrences')
         accounts = unified_account_options()
-    except Exception:
+    except Exception as exc:
         logger.exception('Unified budget load failed.')
-        st.error('The shared budget could not be loaded. Check that unified_budget_update.sql is installed.')
+        st.error('The shared budget could not be loaded. A scheduled entry or database request failed.')
+        with st.expander('Error details'):
+            st.code(str(getattr(exc, 'message', None) or exc))
         return
     month_end = selected_month.replace(day=monthrange(selected_month.year, selected_month.month)[1])
     visible = [r for r in rules if r['effective_from'] <= month_end.isoformat()
@@ -3342,9 +3365,6 @@ elif account_selection == "Archived Accounts":
 
 elif account_selection in savings_names:
     render_savings_page()
-
-
-
 
 
 
