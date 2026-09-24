@@ -238,8 +238,8 @@ def get_transactions() -> list[dict]:
 
 
 def get_existing_merchants() -> list[str]:
-    """Return unique merchants from the cached transaction dataset."""
-    transactions = get_transactions_cached()
+    """Return merchants across accounts, including saved budget merchants."""
+    transactions = get_all_transactions_cached()
 
     merchants = {
         str(row.get("merchant")).strip()
@@ -247,7 +247,16 @@ def get_existing_merchants() -> list[str]:
         if row.get("merchant")
     }
 
-    return sorted(merchants, key=str.lower)
+    try:
+        merchants.update(
+            str(row['paid_to']).strip()
+            for row in load_budget_table('LedgerUnifiedBudgetRules')
+            if row.get('transaction_type') != 'Transfer' and row.get('paid_to')
+            and str(row['paid_to']).strip().casefold() != 'merchant'
+        )
+    except Exception:
+        logger.exception('Saved budget merchants could not be loaded.')
+    return sorted({value.casefold(): value for value in merchants if value}.values(), key=str.lower)
 
 
 def get_existing_categories() -> list[str]:
@@ -1259,9 +1268,11 @@ export default function({parentElement, data, setTriggerValue}) {
     const root = parentElement.querySelector('.ledger-interactive-root');
     root.innerHTML = data.html;
     root.onclick = event => {
-        const button = event.target.closest('button[data-transaction],button[data-planned],button[data-payday],button[data-card-amount],button[data-review],button[data-savings]');
+        const button = event.target.closest('button[data-transaction],button[data-planned],button[data-payday],button[data-card-amount],button[data-review],button[data-savings],button[data-day]');
         if (!button || !root.contains(button)) return;
-        if (button.dataset.savings) {
+        if (button.dataset.day) {
+            setTriggerValue('action', {day: button.dataset.day});
+        } else if (button.dataset.savings) {
             setTriggerValue('action', {savings: button.dataset.savings});
         } else if (button.dataset.cardAmount) {
             setTriggerValue('action', {card_amount: button.dataset.cardAmount});
@@ -1355,7 +1366,18 @@ def render_check_clearance(row):
 
 
 def render_check_calendar(first, balances, direct, settings):
-    markup = calendar_grid_html(first, balances, direct, settings, show_cards=active_cash_id()==1)
+    last = date(first.year, first.month, monthrange(first.year, first.month)[1])
+    try:
+        response = conn.table('LedgerDayMarkers').select('day,color').eq('account_id', active_cash_id()).gte(
+            'day', first.isoformat()).lte('day', last.isoformat()).execute()
+        markers = {row['day']: row['color'] for row in response.data or []}
+    except Exception:
+        logger.exception('Calendar day markers could not be loaded.')
+        st.error('Day markers could not be loaded. Apply the follow-up SQL update, then reload.')
+        return
+    markup = calendar_grid_html(first, balances, direct, settings,
+        show_cards=active_cash_id()==1, markers=markers)
+    st.caption('Click a day number to cycle its visual marker: green, yellow, clear. This does not change transactions or balances.')
     st.caption('Click an actual transaction to edit it. Checks: yellow = uncleared; green = cleared. '
                'Use Mark cleared or Mark uncleared in the edit window. Clearance changes status only; '
                'checks affect projections once on their transaction date. Click a planned estimate to change its amount for that month only. Card summaries are read-only.')
@@ -1363,12 +1385,22 @@ def render_check_calendar(first, balances, direct, settings):
                   if not r.get('planned') and r.get('type') in ('Direct', 'Check', 'AMZ Card', 'Savings Transfer')}
     planned_ids = {str(r['budget_item_id']) for rows in direct.values() for r in rows if r.get('planned') and r.get('budget_item_id') is not None}
     payday_ids = {str(r['payday_id']) for rows in direct.values() for r in rows if r.get('payday_id') is not None}
-    if not actual_ids and not planned_ids and not payday_ids:
-        st.html(markup)
-        return
     event = ledger_interaction(data={'html': markup}, key='check_calendar',
                                on_action_change=lambda: None).action
-    if event and str(event.get('id')) in actual_ids:
+    if event and isinstance(event, dict) and event.get('day'):
+        require_session()
+        try:
+            selected = date.fromisoformat(str(event['day']))
+            if selected < first or selected > last:
+                raise ValueError('Choose a day in the displayed month.')
+            response = conn.rpc('ledger_cycle_day_marker', {
+                'p_account': active_cash_id(), 'p_day': selected.isoformat()}).execute()
+            if response.data not in ('green', 'yellow', 'clear'):
+                raise RuntimeError('Marker save was not confirmed.')
+            st.rerun()
+        except Exception as exc:
+            st.error('Day marker was not saved: ' + str(getattr(exc, 'message', None) or exc))
+    elif event and str(event.get('id')) in actual_ids:
         require_session()
         clear_transaction_caches()
         st.session_state['calendar_edit_id'] = str(event['id'])
@@ -1796,8 +1828,9 @@ def calendar_entry_html(row):
     )
 
 
-def calendar_grid_html(first, balances, direct, settings, show_cards=True):
+def calendar_grid_html(first, balances, direct, settings, show_cards=True, markers=None):
     """One CSS grid gives every day the height required by the busiest day."""
+    markers = markers or {}
     cells = []
     for week in Calendar(firstweekday=6).monthdatescalendar(first.year, first.month):
         for day in week:
@@ -1828,7 +1861,10 @@ def calendar_grid_html(first, balances, direct, settings, show_cards=True):
                     content.append(f'<div class="ledger-note">Over budget: ${values["spent"]-values["budget"]:,.2f}</div>')
             cells.append(
                 '<div class="ledger-day"><header>'
-                f'<span class="ledger-date">{day.day}</span><span class="ledger-balance">${values["balance"]:,.2f}</span>'
+                f'<button type="button" data-day="{day.isoformat()}" '
+                f'class="ledger-date ledger-date-{markers.get(day.isoformat(), "clear")}" '
+                f'aria-label="Mark {day.isoformat()}: {markers.get(day.isoformat(), "clear")}">{day.day}</button>'
+                f'<span class="ledger-balance">${values["balance"]:,.2f}</span>'
                 '</header><div class="ledger-body">' + ''.join(content) + '</div>'
                 f'<footer>Day net: ${values["net"]:,.2f}</footer></div>')
     style = '''<style>
@@ -1840,6 +1876,9 @@ def calendar_grid_html(first, balances, direct, settings, show_cards=True):
     .ledger-day {display:flex;flex-direction:column;min-height:240px;min-width:0;border:1px solid #8a96a5;border-radius:6px;overflow:hidden;}
     .ledger-day header {display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:7px;border-bottom:1px solid #8a96a5;background:rgba(127,150,180,.12);}
     .ledger-date {display:inline-flex;align-items:center;justify-content:center;min-width:30px;min-height:30px;padding:2px 5px;box-sizing:border-box;border:1px solid #8a96a5;border-radius:3px;background:rgba(127,150,180,.2);font-weight:700;}
+    button.ledger-date {color:inherit;cursor:pointer;font:inherit;font-weight:700;}
+    .ledger-date-green {background:#36b75e!important;color:#092b13!important;border-color:#287e42!important;}
+    .ledger-date-yellow {background:#f7d75c!important;color:#392c00!important;border-color:#b79622!important;}
     .ledger-balance {font-weight:600;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;}
     .ledger-body {padding:8px;flex:1;overflow-wrap:anywhere;}
     .ledger-day footer {padding:7px;border-top:1px solid #8a96a5;background:rgba(127,150,180,.12);font-size:.85rem;font-variant-numeric:tabular-nums;}
@@ -2091,9 +2130,29 @@ def budget_editor_changes(edited, originals, month, transaction_labels):
     return changes
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def unified_account_options():
-    checking = {'c:' + str(i): row['name'] for i, row in cash_accounts().items()}
-    savings = {'s:' + str(i): row['name'] for i, row in savings_accounts().items()}
+    checking = {'c:' + str(i): row['name'] for i, row in cash_accounts().items()
+        if not row.get('archived_at')}
+    savings = {'s:' + str(i): row['name'] for i, row in savings_accounts().items()
+        if not row.get('archived_at')}
     return checking | savings
 
 
@@ -2114,7 +2173,6 @@ def save_unified_budget_action(name, payload):
 def unified_budget_item_dialog(rule, selected_month):
     require_session()
     accounts = unified_account_options()
-    payees = load_budget_table('LedgerUnifiedPayees')
     generation = str(st.session_state.get('unified_budget_generation', 0))
     identity = str(rule['id']) if rule else 'new'
     types = ['AMZ Card', 'Direct', 'Check', 'Transfer']
@@ -2144,10 +2202,15 @@ def unified_budget_item_dialog(rule, selected_month):
             index=destinations.index(current_target) if current_target in destinations else 0,
             format_func=accounts.get)
     else:
-        destinations = [row['label'] for row in payees if row['transaction_type'] == transaction_type]
-        current_target = rule['paid_to'] if rule else 'Merchant'
-        paid_to = st.selectbox('Paid to', destinations,
-            index=destinations.index(current_target) if current_target in destinations else 0)
+        merchants = get_existing_merchants()
+        current_target = (rule['name'] if rule and rule['paid_to'] == 'Merchant'
+                          else rule['paid_to'] if rule else None)
+        if current_target and current_target.casefold() not in {m.casefold() for m in merchants}:
+            merchants = sorted(merchants + [current_target], key=str.casefold)
+        paid_to = st.selectbox('Paid to (merchant)', merchants, index=merchants.index(current_target)
+            if current_target in merchants else None, placeholder='Select or enter a merchant',
+            accept_new_options=True)
+        st.caption('Select a saved merchant or type a new merchant and press Enter.')
     with st.form('budget_item_form_' + identity + '_' + generation):
         name = st.text_input('Item', value=rule['name'] if rule else '')
         amount = st.number_input('Amount', min_value=0.0, max_value=999999999.99,
@@ -2162,7 +2225,8 @@ def unified_budget_item_dialog(rule, selected_month):
                 value=int(rule['day_of_month']) if rule and rule['day_of_month'] is not None else 1)
             weekday = None
         description = st.text_input('Description', value=rule['description'] if rule else '')
-        enabled = st.checkbox('Include', value=bool(rule['enabled']) if rule else True)
+        enabled = st.checkbox('Include', value=bool(rule['enabled']) if rule else schedule in ('Monthly', 'Weekly'),
+            key='budget_include_' + identity + '_' + generation + '_' + schedule)
         if rule:
             st.caption('Changes to this recurring item begin with future occurrences. Earlier entries stay as recorded.')
         save = st.form_submit_button('Save budget item', type='primary')
@@ -2170,279 +2234,13 @@ def unified_budget_item_dialog(rule, selected_month):
         if amount is None:
             st.error('Enter an amount.')
             return
-        effective = max(selected_month, datetime.now(LOCAL_TZ).date() + timedelta(days=1)) if rule else selected_month
-        details = dict(name=name.strip(),amount=str(money(amount)),description=description,
-            transaction_type=transaction_type,paid_from=paid_from,paid_to=paid_to,
-            schedule=schedule,day_of_month=day_of_month,weekday=weekday,enabled=enabled)
-        save_unified_budget_action('ledger_save_unified_budget_rule', dict(
-            p_id=rule['id'] if rule else None,
-            p_revision=rule['revision'] if rule else None,
-            p_effective_from=effective.isoformat(),p_data=details))
-
-
-def unified_account_options():
-    checking = {'c:' + str(i): row['name'] for i, row in cash_accounts().items()}
-    savings = {'s:' + str(i): row['name'] for i, row in savings_accounts().items()}
-    return checking | savings
-
-
-def save_unified_budget_action(name, payload):
-    require_session()
-    try:
-        response = conn.rpc(name, payload).execute()
-        if response.data is not True:
-            raise RuntimeError('Save was not confirmed.')
-        clear_transaction_caches()
-        st.session_state['unified_budget_generation'] = st.session_state.get('unified_budget_generation', 0) + 1
-        st.rerun()
-    except Exception as exc:
-        st.error('Nothing was saved: ' + str(getattr(exc, 'message', None) or exc))
-
-
-@st.dialog('Budget item', width='large')
-def unified_budget_item_dialog(rule, selected_month):
-    require_session()
-    accounts = unified_account_options()
-    payees = load_budget_table('LedgerUnifiedPayees')
-    generation = str(st.session_state.get('unified_budget_generation', 0))
-    identity = str(rule['id']) if rule else 'new'
-    types = ['AMZ Card', 'Direct', 'Check', 'Transfer']
-    current_type = rule['transaction_type'] if rule else 'Direct'
-    transaction_type = st.selectbox('Transaction type', types,
-        index=types.index(current_type), key='budget_type_' + identity + '_' + generation)
-    source_default = rule['paid_from'] if rule else 'c:1'
-    if transaction_type == 'AMZ Card':
-        paid_from = 'c:1'
-        st.text_input('Paid from', value=accounts['c:1'], disabled=True)
-    else:
-        available_sources = list(accounts)
-        paid_from = st.selectbox('Paid from', available_sources,
-            index=available_sources.index(source_default) if source_default in available_sources else 0,
-            format_func=accounts.get, key='budget_source_' + identity + '_' + generation)
-    schedules = ['Monthly', 'Weekly', 'As needed']
-    current_schedule = rule['schedule'] if rule else 'Monthly'
-    schedule = st.selectbox('Schedule', schedules, index=schedules.index(current_schedule),
-        key='budget_schedule_' + identity + '_' + generation)
-    if transaction_type == 'Transfer':
-        destinations = [key for key in accounts if key != paid_from]
-        if not destinations:
-            st.error('Create another account before adding a transfer.')
-            return
-        current_target = rule['paid_to'] if rule else destinations[0]
-        paid_to = st.selectbox('Paid to', destinations,
-            index=destinations.index(current_target) if current_target in destinations else 0,
-            format_func=accounts.get)
-    else:
-        destinations = [row['label'] for row in payees if row['transaction_type'] == transaction_type]
-        current_target = rule['paid_to'] if rule else 'Merchant'
-        paid_to = st.selectbox('Paid to', destinations,
-            index=destinations.index(current_target) if current_target in destinations else 0)
-    with st.form('budget_item_form_' + identity + '_' + generation):
-        name = st.text_input('Item', value=rule['name'] if rule else '')
-        amount = st.number_input('Amount', min_value=0.0, max_value=999999999.99,
-            value=float(money(rule['amount'])) if rule else None, format='%.2f')
-        if schedule == 'Weekly':
-            weekday = st.selectbox('Day of week', list(range(7)),
-                index=int(rule['weekday']) if rule and rule['weekday'] is not None else 4,
-                format_func=lambda day: ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'][day])
-            day_of_month = None
-        else:
-            day_of_month = st.number_input('Day of month', min_value=1, max_value=31,
-                value=int(rule['day_of_month']) if rule and rule['day_of_month'] is not None else 1)
-            weekday = None
-        description = st.text_input('Description', value=rule['description'] if rule else '')
-        enabled = st.checkbox('Include', value=bool(rule['enabled']) if rule else True)
-        if rule:
-            st.caption('Changes to this recurring item begin with future occurrences. Earlier entries stay as recorded.')
-        save = st.form_submit_button('Save budget item', type='primary')
-    if save:
-        if amount is None:
-            st.error('Enter an amount.')
-            return
-        effective = max(selected_month, datetime.now(LOCAL_TZ).date() + timedelta(days=1)) if rule else selected_month
-        details = dict(name=name.strip(),amount=str(money(amount)),description=description,
-            transaction_type=transaction_type,paid_from=paid_from,paid_to=paid_to,
-            schedule=schedule,day_of_month=day_of_month,weekday=weekday,enabled=enabled)
-        save_unified_budget_action('ledger_save_unified_budget_rule', dict(
-            p_id=rule['id'] if rule else None,
-            p_revision=rule['revision'] if rule else None,
-            p_effective_from=effective.isoformat(),p_data=details))
-
-
-def unified_account_options():
-    checking = {'c:' + str(i): row['name'] for i, row in cash_accounts().items()}
-    savings = {'s:' + str(i): row['name'] for i, row in savings_accounts().items()}
-    return checking | savings
-
-
-def save_unified_budget_action(name, payload):
-    require_session()
-    try:
-        response = conn.rpc(name, payload).execute()
-        if response.data is not True:
-            raise RuntimeError('Save was not confirmed.')
-        clear_transaction_caches()
-        st.session_state['unified_budget_generation'] = st.session_state.get('unified_budget_generation', 0) + 1
-        st.rerun()
-    except Exception as exc:
-        st.error('Nothing was saved: ' + str(getattr(exc, 'message', None) or exc))
-
-
-@st.dialog('Budget item', width='large')
-def unified_budget_item_dialog(rule, selected_month):
-    require_session()
-    accounts = unified_account_options()
-    payees = load_budget_table('LedgerUnifiedPayees')
-    generation = str(st.session_state.get('unified_budget_generation', 0))
-    identity = str(rule['id']) if rule else 'new'
-    types = ['AMZ Card', 'Direct', 'Check', 'Transfer']
-    current_type = rule['transaction_type'] if rule else 'Direct'
-    transaction_type = st.selectbox('Transaction type', types,
-        index=types.index(current_type), key='budget_type_' + identity + '_' + generation)
-    source_default = rule['paid_from'] if rule else 'c:1'
-    if transaction_type == 'AMZ Card':
-        paid_from = 'c:1'
-        st.text_input('Paid from', value=accounts['c:1'], disabled=True)
-    else:
-        available_sources = list(accounts)
-        paid_from = st.selectbox('Paid from', available_sources,
-            index=available_sources.index(source_default) if source_default in available_sources else 0,
-            format_func=accounts.get, key='budget_source_' + identity + '_' + generation)
-    schedules = ['Monthly', 'Weekly', 'As needed']
-    current_schedule = rule['schedule'] if rule else 'Monthly'
-    schedule = st.selectbox('Schedule', schedules, index=schedules.index(current_schedule),
-        key='budget_schedule_' + identity + '_' + generation)
-    if transaction_type == 'Transfer':
-        destinations = [key for key in accounts if key != paid_from]
-        if not destinations:
-            st.error('Create another account before adding a transfer.')
-            return
-        current_target = rule['paid_to'] if rule else destinations[0]
-        paid_to = st.selectbox('Paid to', destinations,
-            index=destinations.index(current_target) if current_target in destinations else 0,
-            format_func=accounts.get)
-    else:
-        destinations = [row['label'] for row in payees if row['transaction_type'] == transaction_type]
-        current_target = rule['paid_to'] if rule else 'Merchant'
-        paid_to = st.selectbox('Paid to', destinations,
-            index=destinations.index(current_target) if current_target in destinations else 0)
-    with st.form('budget_item_form_' + identity + '_' + generation):
-        name = st.text_input('Item', value=rule['name'] if rule else '')
-        amount = st.number_input('Amount', min_value=0.0, max_value=999999999.99,
-            value=float(money(rule['amount'])) if rule else None, format='%.2f')
-        if schedule == 'Weekly':
-            weekday = st.selectbox('Day of week', list(range(7)),
-                index=int(rule['weekday']) if rule and rule['weekday'] is not None else 4,
-                format_func=lambda day: ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'][day])
-            day_of_month = None
-        else:
-            day_of_month = st.number_input('Day of month', min_value=1, max_value=31,
-                value=int(rule['day_of_month']) if rule and rule['day_of_month'] is not None else 1)
-            weekday = None
-        description = st.text_input('Description', value=rule['description'] if rule else '')
-        enabled = st.checkbox('Include', value=bool(rule['enabled']) if rule else True)
-        if rule:
-            st.caption('Changes to this recurring item begin with future occurrences. Earlier entries stay as recorded.')
-        save = st.form_submit_button('Save budget item', type='primary')
-    if save:
-        if amount is None:
-            st.error('Enter an amount.')
-            return
-        today = datetime.now(LOCAL_TZ).date()
-        effective = (max(selected_month, today + timedelta(days=1 if rule['enabled'] else 0))
-            if rule else max(selected_month, today))
-        details = dict(name=name.strip(),amount=str(money(amount)),description=description,
-            transaction_type=transaction_type,paid_from=paid_from,paid_to=paid_to,
-            schedule=schedule,day_of_month=day_of_month,weekday=weekday,enabled=enabled)
-        save_unified_budget_action('ledger_save_unified_budget_rule', dict(
-            p_id=rule['id'] if rule else None,
-            p_revision=rule['revision'] if rule else None,
-            p_effective_from=effective.isoformat(),p_data=details))
-
-
-def unified_account_options():
-    checking = {'c:' + str(i): row['name'] for i, row in cash_accounts().items()}
-    savings = {'s:' + str(i): row['name'] for i, row in savings_accounts().items()}
-    return checking | savings
-
-
-def save_unified_budget_action(name, payload):
-    require_session()
-    try:
-        response = conn.rpc(name, payload).execute()
-        if response.data is not True:
-            raise RuntimeError('Save was not confirmed.')
-        clear_transaction_caches()
-        st.session_state['unified_budget_generation'] = st.session_state.get('unified_budget_generation', 0) + 1
-        st.rerun()
-    except Exception as exc:
-        st.error('Nothing was saved: ' + str(getattr(exc, 'message', None) or exc))
-
-
-@st.dialog('Budget item', width='large')
-def unified_budget_item_dialog(rule, selected_month):
-    require_session()
-    accounts = unified_account_options()
-    payees = load_budget_table('LedgerUnifiedPayees')
-    generation = str(st.session_state.get('unified_budget_generation', 0))
-    identity = str(rule['id']) if rule else 'new'
-    types = ['AMZ Card', 'Direct', 'Check', 'Transfer']
-    current_type = rule['transaction_type'] if rule else 'Direct'
-    transaction_type = st.selectbox('Transaction type', types,
-        index=types.index(current_type), key='budget_type_' + identity + '_' + generation)
-    source_default = rule['paid_from'] if rule else 'c:1'
-    if transaction_type == 'AMZ Card':
-        paid_from = 'c:1'
-        st.text_input('Paid from', value=accounts['c:1'], disabled=True)
-    else:
-        available_sources = list(accounts)
-        paid_from = st.selectbox('Paid from', available_sources,
-            index=available_sources.index(source_default) if source_default in available_sources else 0,
-            format_func=accounts.get, key='budget_source_' + identity + '_' + generation)
-    schedules = ['Monthly', 'Weekly', 'As needed']
-    current_schedule = rule['schedule'] if rule else 'Monthly'
-    schedule = st.selectbox('Schedule', schedules, index=schedules.index(current_schedule),
-        key='budget_schedule_' + identity + '_' + generation)
-    if transaction_type == 'Transfer':
-        destinations = [key for key in accounts if key != paid_from]
-        if not destinations:
-            st.error('Create another account before adding a transfer.')
-            return
-        current_target = rule['paid_to'] if rule else destinations[0]
-        paid_to = st.selectbox('Paid to', destinations,
-            index=destinations.index(current_target) if current_target in destinations else 0,
-            format_func=accounts.get)
-    else:
-        destinations = [row['label'] for row in payees if row['transaction_type'] == transaction_type]
-        current_target = rule['paid_to'] if rule else 'Merchant'
-        paid_to = st.selectbox('Paid to', destinations,
-            index=destinations.index(current_target) if current_target in destinations else 0)
-    with st.form('budget_item_form_' + identity + '_' + generation):
-        name = st.text_input('Item', value=rule['name'] if rule else '')
-        amount = st.number_input('Amount', min_value=0.0, max_value=999999999.99,
-            value=float(money(rule['amount'])) if rule else None, format='%.2f')
-        if schedule == 'Weekly':
-            weekday = st.selectbox('Day of week', list(range(7)),
-                index=int(rule['weekday']) if rule and rule['weekday'] is not None else 4,
-                format_func=lambda day: ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'][day])
-            day_of_month = None
-        else:
-            day_of_month = st.number_input('Day of month', min_value=1, max_value=31,
-                value=int(rule['day_of_month']) if rule and rule['day_of_month'] is not None else 1)
-            weekday = None
-        description = st.text_input('Description', value=rule['description'] if rule else '')
-        enabled = st.checkbox('Include', value=bool(rule['enabled']) if rule else True)
-        if rule:
-            st.caption('Changes to this recurring item begin with future occurrences. Earlier entries stay as recorded.')
-        save = st.form_submit_button('Save budget item', type='primary')
-    if save:
-        if amount is None:
-            st.error('Enter an amount.')
+        if not paid_to or not str(paid_to).strip():
+            st.error('Choose or enter a merchant.' if transaction_type != 'Transfer' else 'Choose a destination account.')
             return
         effective = (max(selected_month, datetime.now(LOCAL_TZ).date() +
             timedelta(days=1 if rule['enabled'] else 0)) if rule else selected_month)
         details = dict(name=name.strip(),amount=str(money(amount)),description=description,
-            transaction_type=transaction_type,paid_from=paid_from,paid_to=paid_to,
+            transaction_type=transaction_type,paid_from=paid_from,paid_to=str(paid_to).strip(),
             schedule=schedule,day_of_month=day_of_month,weekday=weekday,enabled=enabled)
         save_unified_budget_action('ledger_save_unified_budget_rule', dict(
             p_id=rule['id'] if rule else None,
@@ -2523,15 +2321,6 @@ def render_budget_page():
         if st.session_state.get('unified_budget_handled_selection') != selection_token:
             st.session_state['unified_budget_handled_selection'] = selection_token
             unified_budget_item_dialog(visible[selection_token[1]], selected_month)
-    with st.expander('Paid to values'):
-        st.caption('Merchant is the default value. The Item field holds the merchant name.')
-        with st.form('add_unified_payee'):
-            payee_type = st.selectbox('Transaction type', ['AMZ Card','Direct','Check'])
-            payee_label = st.text_input('New Paid to value')
-            add_payee = st.form_submit_button('Add value')
-        if add_payee:
-            save_unified_budget_action('ledger_add_unified_payee',
-                {'p_type':payee_type,'p_label':payee_label})
     savings_entries = [o for o in occurrences if not o['cancelled']
         and o['paid_from'].startswith('s:') and o['transaction_type'] != 'Transfer'
         and o['scheduled_date'][:7] == selected_month.isoformat()[:7]]
@@ -3118,6 +2907,132 @@ def active_savings_id():
     return int(st.session_state.get('savings_account_id', 1))
 
 
+def account_impact(kind, account_id):
+    require_session()
+    response = conn.rpc('ledger_account_impact', {
+        'p_kind': kind, 'p_id': account_id}).execute()
+    if not isinstance(response.data, dict):
+        raise RuntimeError('Account review was not confirmed.')
+    return response.data
+
+
+def render_manage_account_page():
+    require_session()
+    name = st.session_state['ledger_account']
+    checking = cash_accounts()
+    savings = savings_accounts()
+    found = next((('checking', aid) for aid, row in checking.items()
+        if row['name'] == name and not row.get('archived_at')), None)
+    if found is None:
+        found = next((('savings', aid) for aid, row in savings.items()
+            if row['name'] == name and not row.get('archived_at')), None)
+    if found is None:
+        st.error('Select an active account first.')
+        return
+    kind, account_id = found
+    st.title('Manage ' + name)
+    try:
+        impact = account_impact(kind, account_id)
+    except Exception:
+        logger.exception('Account impact could not be loaded.')
+        st.error('Account details could not be checked. Apply the follow-up SQL update and reload.')
+        return
+    st.write(f"Recorded transactions: {impact['transactions']}; linked transfers: {impact['transfers']}; "
+        f"budget records: {impact['budget_records']}; audit records: {impact['audit_records']}.")
+    if impact.get('day_markers'):
+        st.write(f"Calendar day markers: {impact['day_markers']}.")
+    if kind == 'savings':
+        st.write(f"Current savings balance: ${money(impact['balance']):,.2f}.")
+    if impact['primary']:
+        st.info('Primary accounts are protected from archiving and deletion.')
+        return
+    if impact['active_budget_rules']:
+        st.warning('Pause budget rules involving this account before archiving it.')
+    if kind == 'savings' and money(impact['balance']) != 0:
+        st.warning('Move the savings balance before archiving this account.')
+    st.caption('Archiving hides an account from active navigation and preserves its history. '
+        'Permanent deletion is available only when the account has never been used and is empty.')
+    stage_key = (kind, account_id)
+    current_stage = st.session_state.get('account_confirm_stage')
+    if impact['can_archive'] and st.button('Review archiving this account'):
+        st.session_state['account_confirm_stage'] = (*stage_key, 'archive')
+        current_stage = st.session_state['account_confirm_stage']
+    if impact['can_delete'] and st.button('Review permanent deletion'):
+        st.session_state['account_confirm_stage'] = (*stage_key, 'delete')
+        current_stage = st.session_state['account_confirm_stage']
+    if current_stage not in ((*stage_key, 'archive'), (*stage_key, 'delete')):
+        return
+    action = current_stage[2]
+    if action == 'archive' and not impact['can_archive'] or action == 'delete' and not impact['can_delete']:
+        st.session_state.pop('account_confirm_stage', None)
+        st.error('Account eligibility changed. Review it again.')
+        return
+    st.warning(('Final confirmation: archive ' if action == 'archive' else
+        'Final confirmation: permanently delete ') + name + '?')
+    typed = st.text_input('Type the exact account name to confirm', key='confirm_account_name_' + str(account_id) + action)
+    if st.button('Archive account' if action == 'archive' else 'Permanently delete account',
+        type='primary', disabled=typed != name):
+        rpc = 'ledger_archive_account' if action == 'archive' else 'ledger_delete_empty_account'
+        account_action(rpc, {'p_kind': kind, 'p_id': account_id,
+            'p_revision': impact['revision'], 'p_confirm_name': typed})
+
+
+def render_archived_accounts_page():
+    require_session()
+    st.title('Archived Accounts')
+    archived = [('checking', aid, row) for aid, row in cash_accounts().items()
+        if row.get('archived_at')]
+    archived += [('savings', aid, row) for aid, row in savings_accounts().items()
+        if row.get('archived_at')]
+    if not archived:
+        st.info('No archived accounts.')
+        return
+    st.caption('Archived accounts are read-only. Their recorded history remains available here.')
+    for kind, account_id, row in archived:
+        if st.button(row['name'], key='archived_account_' + kind + str(account_id), use_container_width=True):
+            st.session_state['archived_detail'] = (kind, account_id)
+    choice = st.session_state.get('archived_detail')
+    selected = next(((kind, account_id, row) for kind, account_id, row in archived
+        if choice == (kind, account_id)), None)
+    if selected is None:
+        return
+    kind, account_id, row = selected
+    st.subheader(row['name'])
+    try:
+        impact = account_impact(kind, account_id)
+        if kind == 'checking':
+            history = [t for t in get_all_transactions_cached()
+                if int(t.get('cash_account_id') or 1) == account_id]
+            if history:
+                st.dataframe(pd.DataFrame(history).sort_values('date', ascending=False),
+                    hide_index=True, use_container_width=True)
+            else:
+                st.info('No transactions recorded.')
+            marked = conn.table('LedgerDayMarkers').select('day,color').eq('account_id', account_id).execute().data or []
+            if marked:
+                st.caption('Saved calendar markers')
+                st.dataframe(pd.DataFrame(marked).sort_values('day', ascending=False),
+                    hide_index=True, use_container_width=True)
+        else:
+            buckets = [b for b in load_budget_table('LedgerSavingsBuckets')
+                if int(b['savings_account_id']) == account_id]
+            if buckets:
+                st.dataframe(pd.DataFrame(buckets), hide_index=True, use_container_width=True)
+            bucket_ids = {b['id'] for b in buckets}
+            audit = [a for a in load_budget_table('LedgerSavingsAudit') if a['bucket_id'] in bucket_ids]
+            if audit:
+                st.dataframe(pd.DataFrame(audit).sort_values('recorded_at', ascending=False),
+                    hide_index=True, use_container_width=True)
+    except Exception:
+        logger.exception('Archived account history could not be loaded.')
+        st.error('Archived account history could not be loaded.')
+        return
+    typed = st.text_input('Type the account name to restore it', key='restore_account_name_' + kind + str(account_id))
+    if st.button('Restore account', disabled=typed != row['name']):
+        account_action('ledger_restore_account', {'p_kind': kind, 'p_id': account_id,
+            'p_revision': impact['revision'], 'p_confirm_name': typed})
+
+
 def account_action(name, payload):
     require_session()
     try:
@@ -3146,12 +3061,12 @@ def savings_linked_rows(bucket_id):
 
 
 def transfer_form(original=None):
-    accounts = cash_accounts()
-    savings = savings_accounts()
+    accounts = {i: row for i, row in cash_accounts().items() if not row.get('archived_at')}
+    savings = {i: row for i, row in savings_accounts().items() if not row.get('archived_at')}
     buckets = load_budget_table('LedgerSavingsBuckets')
     endpoints = {'c:' + str(i): row['name'] for i, row in accounts.items()}
     endpoints.update({'s:' + str(b['id']): savings[int(b['savings_account_id'])]['name'] + ' / ' + b['name']
-        for b in buckets if b['active'] and b['balance'] is not None})
+        for b in buckets if int(b['savings_account_id']) in savings and b['active'] and b['balance'] is not None})
     options = list(endpoints)
     if len(options) < 2:
         st.error('Set up two available accounts before recording a transfer.')
@@ -3319,18 +3234,25 @@ try:
 except Exception:
     st.error('Install unified_budget_update.sql after the multi-account update, then reload.')
     st.stop()
-account_names = {row['name']: aid for aid, row in checking_accounts.items()}
-savings_names = {row['name']: aid for aid, row in saved_savings_accounts.items()}
+account_names = {row['name']: aid for aid, row in checking_accounts.items() if not row.get('archived_at')}
+savings_names = {row['name']: aid for aid, row in saved_savings_accounts.items() if not row.get('archived_at')}
 choices = list(account_names) + list(savings_names)
 if st.session_state.get('ledger_account') not in choices:
     st.session_state['ledger_account'] = 'Primary Checking'
-
-def selected_account_changed():
     st.session_state['ledger_view'] = 'Account'
-    st.session_state.pop('savings_snapshot', None)
 
-account_selection = st.sidebar.selectbox('Select account', choices, key='ledger_account',
-    on_change=selected_account_changed)
+st.sidebar.caption('Accounts')
+for name in choices:
+    if st.sidebar.button(name, key='select_account_' + name,
+        type='primary' if st.session_state['ledger_account'] == name
+            and st.session_state.get('ledger_view', 'Account') == 'Account' else 'secondary',
+        use_container_width=True):
+        st.session_state['ledger_account'] = name
+        st.session_state['ledger_view'] = 'Account'
+        st.session_state.pop('savings_snapshot', None)
+        st.session_state.pop('account_confirm_stage', None)
+
+account_selection = st.session_state['ledger_account']
 if account_selection in account_names:
     st.session_state['cash_account_id'] = account_names[account_selection]
 elif account_selection in savings_names:
@@ -3347,20 +3269,24 @@ with st.sidebar.expander('Add new account'):
         else:
             account_action('ledger_create_savings_account', {'p_name': name})
 
-if st.sidebar.button('View selected account', use_container_width=True):
-    st.session_state['ledger_view'] = 'Account'
+if st.sidebar.button('Manage selected account', use_container_width=True):
+    st.session_state['ledger_view'] = 'Manage Account'
+    st.session_state.pop('account_confirm_stage', None)
+if st.sidebar.button('Archived Accounts', use_container_width=True):
+    st.session_state['ledger_view'] = 'Archived Accounts'
 st.sidebar.divider()
 
-if st.sidebar.button('➕ Add Transaction', type='primary', use_container_width=True):
+if st.sidebar.button('➕ Add Transaction', type='primary', use_container_width=True,
+    disabled=st.session_state.get('ledger_view') in ('Archived Accounts','Manage Account')):
     reset_add_transaction_state()
     add_transaction_dialog()
-if st.sidebar.button('✏️ Edit Transaction', use_container_width=True):
+if st.sidebar.button('✏️ Edit Transaction', use_container_width=True,
+    disabled=st.session_state.get('ledger_view') in ('Archived Accounts','Manage Account')):
     st.session_state.pop('edit_loaded_tx_id', None)
     edit_transaction_dialog()
 if st.sidebar.button('AMZ Card Ledger', use_container_width=True):
     st.session_state['ledger_view'] = 'Reconcile'
 
-st.sidebar.divider()
 if st.sidebar.button('View / Edit Budget', use_container_width=True):
     st.session_state['ledger_view'] = 'Budget'
 if st.sidebar.button('Lines of Credit', use_container_width=True):
@@ -3368,7 +3294,8 @@ if st.sidebar.button('Lines of Credit', use_container_width=True):
         st.session_state['credit_generation'] = st.session_state.get('credit_generation', 0) + 1
     st.session_state['ledger_view'] = 'Lines of Credit'
 
-if st.session_state.get('ledger_view') in ('Budget', 'Reconcile', 'Lines of Credit'):
+if st.session_state.get('ledger_view') in ('Budget', 'Reconcile', 'Lines of Credit',
+    'Archived Accounts', 'Manage Account'):
     account_selection = st.session_state['ledger_view']
 st.sidebar.divider()
 if st.sidebar.button('Log Out', use_container_width=True):
@@ -3407,8 +3334,15 @@ elif account_selection == "Lines of Credit":
     render_credit_page()
     render_debt_planning()
 
+elif account_selection == "Manage Account":
+    render_manage_account_page()
+
+elif account_selection == "Archived Accounts":
+    render_archived_accounts_page()
+
 elif account_selection in savings_names:
     render_savings_page()
+
 
 
 
