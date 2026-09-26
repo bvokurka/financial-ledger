@@ -1,4 +1,3 @@
-
 from uuid import uuid4
 import json
 from hashlib import sha256
@@ -261,8 +260,13 @@ def get_existing_merchants() -> list[str]:
 
 
 def get_existing_categories() -> list[str]:
-    """Return default categories plus categories found in transactions."""
-    transactions = get_transactions_cached()
+    """Return active transaction categories across all checking accounts."""
+    transactions = get_all_transactions_cached()
+    budget_categories = {str(row.get('category')).strip() for row in
+                         load_budget_table('LedgerUnifiedBudgetRules')
+                         if row.get('transaction_type') != 'Transfer' and row.get('category')}
+    retired = {str(row['name']).strip().casefold() for row in
+               load_budget_table('LedgerRetiredCategories')}
 
     db_categories = {
         str(row.get("category")).strip()
@@ -271,7 +275,8 @@ def get_existing_categories() -> list[str]:
     }
 
     return sorted(
-        set(BASE_CATEGORIES).union(db_categories),
+        (category for category in set(BASE_CATEGORIES).union(db_categories, budget_categories)
+         if category.casefold() not in retired),
         key=str.lower,
     )
 
@@ -883,7 +888,7 @@ def edit_transaction_dialog():
     render_check_clearance(selected_tx)
     budget_generated = selected_tx.get('unified_occurrence_id') is not None
     if budget_generated:
-        st.caption('Amount and date edits apply to this occurrence only. The recurring budget item stays unchanged.')
+        st.caption('Amount, date, and payment-type edits apply only to this occurrence. The recurring budget item stays unchanged.')
     paid_week = None
     if selected_tx.get('card_budget_week'):
         paid_week = load_card_weeks().get(str(selected_tx['card_budget_week']))
@@ -897,7 +902,6 @@ def edit_transaction_dialog():
 
     workflow_types = (["AMZ Card"] if active_cash_id() == 1 else []) + ["Direct", "Check"]
     if selected_tx.get('type') == 'Savings Transfer': workflow_types.append('Savings Transfer')
-    if budget_generated: workflow_types = [selected_tx['type']]
 
     if st.session_state["edit_workflow_type"] not in workflow_types:
         st.session_state["edit_workflow_type"] = workflow_types[0]
@@ -907,7 +911,7 @@ def edit_transaction_dialog():
         workflow_types,
         format_func=lambda v: "Transfer" if v == "Savings Transfer" else v,
         horizontal=True,
-        key="edit_workflow_type", disabled=bool(paid_week or budget_generated),
+        key="edit_workflow_type", disabled=bool(paid_week),
     )
 
     if workflow_type == "Savings Transfer":
@@ -1130,7 +1134,7 @@ def calendar_balances(transactions, settings, first, last, as_of=None, reconcile
     anchor = max(anchors)
     start = date.fromisoformat(anchor.split(':', 1)[1])
     balance = money(settings[anchor]['amount'])
-    direct, card, payments, generated_card = {}, {}, {}, {}
+    direct, card, payments = {}, {}, {}
     for closed in reconciled.values():
         payment_day = date.fromisoformat(closed['payment_date'])
         payments.setdefault(payment_day, []).append(closed)
@@ -1140,13 +1144,6 @@ def calendar_balances(transactions, settings, first, last, as_of=None, reconcile
         kind = row.get('type')
         assigned_week = (date.fromisoformat(str(row['card_budget_week']))
                          if row.get('card_budget_week') else week_ending(day))
-        if kind == 'AMZ Card' and row.get('unified_occurrence_id') is not None:
-            signed = amount if row.get('direction') == 'Expense' else -amount
-            generated_card[assigned_week.isoformat()] = generated_card.get(
-                assigned_week.isoformat(), Decimal(0)) + signed
-            if start <= day <= last:
-                direct[day] = direct.get(day, Decimal(0)) - signed
-            continue
         if kind == 'AMZ Card' and assigned_week.isoformat() in reconciled:
             continue  # Its immutable payment is counted separately, once.
         effective = assigned_week if kind == 'AMZ Card' else day
@@ -1174,14 +1171,12 @@ def calendar_balances(transactions, settings, first, last, as_of=None, reconcile
     day = start
     while day <= last:
         net = direct.get(day, Decimal(0)) - sum((
-            money(row['paid_amount']) - generated_card.get(str(row['week_ending']), Decimal(0))
-            for row in payments.get(day, [])), Decimal(0))
+            money(row['paid_amount']) for row in payments.get(day, [])), Decimal(0))
         spent, remaining, budget = Decimal(0), Decimal(0), Decimal(0)
         surplus = Decimal(0)
         completed = day.isoformat() in reconciled
         if day.weekday() == 5:
-            manual_card = card.get(day, Decimal(0))
-            spent = manual_card + generated_card.get(day.isoformat(), Decimal(0))
+            spent = card.get(day, Decimal(0))
             budget_key = 'budget:' + day.isoformat()
             budget = money(settings.get(budget_key, {}).get('amount', 0))
             remaining = max(budget - spent, Decimal(0))
@@ -1192,7 +1187,7 @@ def calendar_balances(transactions, settings, first, last, as_of=None, reconcile
                 remaining = max(budget - spent, Decimal(0))
                 surplus = remaining
             else:
-                net -= max(manual_card + remaining, Decimal(0))
+                net -= max(spent + remaining, Decimal(0))
         balance += net
         if day >= first:
             days[day] = dict(balance=balance, net=net, spent=spent,
@@ -1378,10 +1373,6 @@ def render_check_calendar(first, balances, direct, settings):
         return
     markup = calendar_grid_html(first, balances, direct, settings,
         show_cards=active_cash_id()==1, markers=markers)
-    st.caption('Click a day number to cycle its visual marker: green, yellow, clear. This does not change transactions or balances.')
-    st.caption('Click an actual transaction to edit it. Checks: yellow = uncleared; green = cleared. '
-               'Use Mark cleared or Mark uncleared in the edit window. Clearance changes status only; '
-               'checks affect projections once on their transaction date. Click a planned estimate to change its amount for that month only. Card summaries are read-only.')
     actual_ids = {str(r['id']) for rows in direct.values() for r in rows
                   if not r.get('planned') and r.get('type') in ('Direct', 'Check', 'AMZ Card', 'Savings Transfer')}
     planned_ids = {str(r['budget_item_id']) for rows in direct.values() for r in rows if r.get('planned') and r.get('budget_item_id') is not None}
@@ -1892,12 +1883,22 @@ def calendar_grid_html(first, balances, direct, settings, show_cards=True, marke
 
 
 def render_editable_calendar():
-    first = st.date_input('Calendar month', value=date(CALENDAR_YEAR, CALENDAR_MONTH, 1), key='calendar_month_choice').replace(day=1)
-    last = date(first.year, first.month, monthrange(first.year, first.month)[1])
     heading, summary = st.columns([3, 2], gap='large')
     heading.title(cash_accounts()[active_cash_id()]['name'] + ': Cash Flow Calendar')
     summary_slot = summary.empty()
-    st.subheader(first.strftime('%B %Y'))
+    month_heading = st.empty()
+    month_col, year_col = st.columns([2, 1])
+    with month_col:
+        month = st.selectbox('Calendar month', list(range(1, 13)),
+            index=CALENDAR_MONTH - 1,
+            format_func=lambda value: date(2000, value, 1).strftime('%B'),
+            key='calendar_month_name')
+    with year_col:
+        year = st.number_input('Calendar year', min_value=1900, max_value=2100,
+            value=CALENDAR_YEAR, step=1, key='calendar_year_choice')
+    first = date(int(year), int(month), 1)
+    last = date(first.year, first.month, monthrange(first.year, first.month)[1])
+    month_heading.subheader(first.strftime('%B %Y'))
     try:
         settings = load_calendar_settings()
         opening_dates = [date.fromisoformat(key.split(':', 1)[1]) for key in settings
@@ -1921,6 +1922,7 @@ def render_editable_calendar():
     opening_key = 'opening:' + first.isoformat()
     anchors = [key for key in settings if key.startswith('opening:')
                and key.split(':', 1)[1] <= first.isoformat()]
+    calendar_warning_slot = st.empty()
     with st.expander('Opening balance', expanded=not anchors):
         st.caption('Enter the checking balance immediately before the first day’s transactions. '
                    'When an earlier month has an opening balance, its ending balance carries '
@@ -1955,23 +1957,12 @@ def render_editable_calendar():
         st.error('The calendar could not calculate. Apply budget_setup.sql and check the connection and transaction classifications.')
         return
 
-    if active_cash_id() == 1:
-        st.caption('Hover over a transaction amount for its description and merchant. '
-                   'Use the sidebar to add transactions or click an actual calendar entry to edit. Card purchases are '
-                   'entered as positive AMZ Card transactions and assigned to a budget week. '
-                   'Do not enter the same card payment again as a Direct expense.')
-        st.caption('Open card weeks reserve spending plus remaining budget on Saturday. '
-                   'Use AMZ Card Ledger after paying: the actual payment date then controls '
-                   'the deduction, and unused budget is retained as surplus.')
     if reconciled:
         next_week = date.fromisoformat(max(reconciled)) + timedelta(days=7)
         st.info(f'New card entries apply to the budget week ending {next_week:%b %d, %Y}, regardless of transaction date.')
-    if anchor < first:
-        st.caption(f'Opening balance carried forward from the saved balance on {anchor:%b %d, %Y}.')
     direct = {}
     for row in transactions:
-        if row.get('type') in ('Direct', 'Check', 'Savings Transfer') or (
-            row.get('type') == 'AMZ Card' and row.get('unified_occurrence_id') is not None):
+        if row.get('type') in ('Direct', 'Check', 'Savings Transfer'):
             direct.setdefault(str(row['date'])[:10], []).append(row)
     for item in planned:
         if item['enabled'] and item.get('transaction_id') is None:
@@ -1985,8 +1976,8 @@ def render_editable_calendar():
     unset = sum(1 for r in paydays if r['enabled'] and r['amount'] is None and r.get('transaction_id') is None
                 and anchor.isoformat() <= r['due_date'] <= last.isoformat())
     if unset:
-        st.warning(f'{unset} payday amounts are unset in the balance period and excluded from projections. Enter them in Budget → Payday income.')
-    st.caption('Active shared-budget items are recorded on their scheduled dates. Older planned items before the budget changeover and unset payday amounts remain estimates.')
+        calendar_warning_slot.warning(
+            f'{unset} payday amounts are unset in the balance period and excluded from projections. Enter them in Budget → Payday income.')
     # Render as HTML directly: Markdown interprets dollar amounts as math and
     # can break markup around multiline tooltip attributes.
     render_check_calendar(first, balances, direct, settings)
@@ -2012,7 +2003,8 @@ def render_editable_calendar():
 
 def load_budget_table(table):
     rows, offset = [], 0
-    order = 'month' if table == 'LedgerBudgetMonths' else 'id'
+    order = ('month' if table == 'LedgerBudgetMonths' else
+             'name' if table == 'LedgerRetiredCategories' else 'id')
     while True:
         response = conn.table(table).select('*').order(order).range(offset, offset + 499).execute()
         if getattr(response, 'error', None) or response.data is None:
@@ -2211,6 +2203,7 @@ def unified_budget_item_dialog(rule, selected_month):
         paid_to = st.selectbox('Paid to', destinations,
             index=destinations.index(current_target) if current_target in destinations else 0,
             format_func=accounts.get)
+        category = 'Transfer'
     else:
         merchants = get_existing_merchants()
         current_target = (rule['name'] if rule and rule['paid_to'] == 'Merchant'
@@ -2221,6 +2214,14 @@ def unified_budget_item_dialog(rule, selected_month):
             if current_target in merchants else None, placeholder='Select or enter a merchant',
             accept_new_options=True)
         st.caption('Select a saved merchant or type a new merchant and press Enter.')
+        categories = get_existing_categories()
+        current_category = str(rule.get('category') or 'Budget') if rule else None
+        if current_category and current_category not in categories:
+            categories = sorted(categories + [current_category], key=str.casefold)
+        category = st.selectbox('Category', categories,
+            index=categories.index(current_category) if current_category in categories else None,
+            placeholder='Select or enter a category', accept_new_options=True,
+            key='budget_category_' + identity + '_' + generation)
     with st.form('budget_item_form_' + identity + '_' + generation):
         name = st.text_input('Item', value=rule['name'] if rule else '')
         amount = st.number_input('Amount', min_value=0.0, max_value=999999999.99,
@@ -2247,6 +2248,9 @@ def unified_budget_item_dialog(rule, selected_month):
         if not paid_to or not str(paid_to).strip():
             st.error('Choose or enter a merchant.' if transaction_type != 'Transfer' else 'Choose a destination account.')
             return
+        if not category or not str(category).strip():
+            st.error('Choose or enter a category.')
+            return
         today = datetime.now(LOCAL_TZ).date()
         latest_card_week = None
         if transaction_type == 'AMZ Card' and enabled:
@@ -2262,7 +2266,8 @@ def unified_budget_item_dialog(rule, selected_month):
             bool(rule and rule['enabled']), transaction_type, enabled, latest_card_week)
         details = dict(name=name.strip(),amount=str(money(amount)),description=description,
             transaction_type=transaction_type,paid_from=paid_from,paid_to=str(paid_to).strip(),
-            schedule=schedule,day_of_month=day_of_month,weekday=weekday,enabled=enabled)
+            schedule=schedule,day_of_month=day_of_month,weekday=weekday,enabled=enabled,
+            category=str(category).strip())
         save_unified_budget_action('ledger_save_unified_budget_rule', dict(
             p_id=rule['id'] if rule else None,
             p_revision=rule['revision'] if rule else None,
@@ -2286,6 +2291,86 @@ def unified_savings_occurrence_dialog(occurrence):
             p_amount=str(money(amount)) if save else None,p_delete=delete))
 
 
+@st.dialog('Delete category', width='large')
+def delete_category_dialog(category_name):
+    """Preview every checking transaction and budget rule before retiring a category."""
+    require_session()
+    category_key = category_name.casefold()
+    transactions = [row for row in get_all_transactions_cached()
+                    if str(row.get('category') or '').strip().casefold() == category_key]
+    rules = [row for row in load_budget_table('LedgerUnifiedBudgetRules')
+             if str(row.get('category') or '').strip().casefold() == category_key]
+    accounts = cash_accounts()
+    entries = []
+    for row in transactions:
+        entries.append({'Kind': 'Transaction', 'Account': accounts.get(int(row.get('cash_account_id') or 1), {}).get('name', 'Unavailable'),
+                        'Date': str(row['date']), 'Item / merchant': str(row.get('merchant') or ''),
+                        'Amount': float(money(row['amount'])), 'Replacement category': None})
+    for row in rules:
+        entries.append({'Kind': 'Budget item', 'Account': unified_account_options().get(row['paid_from'], 'Unavailable'),
+                        'Date': str(row['effective_from']), 'Item / merchant': str(row['name']),
+                        'Amount': float(money(row['amount'])), 'Replacement category': None})
+    st.write(f'Deleting “{category_name}” will update all checking accounts. Choose a replacement for every listed entry.')
+    replacement_name = st.text_input('Add a replacement category (optional)',
+        key='category_new_replacement_' + category_key)
+    options = [name for name in get_existing_categories() if name.casefold() != category_key]
+    if replacement_name.strip() and replacement_name.strip().casefold() not in {name.casefold() for name in options}:
+        options.append(replacement_name.strip())
+    options.sort(key=str.casefold)
+    if entries:
+        edited = st.data_editor(pd.DataFrame(entries), hide_index=True, use_container_width=True,
+            disabled=['Kind', 'Account', 'Date', 'Item / merchant', 'Amount'],
+            column_config={'Amount': st.column_config.NumberColumn(format='$%.2f'),
+                           'Replacement category': st.column_config.SelectboxColumn(
+                               'Replacement category', options=options, required=False)},
+            key='category_reassignment_' + category_key)
+    else:
+        edited = pd.DataFrame(entries)
+        st.info('No transactions or budget items currently use this category.')
+    if st.button('Delete category and save reassignment', type='primary'):
+        replacements = edited['Replacement category'].tolist() if entries else []
+        if any(not isinstance(name, str) or not name.strip() or
+               name.strip().casefold() == category_key for name in replacements):
+            st.error('Choose a different replacement category for every listed entry.')
+            return
+        transaction_changes = [dict(id=row['id'], revision=row['check_revision'],
+                                    category=replacements[index].strip())
+                               for index, row in enumerate(transactions)]
+        rule_changes = [dict(id=row['id'], revision=row['revision'],
+                             category=replacements[len(transactions) + index].strip())
+                        for index, row in enumerate(rules)]
+        save_unified_budget_action('ledger_delete_transaction_category', dict(
+            p_name=category_name, p_transactions=transaction_changes, p_rules=rule_changes))
+
+
+def render_manage_categories_page():
+    require_session()
+    st.title('Transaction Categories')
+    categories = [name for name in get_existing_categories()
+                  if name.casefold() not in ('transfer', 'savings transfer')]
+    if not categories:
+        st.info('There are no editable categories.')
+        return
+    selected = st.selectbox('Category to delete', categories)
+    if st.button('Review category deletion'):
+        delete_category_dialog(selected)
+
+
+def visible_budget_versions(rules, selected_month):
+    """Show one dated version per budget item in the selected month."""
+    month_end = selected_month.replace(day=monthrange(selected_month.year, selected_month.month)[1])
+    current_by_series = {}
+    for rule in rules:
+        if rule['effective_from'] > month_end.isoformat() or (
+            rule['effective_until'] is not None and rule['effective_until'] < selected_month.isoformat()):
+            continue
+        series = rule['series_id']
+        if series not in current_by_series or (rule['effective_from'], int(rule['id'])) > (
+            current_by_series[series]['effective_from'], int(current_by_series[series]['id'])):
+            current_by_series[series] = rule
+    return sorted(current_by_series.values(), key=lambda row: (row['name'].casefold(), int(row['id'])))
+
+
 def render_budget_page():
     require_session()
     st.title('View / Edit Budget')
@@ -2305,10 +2390,7 @@ def render_budget_page():
         with st.expander('Error details'):
             st.code(str(getattr(exc, 'message', None) or exc))
         return
-    month_end = selected_month.replace(day=monthrange(selected_month.year, selected_month.month)[1])
-    visible = [r for r in rules if r['effective_from'] <= month_end.isoformat()
-        and (r['effective_until'] is None or r['effective_until'] >= selected_month.isoformat())]
-    visible.sort(key=lambda row: (row['name'].casefold(), int(row['id'])))
+    visible = visible_budget_versions(rules, selected_month)
     rows = []
     for rule in visible:
         matching = [o for o in occurrences if int(o['rule_id']) == int(rule['id'])
@@ -2317,6 +2399,7 @@ def render_budget_page():
                if rule['schedule'] == 'Weekly' else str(rule['day_of_month']))
         rows.append({'ID#': int(rule['id']), 'Item': rule['name'],
             'Transaction type': rule['transaction_type'],
+            'Category': rule.get('category') or 'Budget',
             'Paid from': accounts.get(rule['paid_from'], 'Unavailable account'),
             'Paid to': accounts.get(rule['paid_to'], rule['paid_to']),
             'Amount': float(money(rule['amount'])), 'Day': day,
@@ -2324,10 +2407,11 @@ def render_budget_page():
             'Description': rule['description'],
             'Actual transaction': f'{sum(not o["cancelled"] for o in matching)} entries',
             'Apply change': 'Future occurrences',
-            'Status': 'Active' if rule['enabled'] else 'Inactive'})
+            'Status': ('Current' if rule['enabled'] else 'Excluded')
+                if rule['effective_until'] is None else 'Past version'})
     st.subheader('Budgeted bills and income')
     st.caption('Each item is an expense. Payday income is managed below. Click an ID# to edit an item.')
-    frame = pd.DataFrame(rows, columns=['ID#','Item','Transaction type','Paid from','Paid to',
+    frame = pd.DataFrame(rows, columns=['ID#','Item','Transaction type','Category','Paid from','Paid to',
         'Amount','Day','Schedule','Include','Description','Actual transaction','Apply change','Status'])
     event = st.dataframe(frame, hide_index=True, use_container_width=True,
         key='unified_budget_table_' + str(st.session_state.get('unified_budget_generation', 0)),
@@ -2341,7 +2425,9 @@ def render_budget_page():
     if add_item:
         unified_budget_item_dialog(None, selected_month)
     elif selection_token is not None and 0 <= selection_token[1] < len(visible):
-        if st.session_state.get('unified_budget_handled_selection') != selection_token:
+        if visible[selection_token[1]]['effective_until'] is not None:
+            st.info('This is a past version. Select the month when the current version starts to edit that item.')
+        elif st.session_state.get('unified_budget_handled_selection') != selection_token:
             st.session_state['unified_budget_handled_selection'] = selection_token
             unified_budget_item_dialog(visible[selection_token[1]], selected_month)
     savings_entries = [o for o in occurrences if not o['cancelled']
@@ -3307,6 +3393,8 @@ if st.sidebar.button('✏️ Edit Transaction', use_container_width=True,
     disabled=st.session_state.get('ledger_view') in ('Archived Accounts','Manage Account')):
     st.session_state.pop('edit_loaded_tx_id', None)
     edit_transaction_dialog()
+if st.sidebar.button('Transaction Categories', use_container_width=True):
+    st.session_state['ledger_view'] = 'Categories'
 if st.sidebar.button('AMZ Card Ledger', use_container_width=True):
     st.session_state['ledger_view'] = 'Reconcile'
 
@@ -3317,7 +3405,7 @@ if st.sidebar.button('Lines of Credit', use_container_width=True):
         st.session_state['credit_generation'] = st.session_state.get('credit_generation', 0) + 1
     st.session_state['ledger_view'] = 'Lines of Credit'
 
-if st.session_state.get('ledger_view') in ('Budget', 'Reconcile', 'Lines of Credit',
+if st.session_state.get('ledger_view') in ('Budget', 'Reconcile', 'Lines of Credit', 'Categories',
     'Archived Accounts', 'Manage Account'):
     account_selection = st.session_state['ledger_view']
 st.sidebar.divider()
@@ -3353,6 +3441,9 @@ elif account_selection == "Reconcile":
 elif account_selection == "Budget":
     render_budget_page()
 
+elif account_selection == "Categories":
+    render_manage_categories_page()
+
 elif account_selection == "Lines of Credit":
     render_credit_page()
     render_debt_planning()
@@ -3365,6 +3456,8 @@ elif account_selection == "Archived Accounts":
 
 elif account_selection in savings_names:
     render_savings_page()
+
+
 
 
 
