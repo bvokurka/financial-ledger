@@ -155,16 +155,16 @@ st.markdown(
         gap: 0px !important;
     }
 
-    /* Green Add Transaction button */
+    /* Blue Add Transaction button */
     [data-testid="stSidebar"] button[kind="primary"] {
-        background-color: #2ea043 !important;
+        background-color: #1769c2 !important;
         color: #ffffff !important;
-        border-color: #2ea043 !important;
+        border-color: #1769c2 !important;
         font-weight: bold !important;
     }
 
     [data-testid="stSidebar"] button[kind="primary"]:hover {
-        background-color: #2c974b !important;
+        background-color: #11549c !important;
         color: #ffffff !important;
     }
 
@@ -1097,9 +1097,19 @@ from calendar import Calendar, monthrange
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
-# Match the supplied September calendar; month navigation remains a later feature.
-CALENDAR_YEAR = 2026
-CALENDAR_MONTH = 9
+def month_year_picker(label, key):
+    """Default to the actual local month; preserve a manual choice during this session."""
+    today = datetime.now(LOCAL_TZ).date()
+    month_col, year_col = st.columns([2, 1])
+    with month_col:
+        month = st.selectbox(label + ' month', list(range(1, 13)),
+            index=today.month - 1,
+            format_func=lambda value: date(2000, value, 1).strftime('%B'),
+            key=key + '_month')
+    with year_col:
+        year = st.number_input(label + ' year', min_value=1900, max_value=2100,
+            value=today.year, step=1, key=key + '_year')
+    return date(int(year), int(month), 1)
 
 
 def money(value):
@@ -1288,7 +1298,7 @@ ledger_interaction = component('ledger_interaction',
     html='<div class="ledger-interactive-root"></div>', js=LEDGER_INTERACTION_JS)
 
 
-@st.dialog('Edit planned amount for this month', width='medium')
+@st.dialog('Edit planned entry for this month', width='medium')
 def planned_occurrence_dialog(item_id):
     require_session()
     key = 'occurrence_edit_' + str(item_id)
@@ -1310,9 +1320,10 @@ def planned_occurrence_dialog(item_id):
         amount = st.number_input('Amount ($)', min_value=0.0, max_value=999999999.99,
                                  value=float(money(item['amount'])), format='%.2f')
         save = st.form_submit_button('Save this month')
-    if save:
+        delete = st.form_submit_button('Delete this month’s entry')
+    if save or delete:
         try:
-            payload = occurrence_change(item, rule, amount)
+            payload = occurrence_change(item, rule, amount, enabled=False if delete else None)
             response = conn.rpc('ledger_save_budget_edits', {'p_month': item['month'], 'p_changes': [payload]}).execute()
             if response.data is not True:
                 raise RuntimeError('Save not confirmed')
@@ -1323,12 +1334,13 @@ def planned_occurrence_dialog(item_id):
             st.error('Nothing was saved. The item may have changed. Close and reopen it before trying again.')
 
 
-def occurrence_change(item, rule, amount):
+def occurrence_change(item, rule, amount, enabled=None):
     return dict(kind='bill', scope='This month only', id=item['id'], revision=item['revision'],
                 rule_revision=rule['revision'], name=item['name'], description=item.get('description') or '',
                 amount=str(money(amount)), day=item.get('due_day') or date.fromisoformat(item['due_date']).day,
                 direction=item['direction'], schedule='As needed' if item.get('schedule') == 'as_needed' else 'Monthly',
-                enabled=item['enabled'], transaction_id=item.get('transaction_id'))
+                enabled=item['enabled'] if enabled is None else enabled,
+                transaction_id=item.get('transaction_id'))
 
 
 def invalidate_budget_views():
@@ -1589,8 +1601,51 @@ def payday_changes(edited, originals, labels):
 def render_payday_tables(month):
     st.subheader('Payday income')
     st.caption('Bill: every Friday. Spouse: alternate Wednesdays, anchored to January 14, 2026. '
-               'Amounts are independent for each payday; blank means unset and is excluded from projections. '
-               'Link each actual deposit to replace its estimate. Dates do not shift for holidays.')
+               'Set each recurring amount once. Editing a calendar deposit changes only that date. '
+               'Dates do not shift for holidays.')
+    try:
+        defaults = {r['stream']: r for r in load_budget_table('LedgerPaydayDefaults')}
+        default_rows = []
+        for stream in ('Bill', 'Spouse'):
+            row = defaults[stream]
+            default_rows.append({'Stream': stream,
+                'Amount': None if row['amount'] is None else float(money(row['amount'])),
+                'Include': bool(row['enabled']), 'Description': row.get('description') or ''})
+    except Exception:
+        st.error('Payday budget could not be loaded. Install the current SQL update, then reload.')
+        return
+    with st.form('payday_recurring_defaults'):
+        default_edits = st.data_editor(pd.DataFrame(default_rows), hide_index=True,
+            use_container_width=True, num_rows='fixed',
+            disabled=['Stream'],
+            column_config={'Amount': st.column_config.NumberColumn(
+                min_value=0.0,max_value=999999999.99,format='$%.2f')})
+        save_defaults = st.form_submit_button('Save recurring payday amounts', type='primary')
+    if save_defaults:
+        try:
+            changes = []
+            for row in default_edits.to_dict('records'):
+                old = defaults[row['Stream']]
+                amount = None if pd.isna(row['Amount']) else money(row['Amount'])
+                description = str(row['Description'] or '')
+                enabled = bool(row['Include'])
+                if (amount, enabled, description) == (
+                    None if old['amount'] is None else money(old['amount']),
+                    old['enabled'], old.get('description') or ''):
+                    continue
+                changes.append(dict(stream=row['Stream'], revision=old['revision'],
+                    amount=None if amount is None else str(amount), enabled=enabled,
+                    description=description))
+            if changes:
+                response = conn.rpc('ledger_save_payday_defaults', {'p_changes': changes}).execute()
+                if response.data is not True:
+                    raise RuntimeError('Save not confirmed')
+                invalidate_budget_views()
+                st.rerun()
+            st.info('No payday budget changes to save.')
+        except Exception:
+            st.error('Payday budget was not saved. Reload the page and try again.')
+    st.caption('Future dated deposits use these amounts. Previously recorded and individually edited deposits stay as saved.')
     snapshot_key = 'payday_snapshot_' + month.isoformat()
     if st.button('Reload payday income / discard unsaved changes'):
         st.session_state.pop(snapshot_key, None)
@@ -1623,19 +1678,21 @@ def render_payday_tables(month):
     except Exception:
         st.error('Payday income could not be loaded. Install payday_review_update.sql and reload.')
         return
-    with st.form('payday_income_' + month.isoformat()):
-        edits = []
-        for stream in ('Bill', 'Spouse'):
-            st.subheader(stream)
-            edits.append(st.data_editor(frame[frame['Item'] == stream].copy(), hide_index=True,
-                use_container_width=True, num_rows='fixed',
-                key='payday_' + stream + month.isoformat() + '_' + str(st.session_state.get('payday_generation', 0)),
-                disabled=['_id', 'Item', 'Date', 'Direction', 'Schedule', 'Status'],
-                column_order=['Item', 'Amount', 'Date', 'Direction', 'Schedule', 'Include', 'Description', 'Actual transaction', 'Status'],
-                column_config={'_id': None, 'Amount': st.column_config.NumberColumn(min_value=0.0,max_value=999999999.99,format='$%.2f'),
-                    'Date': st.column_config.DateColumn(format='MMM D, YYYY'),
-                    'Actual transaction': st.column_config.SelectboxColumn(options=list(labels), required=True)}))
-        saved = st.form_submit_button('Save payday income', type='primary')
+    with st.expander('Individual payday deposits and actual links'):
+        st.caption('Calendar edits appear here for reference. Linking an actual income transaction replaces its planned deposit.')
+        with st.form('payday_income_' + month.isoformat()):
+            edits = []
+            for stream in ('Bill', 'Spouse'):
+                st.subheader(stream)
+                edits.append(st.data_editor(frame[frame['Item'] == stream].copy(), hide_index=True,
+                    use_container_width=True, num_rows='fixed',
+                    key='payday_' + stream + month.isoformat() + '_' + str(st.session_state.get('payday_generation', 0)),
+                    disabled=['_id', 'Item', 'Amount', 'Date', 'Direction', 'Schedule', 'Include', 'Description', 'Status'],
+                    column_order=['Item', 'Amount', 'Date', 'Direction', 'Schedule', 'Include', 'Description', 'Actual transaction', 'Status'],
+                    column_config={'_id': None, 'Amount': st.column_config.NumberColumn(min_value=0.0,max_value=999999999.99,format='$%.2f'),
+                        'Date': st.column_config.DateColumn(format='MMM D, YYYY'),
+                        'Actual transaction': st.column_config.SelectboxColumn(options=list(labels), required=True)}))
+            saved = st.form_submit_button('Save actual deposit links')
     if saved:
         try:
             changes = payday_changes(pd.concat(edits, ignore_index=True), originals, labels)
@@ -1677,9 +1734,12 @@ def payday_occurrence_dialog(payday_id):
         saved = st.form_submit_button('Save this payday')
     if saved:
         try:
-            result = conn.rpc('ledger_save_paydays', {'p_changes': [dict(id=row['id'], revision=row['revision'],
-                amount=None if amount is None else str(money(amount)), enabled=row['enabled'],
-                description=row.get('description') or '', transaction_id=row.get('transaction_id'))]}).execute()
+            if amount is None:
+                st.error('Enter an amount for this deposit.')
+                return
+            result = conn.rpc('ledger_edit_payday_occurrence', {
+                'p_id': row['id'], 'p_revision': row['revision'],
+                'p_amount': str(money(amount))}).execute()
             if result.data is not True:
                 raise RuntimeError('Save not confirmed')
             invalidate_budget_views()
@@ -1692,7 +1752,7 @@ def payday_occurrence_dialog(payday_id):
 def reconcile_card_dialog():
     require_session()
     st.title('AMZ Card Ledger')
-    month = st.date_input('Review month', value=date(CALENDAR_YEAR, CALENDAR_MONTH, 1), key='card_review_month').replace(day=1)
+    month = month_year_picker('Review', 'card_review')
     try:
         ensure_unified_budget_months(month - timedelta(days=7), month)
         clear_transaction_caches()
@@ -1831,6 +1891,8 @@ def calendar_grid_html(first, balances, direct, settings, show_cards=True, marke
                              + escape(day.strftime('%b %d')) + '</span></header><div class="ledger-body"></div><footer>&nbsp;</footer></div>')
                 continue
             values = balances[day]
+            warning = (' ledger-header-negative' if values['balance'] < 0 else
+                       ' ledger-header-low' if values['balance'] < 500 else '')
             content = [calendar_entry_html(row) for row in sorted(direct.get(day.isoformat(), []), key=lambda row: str(row['id']))]
             for payment in values['payments']:
                 content.append(calendar_entry_html({
@@ -1852,7 +1914,7 @@ def calendar_grid_html(first, balances, direct, settings, show_cards=True, marke
                 if values['spent'] > values['budget'] and 'budget:' + day.isoformat() in settings:
                     content.append(f'<div class="ledger-note">Over budget: ${values["spent"]-values["budget"]:,.2f}</div>')
             cells.append(
-                '<div class="ledger-day"><header>'
+                f'<div class="ledger-day"><header class="ledger-header{warning}">'
                 f'<button type="button" data-day="{day.isoformat()}" '
                 f'class="ledger-date ledger-date-{markers.get(day.isoformat(), "clear")}" '
                 f'aria-label="Mark {day.isoformat()}: {markers.get(day.isoformat(), "clear")}">{day.day}</button>'
@@ -1867,6 +1929,8 @@ def calendar_grid_html(first, balances, direct, settings, show_cards=True, marke
     .ledger-days {grid-auto-rows:1fr;}
     .ledger-day {display:flex;flex-direction:column;min-height:240px;min-width:0;border:1px solid #8a96a5;border-radius:6px;overflow:hidden;}
     .ledger-day header {display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:7px;border-bottom:1px solid #8a96a5;background:rgba(127,150,180,.12);}
+    .ledger-day header.ledger-header-low {background:#ffed9e;border-top:5px solid #d5a500;color:#302500;}
+    .ledger-day header.ledger-header-negative {background:#ffd4d4;border-top:5px solid #c12626;color:#510f0f;}
     .ledger-date {display:inline-flex;align-items:center;justify-content:center;min-width:30px;min-height:30px;padding:2px 5px;box-sizing:border-box;border:1px solid #8a96a5;border-radius:3px;background:rgba(127,150,180,.2);font-weight:700;}
     button.ledger-date {color:inherit;cursor:pointer;font:inherit;font-weight:700;}
     .ledger-date-green {background:#36b75e!important;color:#092b13!important;border-color:#287e42!important;}
@@ -1887,16 +1951,7 @@ def render_editable_calendar():
     heading.title(cash_accounts()[active_cash_id()]['name'] + ': Cash Flow Calendar')
     summary_slot = summary.empty()
     month_heading = st.empty()
-    month_col, year_col = st.columns([2, 1])
-    with month_col:
-        month = st.selectbox('Calendar month', list(range(1, 13)),
-            index=CALENDAR_MONTH - 1,
-            format_func=lambda value: date(2000, value, 1).strftime('%B'),
-            key='calendar_month_name')
-    with year_col:
-        year = st.number_input('Calendar year', min_value=1900, max_value=2100,
-            value=CALENDAR_YEAR, step=1, key='calendar_year_choice')
-    first = date(int(year), int(month), 1)
+    first = month_year_picker('Calendar', 'calendar')
     last = date(first.year, first.month, monthrange(first.year, first.month)[1])
     month_heading.subheader(first.strftime('%B %Y'))
     try:
@@ -2004,7 +2059,8 @@ def render_editable_calendar():
 def load_budget_table(table):
     rows, offset = [], 0
     order = ('month' if table == 'LedgerBudgetMonths' else
-             'name' if table == 'LedgerRetiredCategories' else 'id')
+             'name' if table == 'LedgerRetiredCategories' else
+             'stream' if table == 'LedgerPaydayDefaults' else 'id')
     while True:
         response = conn.table(table).select('*').order(order).range(offset, offset + 499).execute()
         if getattr(response, 'error', None) or response.data is None:
@@ -2272,6 +2328,16 @@ def unified_budget_item_dialog(rule, selected_month):
             p_id=rule['id'] if rule else None,
             p_revision=rule['revision'] if rule else None,
             p_effective_from=effective.isoformat(),p_data=details))
+    if rule:
+        confirm_key = 'delete_budget_rule_' + identity + '_' + generation
+        if st.button('Delete recurring budget item', key=confirm_key + '_review'):
+            st.session_state[confirm_key] = True
+        if st.session_state.get(confirm_key):
+            st.warning('This removes the budget row and future entries you have not individually edited. '
+                       'Earlier and individually edited entries remain recorded.')
+            if st.button('Confirm delete budget item', key=confirm_key + '_confirm'):
+                save_unified_budget_action('ledger_delete_unified_budget_rule', dict(
+                    p_id=rule['id'], p_revision=rule['revision']))
 
 
 @st.dialog('Edit one savings entry')
@@ -2361,6 +2427,8 @@ def visible_budget_versions(rules, selected_month):
     month_end = selected_month.replace(day=monthrange(selected_month.year, selected_month.month)[1])
     current_by_series = {}
     for rule in rules:
+        if rule.get('deleted_at'):
+            continue
         if rule['effective_from'] > month_end.isoformat() or (
             rule['effective_until'] is not None and rule['effective_until'] < selected_month.isoformat()):
             continue
@@ -2374,8 +2442,7 @@ def visible_budget_versions(rules, selected_month):
 def render_budget_page():
     require_session()
     st.title('View / Edit Budget')
-    selected_month = st.date_input('Budget month', value=date(CALENDAR_YEAR, CALENDAR_MONTH, 1),
-        key='unified_budget_month').replace(day=1)
+    selected_month = month_year_picker('Budget', 'unified_budget')
     try:
         response = conn.rpc('ledger_prepare_unified_budget_month',
             {'p_month': selected_month.isoformat()}).execute()
@@ -2814,8 +2881,8 @@ def render_credit_page():
     st.caption('Enter charges and payments in the monthly worksheet. Saved credit entries track these balances separately from checking.')
     controls = st.columns([1, 1, 1])
     with controls[0]:
-        chosen = st.date_input('Worksheet month', value=date(2026, 9, 1), key='credit_month_picker')
-    month = chosen.replace(day=1).isoformat()
+        chosen = month_year_picker('Worksheet', 'credit_worksheet')
+    month = chosen.isoformat()
     # Match the space occupied by the date input's label above adjacent controls.
     for control in controls[1:]:
         control.markdown('<div aria-hidden="true" style="height:28px"></div>', unsafe_allow_html=True)
