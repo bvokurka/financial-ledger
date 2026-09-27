@@ -3399,6 +3399,10 @@ def account_action(name, payload):
         if response.data is not True:
             raise ValueError('Save was not confirmed.')
         clear_transaction_caches()
+        # The Savings page holds a per-session snapshot until explicitly reloaded.
+        # Any linked transfer may change category balances, so discard that view.
+        st.session_state.pop('savings_snapshot', None)
+        st.session_state['savings_generation'] = st.session_state.get('savings_generation', 0) + 1
         for key in list(st.session_state):
             if key.startswith(('budget_grid_snapshot_', 'payday_snapshot_')):
                 st.session_state.pop(key, None)
@@ -3467,6 +3471,8 @@ def transfer_form(original=None):
         if budget_savings and not completed:
             st.warning('This budget transfer was posted before the confirmation workflow. '
                        'If it has not actually happened, return it to pending; that reverses its account entries.')
+            st.caption('Savings already includes this older transfer. Marking it made moves the amount to the category below; '
+                       'it will not increase total savings again. Editing the recurring budget item does not change an older transfer.')
             occurrence = next((r for r in load_budget_table('LedgerUnifiedBudgetOccurrences')
                 if int(r['id']) == int(original['unified_occurrence_id'])), None)
             if occurrence is None:
@@ -3758,7 +3764,6 @@ elif account_selection == "Archived Accounts":
 
 elif account_selection in savings_names:
     render_savings_page()
-
 
 
 
