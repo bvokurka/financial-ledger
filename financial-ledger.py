@@ -831,6 +831,26 @@ def add_transaction_dialog():
 # ============================================================
 
 
+def linked_current_budget_savings_category(original):
+    """Find an unambiguous current transfer version of an older Direct rule."""
+    occurrence_id = original.get('unified_occurrence_id')
+    if occurrence_id is None:
+        return None
+    occurrences = load_budget_table('LedgerUnifiedBudgetOccurrences')
+    occurrence = next((o for o in occurrences if int(o['id']) == int(occurrence_id)), None)
+    if occurrence is None:
+        return None
+    rules = load_budget_table('LedgerUnifiedBudgetRules')
+    old_rule = next((r for r in rules if int(r['id']) == int(occurrence['rule_id'])), None)
+    if old_rule is None:
+        return None
+    matches = [r for r in rules if r['series_id'] == old_rule['series_id']
+        and r['transaction_type'] == 'Transfer' and r['effective_until'] is None
+        and r['paid_from'] == 'c:' + str(original['cash_account_id'])
+        and r.get('destination_savings_bucket_id') is not None]
+    return int(matches[0]['destination_savings_bucket_id']) if len(matches) == 1 else None
+
+
 @st.dialog("Edit Existing Transaction", width="medium")
 def edit_transaction_dialog():
     require_session()
@@ -880,6 +900,7 @@ def edit_transaction_dialog():
             return
         st.session_state['edit_tx_select_dropdown'] = match
         st.session_state.pop('edit_loaded_tx_id', None)
+        st.session_state.pop('edit_auto_transfer_decided', None)
     selected_label = st.selectbox(
         "Select Transaction to Edit",
         list(tx_options.keys()),
@@ -895,7 +916,6 @@ def edit_transaction_dialog():
     initialize_edit_transaction_state(selected_tx)
     selected_tx = deepcopy(st.session_state["edit_original_row"])
     render_check_clearance(selected_tx)
-    render_transaction_completion(selected_tx)
     budget_generated = selected_tx.get('unified_occurrence_id') is not None
     if budget_generated:
         st.caption('Amount, date, and payment-type edits apply only to this occurrence. The recurring budget item stays unchanged.')
@@ -912,6 +932,13 @@ def edit_transaction_dialog():
 
     workflow_types = (["AMZ Card"] if active_cash_id() == 1 else []) + ["Direct", "Check"]
     if selected_tx.get('type') == 'Savings Transfer': workflow_types.append('Savings Transfer')
+    if (selected_tx.get('type') == 'Direct' and selected_tx.get('direction') == 'Expense'
+            and selected_tx.get('transfer_id') is None and not paid_week):
+        workflow_types.append('Transfer')
+        if st.session_state.get('edit_auto_transfer_decided') != selected_tx['id']:
+            if linked_current_budget_savings_category(selected_tx) is not None:
+                st.session_state['edit_workflow_type'] = 'Transfer'
+            st.session_state['edit_auto_transfer_decided'] = selected_tx['id']
 
     if st.session_state["edit_workflow_type"] not in workflow_types:
         st.session_state["edit_workflow_type"] = workflow_types[0]
@@ -924,6 +951,10 @@ def edit_transaction_dialog():
         key="edit_workflow_type", disabled=bool(paid_week),
     )
 
+    if workflow_type == 'Transfer':
+        convert_direct_to_savings_form(selected_tx)
+        return
+    render_transaction_completion(selected_tx)
     if workflow_type == "Savings Transfer":
         savings_transfer_form("edit", selected_tx)
         return
@@ -1390,7 +1421,8 @@ def render_transaction_completion(row):
         return
     completed = bool(row.get('completed_at'))
     st.caption('Status: ' + ('Completed' if completed else 'Not marked completed'))
-    st.caption('This marker does not change the transaction amount or account balance. Save edits before changing its status.')
+    st.caption('This check mark does not move money. For an older Direct entry that belongs in savings, '
+               'choose Transfer under Transaction Type instead. Save edits before changing status.')
     if st.button('Remove completed mark' if completed else 'Mark completed',
                  key='complete_saved_transaction_' + str(row['id'])):
         require_session()
@@ -3423,7 +3455,61 @@ def savings_linked_rows(bucket_id):
     return rows
 
 
+def convert_direct_to_savings_form(original):
+    """Replace one older Direct debit with a completed linked savings transfer."""
+    buckets = [b for b in load_budget_table('LedgerSavingsBuckets')
+        if b['active'] and b['balance'] is not None]
+    active_savings = {i for i, row in savings_accounts().items() if not row.get('archived_at')}
+    choices = {int(b['id']): b for b in buckets
+        if int(b['savings_account_id']) in active_savings}
+    if not choices:
+        st.error('Establish an active savings category balance before making this transfer.')
+        return
+    preferred = linked_current_budget_savings_category(original)
+    rules = load_budget_table('LedgerUnifiedBudgetRules')
+    if preferred not in choices:
+        preferred = None
+    if preferred is None:
+        label = str(original.get('description') or original.get('merchant') or '').strip().casefold()
+        matching = [r for r in rules if r['transaction_type'] == 'Transfer'
+            and r['effective_until'] is None and r['paid_from'] == 'c:' + str(original['cash_account_id'])
+            and str(r['name']).strip().casefold() == label
+            and r.get('destination_savings_bucket_id') in choices]
+        if len(matching) == 1:
+            preferred = int(matching[0]['destination_savings_bucket_id'])
+    if preferred is None:
+        transfer_day = date.fromisoformat(str(original['date'])[:10])
+        matching = [r for r in rules if r['transaction_type'] == 'Transfer'
+            and r['enabled'] and r['effective_until'] is None
+            and r['paid_from'] == 'c:' + str(original['cash_account_id'])
+            and r.get('destination_savings_bucket_id') in choices
+            and money(r['amount']) == money(original['amount'])
+            and ((r['schedule'] == 'Weekly' and int(r['weekday']) == transfer_day.weekday())
+                 or (r['schedule'] == 'Monthly' and int(r['day_of_month']) == transfer_day.day))]
+        if len(matching) == 1:
+            preferred = int(matching[0]['destination_savings_bucket_id'])
+    keys = list(choices)
+    savings_names = savings_accounts()
+    st.info('This is an older Direct expense. Marking it as a transfer replaces that checking debit '
+            'with a linked transfer of the same amount and date, then adds the amount to savings once.')
+    st.write('Date:', str(original['date'])[:10], ' · Amount: $' + f"{money(original['amount']):,.2f}")
+    destination = st.selectbox('Savings category for this transfer', keys,
+        index=keys.index(preferred) if preferred in keys else None,
+        placeholder='Choose the category',
+        format_func=lambda i: savings_names[int(choices[i]['savings_account_id'])]['name']
+            + ' / ' + choices[i]['name'],
+        key='convert_direct_bucket_' + str(original['id']))
+    if st.button('Mark transfer made', type='primary',
+                 disabled=destination is None,
+                 key='convert_direct_transfer_' + str(original['id'])):
+        account_action('ledger_convert_direct_to_savings_transfer', dict(
+            p_transaction_id=original['id'], p_revision=original['check_revision'],
+            p_destination_bucket=destination))
+
+
 def transfer_form(original=None):
+    if original:
+        st.caption('Transaction type: Transfer')
     accounts = {i: row for i, row in cash_accounts().items() if not row.get('archived_at')}
     savings = {i: row for i, row in savings_accounts().items() if not row.get('archived_at')}
     buckets = load_budget_table('LedgerSavingsBuckets')
@@ -3764,6 +3850,8 @@ elif account_selection == "Archived Accounts":
 
 elif account_selection in savings_names:
     render_savings_page()
+
+
 
 
 
