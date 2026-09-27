@@ -155,17 +155,26 @@ st.markdown(
         gap: 0px !important;
     }
 
-    /* Blue Add Transaction button */
+    /* Selected account buttons stay green. */
     [data-testid="stSidebar"] button[kind="primary"] {
-        background-color: #1769c2 !important;
+        background-color: #2ea043 !important;
         color: #ffffff !important;
-        border-color: #1769c2 !important;
+        border-color: #2ea043 !important;
         font-weight: bold !important;
     }
 
     [data-testid="stSidebar"] button[kind="primary"]:hover {
-        background-color: #11549c !important;
+        background-color: #2c974b !important;
         color: #ffffff !important;
+    }
+
+    /* Only Add Transaction is blue. */
+    [data-testid="stSidebar"] .st-key-sidebar_add_transaction button[kind="primary"] {
+        background-color: #1769c2 !important;
+        border-color: #1769c2 !important;
+    }
+    [data-testid="stSidebar"] .st-key-sidebar_add_transaction button[kind="primary"]:hover {
+        background-color: #11549c !important;
     }
 
     </style>
@@ -3452,10 +3461,11 @@ if st.sidebar.button('Archived Accounts', use_container_width=True):
     st.session_state['ledger_view'] = 'Archived Accounts'
 st.sidebar.divider()
 
-if st.sidebar.button('➕ Add Transaction', type='primary', use_container_width=True,
-    disabled=st.session_state.get('ledger_view') in ('Archived Accounts','Manage Account')):
-    reset_add_transaction_state()
-    add_transaction_dialog()
+with st.sidebar.container(key='sidebar_add_transaction'):
+    if st.button('➕ Add Transaction', type='primary', use_container_width=True,
+        disabled=st.session_state.get('ledger_view') in ('Archived Accounts','Manage Account')):
+        reset_add_transaction_state()
+        add_transaction_dialog()
 if st.sidebar.button('✏️ Edit Transaction', use_container_width=True,
     disabled=st.session_state.get('ledger_view') in ('Archived Accounts','Manage Account')):
     st.session_state.pop('edit_loaded_tx_id', None)
@@ -3523,8 +3533,5 @@ elif account_selection == "Archived Accounts":
 
 elif account_selection in savings_names:
     render_savings_page()
-
-
-
 
 
