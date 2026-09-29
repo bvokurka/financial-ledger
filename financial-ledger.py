@@ -825,6 +825,64 @@ def edit_credit_transaction_form(row):
             st.error('Credit transaction was not changed: ' + str(getattr(exc, 'message', None) or exc))
 
 
+def edit_federal_loan_payment_form(row):
+    """A scheduled loan payment affects checking now and the loan when completed."""
+    loans = {int(a['id']): a for a in load_budget_table('LedgerFederalLoans')}
+    loan_id = int(row['federal_loan_id']) if row.get('federal_loan_id') else None
+    loan = loans.get(loan_id)
+    if not loan:
+        st.error('The student loan could not be found. Reload the page.')
+        return
+    st.write(loan['name'] + ' · monthly payment')
+    st.caption('Changes here affect only this payment, not its recurring budget item.')
+    if row.get('federal_loan_applied_at'):
+        st.success('This payment has been applied to the loan.')
+        st.caption('Use a newer servicer statement to reconcile principal and unpaid interest.')
+        return
+    st.info('This payment is in the checking projection. The loan changes only when you mark it complete.')
+    if st.button('Mark loan payment complete', type='primary',
+                 key='complete_loan_' + str(row['id'])):
+        try:
+            response = conn.rpc('ledger_complete_federal_loan_payment',
+                {'p_id': row['id'], 'p_revision': row['check_revision']}).execute()
+            if response.data is not True:
+                raise RuntimeError('Completion was not confirmed.')
+            clear_transaction_caches()
+            st.session_state.pop('credit_snapshot', None)
+            st.rerun()
+        except Exception as exc:
+            st.error('Loan payment was not completed: ' + str(getattr(exc, 'message', None) or exc))
+    with st.form('loan_payment_edit_' + str(row['id'])):
+        amount = st.number_input('Amount ($)', min_value=0.01,
+            max_value=999999999.99, value=float(money(row['amount'])), format='%.2f')
+        category = st.text_input('Category', value=row.get('category') or 'Loan payment')
+        description = st.text_input('Description', value=row.get('description') or '')
+        day = st.date_input('Date', value=date.fromisoformat(str(row['date'])[:10]),
+            min_value=date.fromisoformat(loan['as_of']))
+        save = st.form_submit_button('Save this payment', type='primary')
+        delete = st.form_submit_button('Delete this payment')
+    if save or delete:
+        try:
+            table = conn.table('Transactions')
+            if save:
+                if not category.strip():
+                    st.error('Enter a category.')
+                    return
+                response = (table.update(dict(amount=str(money(amount)),
+                    category=category.strip(), description=description,
+                    date=day.isoformat())).eq('id',row['id'])
+                    .eq('check_revision',row['check_revision']).execute())
+            else:
+                response = (table.delete().eq('id',row['id'])
+                    .eq('check_revision',row['check_revision']).execute())
+            if transaction_write_succeeded(response,'loan payment change'):
+                clear_transaction_caches()
+                st.session_state.pop('credit_snapshot', None)
+                st.rerun()
+        except Exception as exc:
+            st.error('Loan payment was not changed: ' + str(getattr(exc, 'message', None) or exc))
+
+
 # ============================================================
 # ADD TRANSACTION DIALOG
 # ============================================================
@@ -1057,6 +1115,9 @@ def edit_transaction_dialog():
         transfer = next((t for t in load_budget_table('LedgerTransfers') if t['id'] == selected_tx['transfer_id']), None)
         if transfer is None: st.error('Transfer changed. Reload the page.'); return
         transfer_form(transfer)
+        return
+    if selected_tx.get('type') == 'Federal student loan':
+        edit_federal_loan_payment_form(selected_tx)
         return
     if selected_tx.get('type') == 'Line of credit':
         edit_credit_transaction_form(selected_tx)
@@ -1357,7 +1418,7 @@ def calendar_balances(transactions, settings, first, last, as_of=None, reconcile
             amount = amount if direction == 'Expense' else -amount
             saturday = assigned_week
             card[saturday] = card.get(saturday, Decimal(0)) + amount
-        elif kind in ('Direct', 'Check', 'Savings Transfer', 'Line of credit'):
+        elif kind in ('Direct', 'Check', 'Savings Transfer', 'Line of credit', 'Federal student loan'):
             amount = amount if direction == 'Income' else -amount
             direct[day] = direct.get(day, Decimal(0)) + amount
         else:
@@ -1603,7 +1664,7 @@ def render_check_calendar(first, balances, direct, settings):
     markup = calendar_grid_html(first, balances, direct, settings,
         show_cards=active_cash_id()==1, markers=markers)
     actual_ids = {str(r['id']) for rows in direct.values() for r in rows
-                  if not r.get('planned') and r.get('type') in ('Direct', 'Check', 'AMZ Card', 'Savings Transfer', 'Line of credit')}
+                  if not r.get('planned') and r.get('type') in ('Direct', 'Check', 'AMZ Card', 'Savings Transfer', 'Line of credit', 'Federal student loan')}
     planned_ids = {str(r['budget_item_id']) for rows in direct.values() for r in rows if r.get('planned') and r.get('budget_item_id') is not None}
     payday_ids = {str(r['payday_id']) for rows in direct.values() for r in rows if r.get('payday_id') is not None}
     pending_transfer_ids = {str(r['pending_transfer_id']) for rows in direct.values()
@@ -2177,7 +2238,7 @@ def calendar_entry_html(row):
                 f'border-radius:3px;padding:6px;margin:3px 0;background:{background};color:#17221a;'
                 f'font:inherit;cursor:pointer;">'
                 f'{escape(displayed)} {"✓" if cleared else ""}</button>')
-    if not row.get('planned') and row.get('type') in ('Direct', 'AMZ Card', 'Savings Transfer', 'Line of credit'):
+    if not row.get('planned') and row.get('type') in ('Direct', 'AMZ Card', 'Savings Transfer', 'Line of credit', 'Federal student loan'):
         marked = ' ✓' if row.get('completed_at') and row.get('type') != 'AMZ Card' else ''
         return (f'<button type="button" data-transaction="{int(row["id"])}" '
                 f'title="{escape(tooltip, quote=True)}" aria-label="{escape("Edit transaction: " + tooltip, quote=True)}" '
@@ -2347,7 +2408,7 @@ def render_editable_calendar():
         for t in load_budget_table('LedgerTransfers')}
         if any(row.get('transfer_id') is not None for row in transactions) else {})
     for row in transactions:
-        if row.get('type') in ('Direct', 'Check', 'Savings Transfer') or (
+        if row.get('type') in ('Direct', 'Check', 'Savings Transfer', 'Federal student loan') or (
                 row.get('type') == 'Line of credit' and row.get('credit_action') == 'Payment'):
             display_row = dict(row)
             if row.get('transfer_id') is not None:
@@ -2571,7 +2632,7 @@ def unified_budget_item_dialog(rule, selected_month):
     accounts = unified_account_options()
     generation = str(st.session_state.get('unified_budget_generation', 0))
     identity = str(rule['id']) if rule else 'new'
-    types = ['AMZ Card', 'Direct', 'Check', 'Transfer', 'Line of credit']
+    types = ['AMZ Card', 'Direct', 'Check', 'Transfer', 'Line of credit', 'Federal student loan']
     current_type = rule['transaction_type'] if rule else 'Direct'
     transaction_type = st.selectbox('Transaction type', types,
         index=types.index(current_type), key='budget_type_' + identity + '_' + generation)
@@ -2581,16 +2642,17 @@ def unified_budget_item_dialog(rule, selected_month):
         st.text_input('Paid from', value=accounts['c:1'], disabled=True)
     else:
         available_sources = ([key for key in accounts if key.startswith('c:')]
-            if transaction_type == 'Line of credit' else list(accounts))
+            if transaction_type in ('Line of credit', 'Federal student loan') else list(accounts))
         paid_from = st.selectbox('Paid from', available_sources,
             index=available_sources.index(source_default) if source_default in available_sources else 0,
             format_func=accounts.get, key='budget_source_' + identity + '_' + generation)
-    schedules = ['Monthly'] if transaction_type == 'Line of credit' else ['Monthly', 'Weekly', 'As needed']
+    schedules = ['Monthly'] if transaction_type in ('Line of credit', 'Federal student loan') else ['Monthly', 'Weekly', 'As needed']
     current_schedule = rule['schedule'] if rule else 'Monthly'
     schedule = st.selectbox('Schedule', schedules,
         index=schedules.index(current_schedule) if current_schedule in schedules else 0,
         key='budget_schedule_' + identity + '_' + generation)
     credit_account_id = None
+    federal_loan_id = None
     if transaction_type == 'Transfer':
         destinations = [key for key in accounts if key != paid_from]
         if not destinations:
@@ -2626,7 +2688,19 @@ def unified_budget_item_dialog(rule, selected_month):
     else:
         source_savings_bucket_id = None
         destination_savings_bucket_id = None
-        if transaction_type == 'Line of credit':
+        if transaction_type == 'Federal student loan':
+            loans = {int(a['id']): a for a in load_budget_table('LedgerFederalLoans')}
+            if not loans:
+                st.error('Add the student loan on Lines of Credit before budgeting its payment.')
+                return
+            choices = list(loans)
+            current_loan = int(rule['federal_loan_id']) if rule and rule.get('federal_loan_id') else None
+            federal_loan_id = st.selectbox('Student loan to pay', choices,
+                index=choices.index(current_loan) if current_loan in choices else 0,
+                format_func=lambda i: loans[i]['name'])
+            paid_to = loans[federal_loan_id]['name']
+            st.caption('This monthly payment appears in checking on its scheduled date. The loan changes only when marked complete.')
+        elif transaction_type == 'Line of credit':
             credit_accounts = {a['id']:a for a in load_budget_table('LedgerCreditAccounts')
                 if a['active'] or (rule and a['id'] == rule.get('credit_account_id'))}
             if not credit_accounts:
@@ -2705,7 +2779,8 @@ def unified_budget_item_dialog(rule, selected_month):
             category=str(category).strip(),
             source_savings_bucket_id=source_savings_bucket_id,
             destination_savings_bucket_id=destination_savings_bucket_id,
-            credit_account_id=credit_account_id)
+            credit_account_id=credit_account_id,
+            federal_loan_id=federal_loan_id)
         if transaction_type == 'Transfer' and ((paid_from.startswith('s:') and source_savings_bucket_id is None)
                 or (paid_to.startswith('s:') and destination_savings_bucket_id is None)):
             st.error('Choose a category for each savings account in the transfer.')
@@ -2845,6 +2920,7 @@ def render_budget_page():
         return
     visible = visible_budget_versions(rules, selected_month)
     credit_names = {a['id']: a['name'] for a in load_budget_table('LedgerCreditAccounts')}
+    loan_names = {int(a['id']): a['name'] for a in load_budget_table('LedgerFederalLoans')}
     rows = []
     for rule in visible:
         matching = [o for o in occurrences if int(o['rule_id']) == int(rule['id'])
@@ -2856,7 +2932,8 @@ def render_budget_page():
             'Category': rule.get('category') or 'Budget',
             'Paid from': accounts.get(rule['paid_from'], 'Unavailable account'),
             'Paid to': credit_names.get(rule.get('credit_account_id'),
-                accounts.get(rule['paid_to'], rule['paid_to'])),
+                loan_names.get(int(rule['federal_loan_id']) if rule.get('federal_loan_id') else None,
+                    accounts.get(rule['paid_to'], rule['paid_to']))),
             'Amount': float(money(rule['amount'])), 'Day': day,
             'Schedule': rule['schedule'], 'Include': bool(rule['enabled']),
             'Description': rule['description'],
@@ -3282,7 +3359,7 @@ def render_credit_page():
             st.session_state['credit_snapshot'] = snapshot
         accounts, setting = snapshot['accounts'], snapshot['settings']
         entries = [r for r in get_all_transactions_cached()
-                   if r.get('type') == 'Line of credit']
+                   if r.get('type') in ('Line of credit', 'Federal student loan')]
     except Exception:
         st.error('Lines of Credit could not be loaded. Install the ongoing credit update, then reload.')
         return
@@ -3351,16 +3428,38 @@ def render_credit_page():
                     p_apr=None if apr is None else str(money(apr)),
                     p_minimum=None if minimum is None else str(money(minimum)),
                     p_opening=None if opening is None else str(money(opening))))
-    if not accounts:
-        st.info('Add a credit account to begin.')
+            if account.get('live_balance') is not None:
+                with st.form('credit_balance_correction_' + str(selected) + '_' + generation):
+                    st.caption('Correct this balance to a statement figure. This does not create a charge or affect checking.')
+                    corrected = st.number_input('Correct current balance ($)', min_value=0.0,
+                        max_value=999999999.99, value=float(money(account['live_balance'])),
+                        format='%.2f')
+                    correction_note = st.text_input('Statement note (optional)')
+                    save_correction = st.form_submit_button('Save balance correction')
+                if save_correction:
+                    credit_action('ledger_correct_credit_balance', dict(
+                        p_id=selected, p_revision=account['revision'],
+                        p_balance=str(money(corrected)), p_note=correction_note))
+        render_loan_manager()
+    loans = load_budget_table('LedgerFederalLoans')
+    if not accounts and not loans:
+        st.info('Add a credit account or student loan to begin.')
         return
     known = [money(a['live_balance']) for a in accounts if a.get('live_balance') is not None]
     unknown = sum(a.get('live_balance') is None for a in accounts)
     total_limit = sum((money(a['credit_limit']) for a in accounts
         if a.get('credit_limit') is not None), Decimal(0))
     c1,c2,c3 = st.columns(3)
+    today = datetime.now(LOCAL_TZ).date()
+    loan_totals = {}
+    for loan in loans:
+        try:
+            p, i = loan_balance(loan, max(today,date.fromisoformat(loan['as_of'])))
+            loan_totals[int(loan['id'])] = p+i
+        except ValueError as exc:
+            st.error('Loan balance could not be estimated: ' + str(exc))
     c1.metric('Current balances' if not unknown else 'Established balance subtotal',
-        f'${sum(known,Decimal(0)):,.2f}')
+        f'${sum(known,Decimal(0))+sum(loan_totals.values(),Decimal(0)):,.2f}')
     c2.metric('Entered credit limits',f'${total_limit:,.2f}')
     c3.metric('Target use',f'{target:,.2f}%')
     if unknown:
@@ -3380,31 +3479,46 @@ def render_credit_page():
             'Remaining credit':None if balance is None or limit is None else float(limit-balance),
             'Payment to target use':None if balance is None or target_amount is None
                 else float(max(balance-target_amount,Decimal(0)))})
+    for loan in loans:
+        balance = loan_totals.get(int(loan['id']))
+        rows.append({'Account':loan['name'],'Type':'Federal student loan',
+            'Status':'Active','Current balance':None if balance is None else float(balance),
+            'Credit limit':None,'APR %':float(money(loan['rate'])),
+            'Current usage %':None,'Remaining credit':None,'Payment to target use':None})
     st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True,
         column_config={key:st.column_config.NumberColumn(format='%.2f' if '%' in key else '$%.2f')
             for key in ('Current balance','Credit limit','APR %','Current usage %',
                 'Remaining credit','Payment to target use')})
-    st.caption('Charges raise the credit balance without reducing checking. Payments reduce checking and credit. A scheduled payment affects the credit balance only after completion.')
+    st.caption('Card charges raise credit owed without reducing checking. Scheduled card and loan payments affect checking on their dates and reduce debt only when marked complete. Card statement interest can be included through a balance correction; loan interest is estimated daily.')
     if entries:
-        st.subheader('Dated credit entries')
+        st.subheader('Dated debt entries')
         names = {a['id']:a['name'] for a in accounts}
+        loan_names = {int(a['id']):a['name'] for a in loans}
+        def debt_name(row):
+            return (loan_names.get(int(row['federal_loan_id']), 'Unavailable loan')
+                if row.get('federal_loan_id') is not None else
+                names.get(row.get('credit_account_id'), 'Unavailable account'))
         ordered = sorted(entries,key=lambda e:(str(e['date']),int(e['id'])),reverse=True)
         st.dataframe(pd.DataFrame([{'Date':r['date'],
-            'Account':names.get(r['credit_account_id'],'Unavailable account'),
-            'Action':r['credit_action'],'Amount':float(money(r['amount'])),
+            'Account':debt_name(r),
+            'Action':r.get('credit_action') or 'Loan payment','Amount':float(money(r['amount'])),
             'Merchant':r['merchant'],'Category':r['category'],
-            'Status':'Applied' if r['credit_action']=='Charge' or r.get('credit_applied_at')
+            'Status':'Applied' if r.get('credit_action')=='Charge' or r.get('credit_applied_at')
+                or r.get('federal_loan_applied_at')
                 else 'Scheduled'} for r in ordered]),hide_index=True,use_container_width=True,
             column_config={'Amount':st.column_config.NumberColumn(format='$%.2f')})
         choice = st.selectbox('Credit entry to edit',ordered,
-            format_func=lambda r: str(r['date'])+' · '+names.get(r['credit_account_id'],'Account')+
-                ' · '+r['credit_action']+' · $'+str(money(r['amount'])))
+            format_func=lambda r: str(r['date'])+' · '+debt_name(r)+
+                ' · '+(r.get('credit_action') or 'Loan payment')+' · $'+str(money(r['amount'])))
         if st.button('Edit selected credit entry'):
             st.session_state['credit_edit_id'] = choice['id']
         selected_edit = next((r for r in ordered
             if r['id'] == st.session_state.get('credit_edit_id')), None)
         if selected_edit is not None:
-            edit_credit_transaction_form(selected_edit)
+            if selected_edit.get('federal_loan_id') is not None:
+                edit_federal_loan_payment_form(selected_edit)
+            else:
+                edit_credit_transaction_form(selected_edit)
     with st.expander('Prior monthly worksheets — read-only history'):
         try:
             months = load_budget_table('LedgerCreditMonths')
@@ -3824,7 +3938,17 @@ def loan_balance(loan, through):
     annual=Decimal(str(loan['rate']))/100; basis=Decimal(str(loan.get('day_basis',365.25)))
     day=date.fromisoformat(loan['as_of'])
     if through<day: raise ValueError('Projection date precedes the statement baseline.')
-    events=sorted(enumerate(loan.get('events',[])),key=lambda pair:(pair[1]['date'],pair[0]))
+    events=list(enumerate(loan.get('events',[])))
+    if loan.get('id') is not None:
+        linked = [r for r in get_all_transactions_cached()
+            if r.get('type') == 'Federal student loan'
+            and r.get('federal_loan_id') is not None
+            and int(r['federal_loan_id']) == int(loan['id'])
+            and r.get('federal_loan_applied_at')
+            and str(r['date'])[:10] > loan['as_of']]
+        events.extend((len(events)+int(r['id']),dict(date=str(r['date'])[:10],
+            kind='Payment',amount=r['amount'])) for r in linked)
+    events.sort(key=lambda pair:(pair[1]['date'],pair[0]))
     for _,event in events:
         event_day=date.fromisoformat(event['date'])
         if event_day<day: raise ValueError('Event precedes the baseline.')
@@ -3864,41 +3988,36 @@ def payoff_estimate(principal, accrued, rate, payment, first_date, federal=False
     return dict(months=None,status='More than 1,200 months at this payment')
 
 
-def render_debt_planning():
-    st.divider(); st.header('Federal student loans')
+def render_loan_manager():
+    st.divider(); st.subheader('Student loan statement')
     loans=load_budget_table('LedgerFederalLoans')
     choices={None:'Add federal consolidation loan',**{r['id']:r['name'] for r in loans}}
-    selected=st.selectbox('Student loan',list(choices),format_func=choices.get)
+    selected=st.selectbox('Student loan',list(choices),
+        index=1 if loans else 0,format_func=choices.get)
     old=next((r for r in loans if r['id']==selected),None)
-    with st.expander('Statement baseline, payments, and capitalization',expanded=old is None):
-        st.caption('Baseline balances are after any activity already reflected in the statement. Only enter later payments here. Reconciliation replaces the baseline; retain only events not included in the new statement. Saves preserve the previous baseline and events in history. No checking payment is created.')
-        with st.form('federal_loan_'+str(selected)):
-            name=st.text_input('Loan name',value=old['name'] if old else 'Federal consolidation loan')
-            as_of=st.date_input('Statement balance date',value=date.fromisoformat(old['as_of']) if old else datetime.now(LOCAL_TZ).date())
-            principal=st.number_input('Principal balance',min_value=0.0,value=float(old['principal']) if old else None,format='%.2f')
-            interest=st.number_input('Unpaid accrued interest',min_value=0.0,value=float(old['accrued_interest']) if old else None,format='%.2f')
-            rate=st.number_input('Annual interest rate (%)',min_value=0.0,max_value=100.0,value=float(old['rate']) if old else 8.25,format='%.4f')
-            basis=st.selectbox('Servicer day-count basis',[365.25,365.0],index=0 if not old or float(old['day_basis'])==365.25 else 1)
-            entries=[{'Date':date.fromisoformat(e['date']),'Kind':e['kind'],'Amount':float(e['amount'])} for e in old.get('events',[])] if old else []
-            events=st.data_editor(pd.DataFrame(entries,columns=['Date','Kind','Amount']),num_rows='dynamic',hide_index=True,
-                column_config={'Date':st.column_config.DateColumn(required=True),'Kind':st.column_config.SelectboxColumn(options=['Payment','Capitalization'],required=True),'Amount':st.column_config.NumberColumn(min_value=0,required=True,format='$%.2f')})
-            save=st.form_submit_button('Save loan baseline and events')
-        if save:
-            try:
-                if principal is None or interest is None: raise ValueError('Enter principal and accrued interest, including explicit zero when applicable.')
-                ev=[dict(date=str(e['Date'])[:10],kind=e['Kind'],amount=str(money(e['Amount']))) for e in events.to_dict('records')]
-                payload=dict(name=name,principal=str(money(principal)),accrued_interest=str(money(interest)),rate=str(rate),as_of=as_of.isoformat(),day_basis=str(basis),events=ev)
-                loan_balance(payload,max([as_of]+[date.fromisoformat(e['date']) for e in ev]))
-                account_action('ledger_save_federal_loan',dict(p_id=selected,p_revision=old['revision'] if old else None,p_data=payload))
-            except (ValueError,TypeError,InvalidOperation) as exc: st.error(str(exc))
-    today=datetime.now(LOCAL_TZ).date()
-    if old:
-        through=st.date_input('Estimate loan balance through',value=max(today,date.fromisoformat(old['as_of'])))
+    st.caption('Enter principal and unpaid interest separately from a servicer statement. Completed budget payments after that statement date are included automatically; do not enter them again in the events table. If a newer statement includes earlier payments, move the baseline date forward to avoid counting them twice.')
+    with st.form('federal_loan_'+str(selected)):
+        name=st.text_input('Loan name',value=old['name'] if old else 'Federal consolidation loan')
+        as_of=st.date_input('Statement balance date',value=date.fromisoformat(old['as_of']) if old else datetime.now(LOCAL_TZ).date())
+        principal=st.number_input('Principal balance',min_value=0.0,value=float(old['principal']) if old else None,format='%.2f')
+        interest=st.number_input('Unpaid accrued interest',min_value=0.0,value=float(old['accrued_interest']) if old else None,format='%.2f')
+        rate=st.number_input('Annual interest rate (%)',min_value=0.0,max_value=100.0,value=float(old['rate']) if old else 8.25,format='%.4f')
+        basis=st.selectbox('Servicer day-count basis',[365.25,365.0],index=0 if not old or float(old['day_basis'])==365.25 else 1)
+        entries=[{'Date':date.fromisoformat(e['date']),'Kind':e['kind'],'Amount':float(e['amount'])} for e in old.get('events',[])] if old else []
+        events=st.data_editor(pd.DataFrame(entries,columns=['Date','Kind','Amount']),num_rows='dynamic',hide_index=True,
+            column_config={'Date':st.column_config.DateColumn(required=True),'Kind':st.column_config.SelectboxColumn(options=['Payment','Capitalization'],required=True),'Amount':st.column_config.NumberColumn(min_value=0,required=True,format='$%.2f')})
+        save=st.form_submit_button('Save loan statement')
+    if save:
         try:
-            p,i=loan_balance(old,through)
-            cols=st.columns(3); cols[0].metric('Principal',f'${p:,.2f}');cols[1].metric('Accrued interest',f'${i:,.2f}');cols[2].metric('Total owed estimate',f'${p+i:,.2f}')
-        except ValueError as exc: st.error(str(exc))
-        with st.expander('Saved loan history'):
+            if principal is None or interest is None: raise ValueError('Enter principal and accrued interest, including zero when applicable.')
+            ev=[dict(date=str(e['Date'])[:10],kind=e['Kind'],amount=str(money(e['Amount']))) for e in events.to_dict('records')]
+            payload=dict(name=name,principal=str(money(principal)),accrued_interest=str(money(interest)),rate=str(rate),as_of=as_of.isoformat(),day_basis=str(basis),events=ev)
+            loan_balance(payload,max([as_of]+[date.fromisoformat(e['date']) for e in ev]))
+            st.session_state.pop('credit_snapshot',None)
+            account_action('ledger_save_federal_loan',dict(p_id=selected,p_revision=old['revision'] if old else None,p_data=payload))
+        except (ValueError,TypeError,InvalidOperation) as exc: st.error(str(exc))
+    if old:
+        with st.expander('Saved loan statement history'):
             history=[r for r in load_budget_table('LedgerAccountAudit') if r['kind']=='Federal loan statement and events'
                 and (r.get('after_data') or {}).get('id')==old['id']]
             if history:
@@ -3906,6 +4025,11 @@ def render_debt_planning():
                     'Principal':float(money(r['after_data']['principal'])),'Unpaid interest':float(money(r['after_data']['accrued_interest'])),
                     'Rate %':float(r['after_data']['rate']),'Events':json.dumps(r['after_data']['events'])} for r in reversed(history)]),hide_index=True)
             else: st.caption('No saved history yet.')
+
+
+def render_debt_planning():
+    loans=load_budget_table('LedgerFederalLoans')
+    today=datetime.now(LOCAL_TZ).date()
     st.subheader('What-if monthly payoff')
     st.caption('Hypothetical payments do not create transactions. Assumes fixed rates, no new borrowing or fees, and a fixed payment each month. Cards and credit lines use a monthly interest approximation; federal loans use daily simple interest. No forgiveness, subsidy, or automatic capitalization is assumed. Compare estimates with your servicer.')
     credit_accounts={a['id']:a for a in load_budget_table('LedgerCreditAccounts')}
