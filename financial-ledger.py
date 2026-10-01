@@ -1547,10 +1547,12 @@ export default function({parentElement, data, setTriggerValue}) {
     const root = parentElement.querySelector('.ledger-interactive-root');
     root.innerHTML = data.html;
     root.onclick = event => {
-        const button = event.target.closest('button[data-transaction],button[data-pending-transfer],button[data-planned],button[data-payday],button[data-card-amount],button[data-review],button[data-savings],button[data-day]');
+        const button = event.target.closest('button[data-transaction],button[data-pending-transfer],button[data-planned],button[data-payday],button[data-card-budget],button[data-card-amount],button[data-review],button[data-savings],button[data-day]');
         if (!button || !root.contains(button)) return;
         if (button.dataset.day) {
             setTriggerValue('action', {day: button.dataset.day});
+        } else if (button.dataset.cardBudget) {
+            setTriggerValue('action', {card_budget: button.dataset.cardBudget});
         } else if (button.dataset.savings) {
             setTriggerValue('action', {savings: button.dataset.savings});
         } else if (button.dataset.cardAmount) {
@@ -1705,6 +1707,16 @@ def render_check_calendar(first, balances, direct, settings):
             st.rerun()
         except Exception as exc:
             st.error('Day marker was not saved: ' + str(getattr(exc, 'message', None) or exc))
+    elif event and event.get('card_budget') and active_cash_id() == 1:
+        try:
+            selected = date.fromisoformat(str(event['card_budget']))
+            if not first <= selected <= last or selected.weekday() != 5:
+                raise ValueError('Choose a Saturday in the displayed month.')
+        except ValueError:
+            st.error('Choose a card budget in the displayed calendar.')
+        else:
+            st.session_state.pop('card_budget_edit_' + selected.isoformat(), None)
+            calendar_card_budget_dialog(selected.isoformat())
     elif event and str(event.get('id')) in actual_ids:
         require_session()
         clear_transaction_caches()
@@ -1720,6 +1732,50 @@ def render_check_calendar(first, balances, direct, settings):
         require_session()
         st.session_state.pop('payday_edit_' + str(event['payday']), None)
         payday_occurrence_dialog(int(event['payday']))
+
+
+@st.dialog('Edit weekly card budget', width='medium')
+def calendar_card_budget_dialog(week):
+    require_session()
+    if active_cash_id() != 1:
+        st.error('AMZ card budgets belong to Primary Checking.')
+        return
+    try:
+        selected = date.fromisoformat(week)
+        if selected.weekday() != 5:
+            raise ValueError('Choose a Saturday.')
+        if week in load_card_weeks():
+            st.info('This week is reconciled. Its budget is locked.')
+            return
+        snapshot_key = 'card_budget_edit_' + week
+        if snapshot_key not in st.session_state:
+            st.session_state[snapshot_key] = {'previous': deepcopy(load_calendar_settings().get('budget:' + week))}
+        previous = st.session_state[snapshot_key]['previous']
+    except Exception:
+        st.error('This card budget could not be loaded. Close and reopen it.')
+        return
+    st.write('Week ending ' + selected.strftime('%B %d, %Y'))
+    st.caption('Changes only this week. Other weekly budgets and purchases stay unchanged.')
+    with st.form('calendar_card_budget_' + week):
+        amount = st.number_input('Weekly card budget ($)', min_value=0.0,
+            max_value=999999999.99, value=float(money(previous['amount'])) if previous else 0.0,
+            format='%.2f')
+        saved = st.form_submit_button('Save weekly budget')
+    if saved:
+        try:
+            if previous:
+                response = conn.rpc('ledger_edit_card_week_budget', {
+                    'p_week': week, 'p_revision': previous['revision'],
+                    'p_amount': str(money(amount))}).execute()
+                if response.data is not True:
+                    raise RuntimeError('Save was not confirmed.')
+            elif not save_calendar_setting('budget:' + week, amount, None):
+                return
+            clear_transaction_caches()
+            st.session_state.pop(snapshot_key, None)
+            st.rerun()
+        except Exception:
+            st.error('The budget was not confirmed. Close and reopen it to check the saved amount before retrying.')
 
 
 @st.dialog('Budgeted savings transfer', width='medium')
@@ -2188,15 +2244,6 @@ def reconcile_card_dialog():
             st.rerun()
         return
     budget = money(settings[budget_key]['amount'])
-    with st.expander('Edit this week’s card budget'):
-        st.caption('Changes only the selected open week. Reconciled weeks remain locked.')
-        with st.form('edit_card_week_budget_' + week):
-            edited_budget = st.number_input('Weekly card budget', min_value=0.0,
-                max_value=999999999.99, value=float(budget), format='%.2f')
-            save_week_budget = st.form_submit_button('Save weekly budget')
-        if save_week_budget:
-            account_action('ledger_edit_card_week_budget', dict(p_week=week,
-                p_revision=settings[budget_key]['revision'], p_amount=str(money(edited_budget))))
     total = sum((money(row['amount']) * (1 if row['direction']=='Expense' else -1)
                  for row in included), Decimal(0))
     if total < 0:
@@ -2317,11 +2364,11 @@ def calendar_grid_html(first, balances, direct, settings, show_cards=True, marke
                     if values['surplus'] > 0:
                         content.append(f'<div class="ledger-note">Budget surplus: ${values["surplus"]:,.2f}</div>')
                 else:
-                    content.append(calendar_entry_html({
-                        'amount': values['remaining'], 'direction': 'Expense',
-                        'merchant': 'Weekly card budget remaining',
-                        'description': f"Budget: ${values['budget']:,.2f}; spent: ${values['spent']:,.2f}",
-                    }))
+                    content.append(
+                        f'<button type="button" data-card-budget="{day.isoformat()}" '
+                        f'class="ledger-card-budget" aria-label="Edit card budget for week ending {day.isoformat()}" '
+                        f'title="Edit this week’s budget; remaining is included in the checking projection">'
+                        f'Budget: ${values["budget"]:,.2f} · Remaining: ${values["remaining"]:,.2f}</button>')
                 card_mark = ' ✓' if values['completed'] else ''
                 content.append(f'<div class="ledger-card-spent" title="Card spent">${values["spent"]:,.2f}{card_mark}</div>')
                 if values['spent'] > values['budget'] and 'budget:' + day.isoformat() in settings:
@@ -2352,6 +2399,8 @@ def calendar_grid_html(first, balances, direct, settings, show_cards=True, marke
     .ledger-body {padding:8px;flex:1;overflow-wrap:anywhere;}
     .ledger-day footer {padding:7px;border-top:1px solid #8a96a5;background:rgba(127,150,180,.12);font-size:.85rem;font-variant-numeric:tabular-nums;}
     .ledger-card-spent {background:#00b4e6;color:#002b36;padding:6px;border-radius:3px;font-weight:600;margin-top:6px;}
+    .ledger-card-budget {display:block;width:100%;border:0;background:transparent;color:#d14343;text-align:left;padding:3px 0;font:inherit;cursor:pointer;text-decoration:underline;}
+    .ledger-card-budget:focus-visible {outline:2px solid #1370c3;outline-offset:2px;}
     .ledger-note {font-size:.85rem;padding:4px 0;}
     .ledger-outside {opacity:.55;}
     </style>'''
@@ -2360,13 +2409,20 @@ def calendar_grid_html(first, balances, direct, settings, show_cards=True, marke
 
 
 def render_editable_calendar():
-    heading, summary = st.columns([3, 2], gap='large')
-    heading.title(cash_accounts()[active_cash_id()]['name'] + ': Cash Flow Calendar')
-    summary_slot = summary.empty()
-    month_heading = st.empty()
-    first = month_year_picker('Calendar', 'calendar')
+    st.html('''<style>
+        .st-key-calendar_heading h1 {font-size:2rem;padding:0;margin:0;}
+        .st-key-calendar_heading [data-testid="stVerticalBlock"] {gap:.4rem;}
+        .ledger-calendar-summary {display:flex;align-items:center;gap:2rem;flex-wrap:wrap;margin:0 0 .25rem;}
+        .ledger-calendar-summary h2 {font-size:1.4rem;margin:0;padding:0;}
+        .ledger-calendar-summary .summary-label {font-size:.85rem;opacity:.8;}
+        .ledger-calendar-summary .summary-value {font-size:1.3rem;font-weight:600;font-variant-numeric:tabular-nums;}
+    </style>''')
+    with st.container(key='calendar_heading'):
+        st.title(cash_accounts()[active_cash_id()]['name'] + ': Cash Flow Calendar')
+        summary_slot = st.empty()
+        first = month_year_picker('Calendar', 'calendar')
     last = date(first.year, first.month, monthrange(first.year, first.month)[1])
-    month_heading.subheader(first.strftime('%B %Y'))
+    summary_slot.html('<div class="ledger-calendar-summary"><h2>' + first.strftime('%B %Y') + '</h2></div>')
     try:
         settings = load_calendar_settings()
         opening_dates = [date.fromisoformat(key.split(':', 1)[1]) for key in settings
@@ -2470,22 +2526,24 @@ def render_editable_calendar():
     # Render as HTML directly: Markdown interprets dollar amounts as math and
     # can break markup around multiline tooltip attributes.
     render_check_calendar(first, balances, direct, settings)
-    with summary_slot.container():
-        st.metric('Projected month-end balance', f"${balances[last]['balance']:,.2f}")
-        monthly_surplus = sum((values['surplus'] for values in balances.values()), Decimal(0))
-        if active_cash_id() == 1: st.metric('Monthly budget surplus — completed weeks', f"${monthly_surplus:,.2f}")
+    monthly_surplus = sum((values['surplus'] for values in balances.values()), Decimal(0))
+    surplus_html = (f'<div title="Includes completed weeks whose Saturday falls in this month">'
+        f'<div class="summary-label">Monthly budget surplus</div>'
+        f'<div class="summary-value">${monthly_surplus:,.2f}</div></div>' if active_cash_id() == 1 else '')
+    summary_slot.html(f'<div class="ledger-calendar-summary"><h2>{first:%B %Y}</h2>'
+        f'<div><div class="summary-label">Projected month-end balance</div>'
+        f'<div class="summary-value">${balances[last]["balance"]:,.2f}</div></div>{surplus_html}</div>')
     if active_cash_id() == 1:
         st.caption('Includes completed weeks whose Saturday falls in this month. '
                    'Over-budget weeks show zero surplus and are flagged above. '
                    'Reconciled payments and budget surplus are preserved from the saved reconciliation.')
-    st.divider()
-    st.subheader('Transaction Register & Schedule Mapping')
-    st.dataframe(pd.DataFrame([{'Date':t['date'],'Type':'Transfer' if t.get('transfer_id') or t['type']=='Savings Transfer' else t['type'],
-        'Direction':t['direction'],'Amount':float(money(t['amount'])),'Merchant':t.get('merchant',''),
-        'Category':'Transfer' if t.get('transfer_id') or t['type']=='Savings Transfer' else t.get('category',''),
-        'Description':t.get('description','')} for t in transactions
-        if not (t.get('type') == 'Line of credit' and t.get('credit_action') == 'Charge')]),
-        use_container_width=True, hide_index=True)
+    with st.expander('Transaction Register', expanded=False):
+        st.dataframe(pd.DataFrame([{'Date':t['date'],'Type':'Transfer' if t.get('transfer_id') or t['type']=='Savings Transfer' else t['type'],
+            'Direction':t['direction'],'Amount':float(money(t['amount'])),'Merchant':t.get('merchant',''),
+            'Category':'Transfer' if t.get('transfer_id') or t['type']=='Savings Transfer' else t.get('category',''),
+            'Description':t.get('description','')} for t in transactions
+            if not (t.get('type') == 'Line of credit' and t.get('credit_action') == 'Charge')]),
+            use_container_width=True, hide_index=True)
 
 
 # ============================================================
@@ -3031,7 +3089,8 @@ def render_budget_page():
     previous_account = active_cash_id()
     st.session_state['cash_account_id'] = 1
     try:
-        render_payday_tables()
+        with st.expander('Payday income', expanded=False):
+            render_payday_tables()
     finally:
         st.session_state['cash_account_id'] = previous_account
 def savings_transfer_deltas(original, replacement):
@@ -4247,8 +4306,6 @@ elif account_selection == "Archived Accounts":
 
 elif account_selection in savings_names:
     render_savings_page()
-
-
 
 
 
