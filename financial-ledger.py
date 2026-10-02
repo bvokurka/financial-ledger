@@ -580,18 +580,21 @@ export default function({ parentElement, data, setStateValue }) {
 
 
 @st.cache_resource
-def get_merchant_component():
-    """Register once using Streamlit's public component API."""
+def get_merchant_component(html: str, css: str, js: str):
+    """Cache by source content so app updates cannot retain an older component."""
+    from hashlib import sha256
     try:
         from streamlit.components.v2 import component
     except ImportError:
         st.error("Merchant autocomplete requires Streamlit 1.51 or newer.")
         st.stop()
+    source = f"{len(html)}:{html}{len(css)}:{css}{len(js)}:{js}"
+    version = sha256(source.encode("utf-8")).hexdigest()[:16]
     return component(
-        "ledger_merchant_autocomplete",
-        html=MERCHANT_HTML,
-        css=MERCHANT_CSS,
-        js=MERCHANT_JS,
+        f"ledger_merchant_autocomplete_{version}",
+        html=html,
+        css=css,
+        js=js,
     )
 
 
@@ -612,7 +615,7 @@ def merchant_selector(prefix: str, current_merchant: str = "") -> str:
     merchants = sorted(by_key.values(), key=str.casefold)
     initial = str(st.session_state.get(merchant_key, current_merchant) or "")
 
-    result = get_merchant_component()(
+    result = get_merchant_component(MERCHANT_HTML, MERCHANT_CSS, MERCHANT_JS)(
         data={"merchants": merchants, "value": initial},
         default={"value": initial},
         isolate_styles=False,  # Mount in the dialog DOM so its focus manager can reach the input.
@@ -4332,8 +4335,6 @@ elif account_selection == "Archived Accounts":
 
 elif account_selection in savings_names:
     render_savings_page()
-
-
 
 
 
