@@ -460,23 +460,44 @@ MERCHANT_JS = r"""
 export default function({ parentElement, data, setStateValue }) {
     const input = parentElement.querySelector('input');
     const merchants = data.merchants;
-    const dialog = parentElement.closest('[role="dialog"]');
-    const amountInput = dialog && [...dialog.querySelectorAll('input[type="number"]')]
-        .filter(candidate => candidate.compareDocumentPosition(input) & Node.DOCUMENT_POSITION_FOLLOWING)
-        .at(-1);
-    if (amountInput) {
-        if (amountInput.ledgerMerchantTabHandler) {
-            amountInput.removeEventListener('keydown', amountInput.ledgerMerchantTabHandler, true);
-        }
-        amountInput.ledgerMerchantTabHandler = event => {
-            if (event.key === 'Tab' && !event.shiftKey) {
-                event.preventDefault();
-                event.stopPropagation();
-                input.focus();
-            }
+    const ownerWindow = input.ownerDocument.defaultView;
+    // Streamlit can replace the Amount input without rerendering this component.
+    // Resolve neighbors at keypress time; capture before the dialog focus trap.
+    function neighbors() {
+        // The component container may be a fragment; the input is a DOM Element.
+        const dialog = input.closest('[role="dialog"]');
+        if (!dialog) return {};
+        return {
+            amount: [...dialog.querySelectorAll('input[type="number"]')]
+                .filter(candidate => candidate.compareDocumentPosition(input) & Node.DOCUMENT_POSITION_FOLLOWING)
+                .at(-1),
+            category: [...dialog.querySelectorAll('[data-testid="stSelectbox"] input')]
+                .find(candidate => input.compareDocumentPosition(candidate) & Node.DOCUMENT_POSITION_FOLLOWING),
         };
-        amountInput.addEventListener('keydown', amountInput.ledgerMerchantTabHandler, true);
     }
+    if (input.ledgerMerchantTabCleanup) input.ledgerMerchantTabCleanup();
+    const handleTab = event => {
+        if (!input.isConnected) {
+            ownerWindow.removeEventListener('keydown', handleTab, true);
+            return;
+        }
+        if (event.key !== 'Tab' || event.altKey || event.ctrlKey || event.metaKey ||
+                !input.getClientRects().length || composing || event.isComposing) return;
+        const {amount, category} = neighbors();
+        let target = null;
+        if (event.target === amount && !event.shiftKey) target = input;
+        else if (event.target === category && event.shiftKey) target = input;
+        else if (event.target === input) {
+            commit();
+            target = event.shiftKey ? amount : category;
+        }
+        if (!target) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        target.focus();
+    };
+    ownerWindow.addEventListener('keydown', handleTab, true);
+    input.ledgerMerchantTabCleanup = () => ownerWindow.removeEventListener('keydown', handleTab, true);
     // Preserve an uncommitted draft if another widget causes a rerender.
     // Python gives each newly opened/selected transaction a fresh component key.
     if (!input.dataset.initialized) {
@@ -532,6 +553,7 @@ export default function({ parentElement, data, setStateValue }) {
         if (composing || event.isComposing) return;
         if (event.key === 'Tab') {
             commit();
+            const amountInput = neighbors().amount;
             if (event.shiftKey && amountInput) {
                 event.preventDefault();
                 amountInput.focus();
@@ -706,7 +728,8 @@ def build_time_string(tx_date, tx_time) -> str:
 
 def add_credit_transaction_form():
     """Record one dated credit charge or payment through the atomic database action."""
-    accounts = [a for a in load_budget_table('LedgerCreditAccounts') if a['active']]
+    accounts = sorted([a for a in load_budget_table('LedgerCreditAccounts') if a['active']],
+        key=lambda a: (a['name'].casefold(), str(a['id'])))
     account_ids = [a['id'] for a in accounts]
     selected = st.selectbox('Line of credit', account_ids + [None],
         index=account_ids.index(st.session_state['new_credit_account_id'])
@@ -3622,6 +3645,9 @@ def render_credit_page():
             'Estimated time to pay off':payoff_time})
     st.caption('Enter a hypothetical monthly payment in the table to estimate payoff time. It does not create a transaction. Estimates start today, assume fixed rates and no new borrowing or fees; cards use monthly interest and the federal loan uses daily simple interest.')
     frame = pd.DataFrame(rows)
+    if not frame.empty:
+        frame = frame.sort_values('Current balance', ascending=False,
+            na_position='last', kind='stable').reset_index(drop=True)
     whatif_column = 'What-if monthly payment'
     edited = st.data_editor(frame, hide_index=True, use_container_width=True,
         num_rows='fixed', key='credit_whatif_table_' + str(st.session_state.get('credit_whatif_generation', 0)),
