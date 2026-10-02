@@ -583,23 +583,30 @@ export default function({ parentElement, data, setStateValue }) {
 def get_merchant_component(html: str, css: str, js: str):
     """Cache by source content so app updates cannot retain an older component."""
     from hashlib import sha256
+    from inspect import signature
     try:
         from streamlit.components.v2 import component
     except ImportError:
         st.error("Merchant autocomplete requires Streamlit 1.51 or newer.")
         st.stop()
-    source = f"{len(html)}:{html}{len(css)}:{css}{len(js)}:{js}"
+    source = f"inline-v2:{len(html)}:{html}{len(css)}:{css}{len(js)}:{js}"
     version = sha256(source.encode("utf-8")).hexdigest()[:16]
+    registration_options = {}
+    # Newer Streamlit versions moved style isolation from mounting to registration.
+    if "isolate_styles" in signature(component).parameters:
+        registration_options["isolate_styles"] = False
     return component(
         f"ledger_merchant_autocomplete_{version}",
         html=html,
         css=css,
         js=js,
+        **registration_options,
     )
 
 
 def merchant_selector(prefix: str, current_merchant: str = "") -> str:
     """Inline prefix completion; Tab, Enter, or blur commits the merchant."""
+    from inspect import signature
     merchant_key = f"{prefix}_merchant"
     instance_key = f"{prefix}_merchant_instance"
     if instance_key not in st.session_state:
@@ -615,12 +622,16 @@ def merchant_selector(prefix: str, current_merchant: str = "") -> str:
     merchants = sorted(by_key.values(), key=str.casefold)
     initial = str(st.session_state.get(merchant_key, current_merchant) or "")
 
-    result = get_merchant_component(MERCHANT_HTML, MERCHANT_CSS, MERCHANT_JS)(
+    renderer = get_merchant_component(MERCHANT_HTML, MERCHANT_CSS, MERCHANT_JS)
+    mount_options = {}
+    if "isolate_styles" in signature(renderer).parameters:
+        mount_options["isolate_styles"] = False
+    result = renderer(
         data={"merchants": merchants, "value": initial},
         default={"value": initial},
-        isolate_styles=False,  # Mount in the dialog DOM so its focus manager can reach the input.
         key=f"{prefix}_autocomplete_{st.session_state[instance_key]}",
         on_value_change=lambda: None,
+        **mount_options,
     )
     value = str(result.value if result.value is not None else initial).strip()
     value = by_key.get(value.casefold(), value)
@@ -4335,8 +4346,6 @@ elif account_selection == "Archived Accounts":
 
 elif account_selection in savings_names:
     render_savings_page()
-
-
 
 
 
