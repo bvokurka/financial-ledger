@@ -789,27 +789,15 @@ def add_credit_transaction_form():
         key='new_credit_date')
     tx_time = st.time_input('Time', value=datetime.now(LOCAL_TZ).time().replace(microsecond=0),
         key='new_credit_time')
-    payment_amount = payment_date = None
-    if side == 'Charge' and money(account['live_balance']) == 0:
-        st.info('This account is at zero. Enter the recurring payment to start with this charge.')
-        payment_amount = st.number_input('Monthly payment ($)', min_value=0.01,
-            max_value=999999999.99, value=None, format='%.2f',
-            key='new_credit_monthly_payment')
-        payment_date = st.date_input('First payment date', value=tx_date,
-            min_value=tx_date, key='new_credit_payment_date')
     if st.button('Save credit transaction', type='primary', use_container_width=True):
         if amount is None or not str(merchant or '').strip() or not str(category or '').strip():
             st.error('Enter an amount, merchant, and category.')
-            return
-        if payment_date is not None and payment_amount is None:
-            st.error('Enter the monthly payment amount.')
             return
         payload = dict(credit_account_id=selected,cash_account_id=active_cash_id(),
             credit_action=side,amount=str(money(amount)),date=tx_date.isoformat(),
             time=build_time_string(tx_date,tx_time),merchant=str(merchant).strip(),
             category=str(category).strip(),description=description,
-            payment_amount=None if payment_amount is None else str(money(payment_amount)),
-            payment_date=None if payment_date is None else payment_date.isoformat())
+            payment_amount=None, payment_date=None)
         try:
             response = conn.rpc('ledger_save_credit_transaction', {'p_data': payload}).execute()
             if response.data is not True:
@@ -831,16 +819,25 @@ def edit_credit_transaction_form(row):
     st.write(account['name'] + ' · ' + str(row.get('credit_action') or 'Credit entry'))
     if row.get('unified_occurrence_id'):
         st.caption('Changes here affect this payment only; the monthly budget rule stays unchanged.')
+    monthly_reserve = row.get('credit_budget_month') is not None
+    if monthly_reserve:
+        spent = credit_month_spent(get_all_transactions_cached(),row['credit_account_id'],row['credit_budget_month'])
+        st.caption(f"Monthly budget: \\${money(row['credit_budget_amount']):,.2f} · Charges: \\${spent:,.2f}")
     if row.get('credit_action') == 'Payment':
         if row.get('credit_applied_at'):
             st.success('This payment has been applied to the credit balance.')
         else:
             st.info('This payment is in the checking projection. The credit balance changes when you mark it complete.')
+            actual_payment = None
+            if monthly_reserve:
+                actual_payment = st.number_input('Amount actually paid ($)', min_value=0.01,max_value=999999999.99, value=float(min(max(spent,Decimal('0.01')),money(account['live_balance']))) if money(account['live_balance'])>0 else 0.01,format='%.2f',key='actual_credit_'+str(row['id']))
             if st.button('Mark credit payment complete', type='primary',
                          key='complete_credit_' + str(row['id'])):
                 try:
-                    response = conn.rpc('ledger_complete_credit_payment',
-                        {'p_id': row['id'], 'p_revision': row['check_revision']}).execute()
+                    payload = {'p_id': row['id'], 'p_revision': row['check_revision']}
+                    if monthly_reserve:
+                        payload['p_amount'] = str(money(actual_payment))
+                    response = conn.rpc('ledger_complete_monthly_credit_payment' if monthly_reserve else 'ledger_complete_credit_payment',payload).execute()
                     if response.data is not True:
                         raise RuntimeError('Completion was not confirmed.')
                     clear_transaction_caches()
@@ -850,7 +847,7 @@ def edit_credit_transaction_form(row):
                     st.error('Payment was not completed: ' + str(getattr(exc, 'message', None) or exc))
     with st.form('credit_edit_' + str(row['id'])):
         amount = st.number_input('Amount ($)', min_value=0.01, max_value=999999999.99,
-            value=float(money(row['amount'])), format='%.2f')
+            value=float(money(row['amount'])), format='%.2f',disabled=monthly_reserve and not row.get('credit_applied_at'))
         merchant = st.text_input('Merchant', value=row.get('merchant') or '')
         category = st.text_input('Category', value=row.get('category') or '')
         description = st.text_input('Description', value=row.get('description') or '')
@@ -1112,56 +1109,111 @@ def linked_current_budget_savings_category(original):
     return int(matches[0]['destination_savings_bucket_id']) if len(matches) == 1 else None
 
 
+def edit_pending_budget_transfer_form_by_id(occurrence_id):
+    require_session()
+    occurrence = next((r for r in load_budget_table('LedgerUnifiedBudgetOccurrences')
+        if int(r['id']) == int(occurrence_id)), None)
+    if not occurrence or occurrence['cancelled'] or occurrence.get('transfer_id') is not None:
+        st.error('This transfer changed. Reload the calendar.')
+        return
+    accounts = unified_account_options()
+    st.write(occurrence['name'])
+    st.caption(accounts.get(occurrence['paid_from'], occurrence['paid_from']) + ' → ' +
+               accounts.get(occurrence['paid_to'], occurrence['paid_to']))
+    st.info('This amount is in the checking projection. Savings will change only when you mark the transfer made.')
+    st.caption('Save changes / keep pending changes only this occurrence. The recurring schedule stays unchanged.')
+    buckets = load_budget_table('LedgerSavingsBuckets')
+    with st.form('pending_savings_transfer_' + str(occurrence_id)):
+        transfer_date = st.date_input('Transfer date', value=date.fromisoformat(occurrence['actual_date']))
+        amount = st.number_input('Transfer amount ($)', min_value=0.01, max_value=999999999.99,
+            value=float(money(occurrence['amount'])), format='%.2f')
+        selected = {'source': None, 'destination': None}
+        for side, ref in (('source', occurrence['paid_from']), ('destination', occurrence['paid_to'])):
+            if not ref.startswith('s:'):
+                continue
+            choices = {int(b['id']): b for b in buckets
+                if int(b['savings_account_id']) == int(ref[2:])
+                and b['active'] and b['balance'] is not None}
+            if not choices:
+                st.error('Establish an active savings category balance before making this transfer.')
+                return
+            preferred = occurrence.get(side + '_savings_bucket_id')
+            general = next((i for i, b in choices.items() if b['is_general']), None)
+            preferred = int(preferred) if preferred is not None else general
+            ids = list(choices)
+            selected[side] = st.selectbox(side.capitalize() + ' savings category', ids,
+                index=ids.index(preferred) if preferred in ids else 0,
+                format_func=lambda i: choices[i]['name'])
+        save_pending = st.form_submit_button('Save changes / keep pending')
+        made = st.form_submit_button('Mark transfer made', type='primary')
+        confirm_delete = st.checkbox('Confirm delete of this one scheduled transfer')
+        deleted = st.form_submit_button('Delete this occurrence')
+    if save_pending:
+        account_action('ledger_edit_pending_savings_occurrence', dict(
+            p_id=occurrence['id'], p_revision=occurrence['revision'],
+            p_date=transfer_date.isoformat(), p_amount=str(money(amount)),
+            p_source_bucket=selected['source'], p_destination_bucket=selected['destination']))
+    if made:
+        account_action('ledger_confirm_budget_savings_occurrence', dict(
+            p_id=occurrence['id'], p_revision=occurrence['revision'],
+            p_date=transfer_date.isoformat(), p_amount=str(money(amount)),
+            p_source_bucket=selected['source'], p_destination_bucket=selected['destination']))
+    if deleted:
+        if not confirm_delete:
+            st.error('Confirm deletion of this occurrence first.')
+        else:
+            account_action('ledger_cancel_pending_savings_occurrence', dict(
+                p_id=occurrence['id'], p_revision=occurrence['revision']))
+
+def edit_pending_budget_transfer_form(row):
+    edit_pending_budget_transfer_form_by_id(row["id"])
+
+
 @st.dialog("Edit Existing Transaction", width="medium")
 def edit_transaction_dialog():
     require_session()
-    if st.session_state.get('ledger_account') in {row['name'] for row in savings_accounts().values()}:
-        bucket_ids = {b['id'] for b in load_budget_table('LedgerSavingsBuckets')
-                      if int(b['savings_account_id']) == active_savings_id()}
-        transfers = [t for t in load_budget_table('LedgerTransfers')
-                     if t.get('source_bucket') in bucket_ids or t.get('destination_bucket') in bucket_ids]
-        if not transfers:
-            st.info('No linked transfers for this savings account. Individual budget expenses can be edited on View / Edit Budget.')
-            return
-        selected = st.selectbox('Select savings transfer', transfers,
-            format_func=lambda t: str(t['date']) + ' · $' + str(t['amount']) + ' · ' + str(t['description']))
-        transfer_form(selected)
+    transactions = get_all_transactions_cached()
+    cash_names = {k:v['name'] for k,v in cash_accounts().items()}
+    credit_names = {a['id']:a['name'] for a in load_budget_table('LedgerCreditAccounts')}
+    loan_names = {int(a['id']):a['name'] for a in load_budget_table('LedgerFederalLoans')}
+    tx_list = sorted(transactions, key=lambda row:int(row['id']), reverse=True)
+    tx_options = {}
+    for row in tx_list:
+        account_name = (credit_names.get(row.get('credit_account_id')) or
+            loan_names.get(int(row['federal_loan_id'])) if row.get('federal_loan_id') is not None
+            else credit_names.get(row.get('credit_account_id')))
+        account_name = account_name or cash_names.get(int(row.get('cash_account_id') or 1),'Checking')
+        label = (f"ID {row['id']} | {account_name} | {row.get('type','')} "
+            f"{row.get('credit_action') or ''} | {row.get('date','')} | "
+            f"{row.get('merchant','')} | ${money(row['amount']):,.2f}")
+        tx_options[label] = row
+    # Savings-only transfers and pending transfers have their own identifiers,
+    # so keep them below the transaction IDs rather than mixing ID sequences.
+    represented = {int(r['transfer_id']) for r in transactions if r.get('transfer_id') is not None}
+    for transfer in sorted(load_budget_table('LedgerTransfers'),key=lambda r:int(r['id']),reverse=True):
+        if int(transfer['id']) not in represented:
+            tx_options[f"Savings transfer {transfer['id']} | {transfer['date']} | ${money(transfer['amount']):,.2f} | {transfer.get('description','')}"] = dict(transfer,_editor_kind='transfer')
+    for plan in sorted(load_budget_table('LedgerManualSavingsPlans'),key=lambda r:int(r['id']),reverse=True):
+        if not plan.get('cancelled') and plan.get('transfer_id') is None:
+            tx_options[f"Pending savings transfer {plan['id']} | {plan['date']} | ${money(plan['amount']):,.2f} | {plan.get('description','')}"] = dict(plan,_editor_kind='manual')
+    for occurrence in sorted(load_budget_table('LedgerUnifiedBudgetOccurrences'),key=lambda r:int(r['id']),reverse=True):
+        if occurrence['transaction_type']=='Transfer' and not occurrence['cancelled'] and occurrence.get('transfer_id') is None:
+            tx_options[f"Budget savings transfer {occurrence['id']} | {occurrence['actual_date']} | {occurrence['name']} | ${money(occurrence['amount']):,.2f}"] = dict(occurrence,_editor_kind='budget-transfer')
+    if not tx_options:
+        st.info('No transactions found to edit.')
         return
-    transactions = get_transactions()
-
-    if not transactions:
-        st.info("No transactions found to edit.")
-        return
-
-    tx_list = sorted(
-        transactions,
-        key=lambda row: (
-            str(row.get("date", "")),
-            str(row.get("time", "")),
-            str(row.get("id", "")),
-        ),
-        reverse=True,
-    )
-
-    tx_options = {
-        (
-            f"ID {t['id']} | "
-            f"{t.get('date', '')} | "
-            f"{t.get('merchant', '')} | "
-            f"${float(t.get('amount', 0) or 0):,.2f}"
-        ): t
-        for t in tx_list
-    }
 
     requested_id = st.session_state.pop('calendar_edit_id', None)
     if requested_id is not None:
-        match = next((label for label, row in tx_options.items() if str(row['id']) == str(requested_id)), None)
+        match = next((label for label, row in tx_options.items() if not row.get('_editor_kind') and str(row['id']) == str(requested_id)), None)
         if match is None:
             st.error('This transaction is no longer available. Reload the calendar.')
             return
         st.session_state['edit_tx_select_dropdown'] = match
         st.session_state.pop('edit_loaded_tx_id', None)
         st.session_state.pop('edit_auto_transfer_decided', None)
+    if st.session_state.get('edit_tx_select_dropdown') not in tx_options:
+        st.session_state.pop('edit_tx_select_dropdown', None)
     selected_label = st.selectbox(
         "Select Transaction to Edit",
         list(tx_options.keys()),
@@ -1169,6 +1221,17 @@ def edit_transaction_dialog():
     )
 
     selected_tx = tx_options[selected_label]
+    extra_kind = selected_tx.get('_editor_kind')
+    if extra_kind == 'transfer':
+        transfer_form(selected_tx)
+        return
+    if extra_kind == 'manual':
+        transfer_form(selected_tx, pending=True)
+        return
+    if extra_kind == 'budget-transfer':
+        edit_pending_budget_transfer_form(selected_tx)
+        return
+    st.caption('Editing across all accounts. The saved account remains attached to this entry.')
     if selected_tx.get('transfer_id') is not None:
         transfer = next((t for t in load_budget_table('LedgerTransfers') if t['id'] == selected_tx['transfer_id']), None)
         if transfer is None: st.error('Transfer changed. Reload the page.'); return
@@ -1197,7 +1260,7 @@ def edit_transaction_dialog():
             st.session_state['edit_date'] = date.fromisoformat(str(selected_tx['date'])[:10])
             st.session_state['edit_time'] = datetime.strptime(str(selected_tx.get('time') or '00:00:00')[:8], '%H:%M:%S').time()
 
-    workflow_types = (["AMZ Card"] if active_cash_id() == 1 else []) + ["Direct", "Check"]
+    workflow_types = (["AMZ Card"] if int(selected_tx.get('cash_account_id') or 1) == 1 else []) + ["Direct", "Check"]
     if selected_tx.get('type') == 'Savings Transfer': workflow_types.append('Savings Transfer')
     if (selected_tx.get('type') == 'Direct' and selected_tx.get('direction') == 'Expense'
             and selected_tx.get('transfer_id') is None and not paid_week):
@@ -1341,7 +1404,7 @@ def edit_transaction_dialog():
             "description": description,
             "type": workflow_type,
             "direction": direction,
-            "cash_account_id": active_cash_id(),
+            "cash_account_id": int(selected_tx.get('cash_account_id') or 1),
         }
 
         if paid_week:
@@ -2332,6 +2395,12 @@ def calendar_entry_html(row):
     displayed = f"{'+' if is_income else '−'}${amount:,.2f}"
     if row.get("planned"):
         displayed += " ◦"
+    if row.get('credit_budget_month'):
+        displayed += ' · ' + str(row.get('merchant') or 'Credit payment')
+        if not row.get('credit_applied_at'):
+            spent = money(row.get('credit_month_spent'))
+            remaining = max(money(row.get('credit_budget_amount'))-spent,Decimal(0))
+            displayed += f' · Spent ${spent:,.2f} · Remaining ${remaining:,.2f}'
     description = str(row.get('description') or 'Not provided')
     merchant = str(row.get('merchant') or 'Not provided')
     tooltip = f"Amount: {displayed}\nDescription: {description}\nMerchant: {merchant}"
@@ -2470,7 +2539,8 @@ def render_editable_calendar():
                          if key.startswith('opening:') and key.split(':', 1)[1] <= first.isoformat()]
         if opening_dates:
             ensure_unified_budget_months(max(opening_dates), first)
-        transactions = get_transactions_cached()
+        all_rows = get_all_transactions_cached()
+        transactions = [dict(r,credit_month_spent=str(credit_month_spent(all_rows,r['credit_account_id'],r['credit_budget_month']))) if r.get('credit_budget_month') else r for r in get_transactions_cached()]
         reconciled = load_card_weeks()
     except Exception as exc:
         logger.exception('Unable to load editable calendar.')
@@ -3571,6 +3641,86 @@ def credit_history_rows(history, accounts):
     return result
 
 
+
+
+def credit_month_spent(rows, account_id, month):
+    return sum((money(r['amount']) for r in rows if r.get('credit_account_id')==account_id
+        and r.get('credit_action')=='Charge' and r.get('credit_spending_month')==str(month)),Decimal(0))
+
+
+CREDIT_TABLE_JS = r"""
+export default function({parentElement,data,setTriggerValue}) {
+    const root=parentElement.querySelector('.credit-account-table');
+    root.innerHTML=data.html;
+    root.onclick=e=>{
+        const button=e.target.closest('button[data-debt-account]');
+        if(button && root.contains(button)) setTriggerValue('action',{account:button.dataset.debtAccount});
+    };
+    root.querySelectorAll('input[data-whatif]').forEach(input=>{
+        const original=input.value;
+        const commit=()=>{
+            if(input.value!==original)
+                setTriggerValue('action',{whatif:input.dataset.whatif,value:input.value});
+        };
+        input.addEventListener('change',commit);
+        input.addEventListener('blur',commit);
+        input.addEventListener('keydown',e=>{if(e.key==='Enter') commit();});
+    });
+}
+"""
+credit_table_component=component('ledger_credit_account_table_'+sha256(CREDIT_TABLE_JS.encode('utf-8')).hexdigest()[:16],html='<div class="credit-account-table"></div>',js=CREDIT_TABLE_JS)
+
+
+def credit_account_table_html(rows, selected=None):
+    columns=['Account','Current balance','APR %','What-if monthly payment','Estimated time to pay off',
+        'Type','Status','Credit limit','Current usage %','Remaining credit','Payment to target use']
+    parts=['<style>.credit-account-table{overflow-x:auto}.credit-account-table table{border-collapse:collapse;width:100%;font:inherit} .credit-account-table td,.credit-account-table th{border:1px solid #899795;padding:8px;text-align:left;white-space:nowrap}.credit-account-table button{border:0;background:transparent;color:#1670c5;text-decoration:underline;cursor:pointer;font:inherit;padding:0}.credit-account-table input{width:120px;font:inherit;padding:5px;color:inherit;background:transparent;border:1px solid #899795;border-radius:4px}.credit-account-table tr.selected{background:rgba(42,131,196,.12)}</style><table><thead><tr>']
+    parts += ['<th>'+escape(c)+'</th>' for c in columns]
+    parts.append('</tr></thead><tbody>')
+    for row in rows:
+        key=escape(row['_key'],quote=True)
+        parts.append('<tr'+(' class="selected"' if selected==row['_key'] else '')+'>')
+        for c in columns:
+            value=row.get(c)
+            missing=value is None or (isinstance(value,float) and math.isnan(value))
+            if c=='Account':
+                cell=f'<button type="button" data-debt-account="{key}" aria-label="{escape("Show entries for "+str(value),quote=True)}">{escape(str(value))}</button>'
+            elif c=='What-if monthly payment':
+                val='' if missing else str(money(value))
+                cell=f'<input type="number" min="0" max="999999999.99" step="0.01" data-whatif="{key}" value="{val}" aria-label="{escape("What-if monthly payment for "+row["Account"],quote=True)}">'
+            elif missing: cell='—'
+            elif c in ('APR %','Current usage %'): cell=f'{money(value):,.2f}%'
+            elif c in ('Current balance','Credit limit','Remaining credit','Payment to target use'): cell=f'${money(value):,.2f}'
+            else: cell=escape(str(value))
+            parts.append('<td>'+cell+'</td>')
+        parts.append('</tr>')
+    parts.append('</tbody></table>')
+    return ''.join(parts)
+
+
+def render_credit_account_table(rows, whatif_values):
+    event=credit_table_component(data={'html':credit_account_table_html(rows,st.session_state.get('debt_account_filter'))},key='credit_account_table',on_action_change=lambda:None)
+    action=event.action
+    keys={r['_key'] for r in rows}
+    if action and action.get('account') in keys:
+        st.session_state['debt_account_filter']=action['account']
+        st.session_state.pop('credit_edit_id',None)
+        st.rerun()
+    elif action and action.get('whatif') in keys:
+        try:
+            raw=action.get('value','').strip()
+            amount=None if not raw else money(raw)
+            if amount is not None and (not amount.is_finite() or amount<0 or amount>=Decimal('1000000000')):
+                raise ValueError('Enter a nonnegative monthly payment.')
+            updated=dict(whatif_values)
+            if amount is None: updated.pop(action['whatif'],None)
+            else: updated[action['whatif']]=float(amount)
+            if updated!=whatif_values:
+                st.session_state['credit_whatif_payments']=updated
+                st.rerun()
+        except (ValueError,InvalidOperation) as exc:
+            st.error(str(exc))
+
 def render_credit_page():
     require_session()
     st.title('Lines of Credit')
@@ -3633,6 +3783,8 @@ def render_credit_page():
                 kind = st.selectbox('Type', kinds,
                     index=kinds.index(account['account_type']))
                 active = st.checkbox('Active', value=account['active'])
+                monthly_budget = st.checkbox('Use a monthly spending budget', value=bool(account.get('monthly_spending_budget')))
+                st.caption('Set its monthly amount and payment day in Budgeted bills and income. Checking reserves the greater of that budget and charges; payment completion applies the actual amount paid. Existing monthly occurrences keep their saved budget.')
                 limit = st.number_input('Credit limit ($)', min_value=0.0,
                     max_value=999999999.99, value=float(money(account['credit_limit']))
                     if account.get('credit_limit') is not None else None, format='%.2f')
@@ -3654,12 +3806,12 @@ def render_credit_page():
                                'Edit a dated charge or payment to correct it.')
                 manage = st.form_submit_button('Save account details')
             if manage:
-                credit_action('ledger_save_credit_profile', dict(
+                credit_action('ledger_save_credit_profile_with_budget', dict(
                     p_id=selected,p_revision=account['revision'],p_name=name,p_type=kind,
                     p_active=active,p_limit=None if limit is None else str(money(limit)),
                     p_apr=None if apr is None else str(money(apr)),
                     p_minimum=None if minimum is None else str(money(minimum)),
-                    p_opening=None if opening is None else str(money(opening))))
+                    p_opening=None if opening is None else str(money(opening)),p_monthly_budget=monthly_budget))
             if account.get('live_balance') is not None:
                 with st.form('credit_balance_correction_' + str(selected) + '_' + generation):
                     st.caption('Correct this balance to a statement figure. This does not create a charge or affect checking.')
@@ -3751,29 +3903,7 @@ def render_credit_page():
     if not frame.empty:
         frame = frame.sort_values('Current balance', ascending=False,
             na_position='last', kind='stable').reset_index(drop=True)
-    whatif_column = 'What-if monthly payment'
-    edited = st.data_editor(frame, hide_index=True, use_container_width=True,
-        num_rows='fixed', key='credit_whatif_table_' + str(st.session_state.get('credit_whatif_generation', 0)),
-        disabled=[key for key in frame.columns if key != whatif_column],
-        column_order=['Account','Current balance','APR %',whatif_column,'Estimated time to pay off',
-            'Type','Status','Credit limit','Current usage %','Remaining credit','Payment to target use'],
-        column_config={'_key':None,
-            **{key:st.column_config.NumberColumn(format='%.2f' if '%' in key else '$%.2f')
-                for key in ('Current balance','Credit limit','APR %','Current usage %',
-                    'Remaining credit','Payment to target use')},
-            whatif_column:st.column_config.NumberColumn(min_value=0.0, max_value=999999999.99, format='$%.2f')})
-    updated_whatif = dict(whatif_values)
-    for item in edited.to_dict('records'):
-        value = item[whatif_column]
-        new_amount = None if value is None or pd.isna(value) else float(money(value))
-        if new_amount is None:
-            updated_whatif.pop(item['_key'], None)
-        else:
-            updated_whatif[item['_key']] = new_amount
-    if updated_whatif != whatif_values:
-        st.session_state['credit_whatif_payments'] = updated_whatif
-        st.session_state['credit_whatif_generation'] = st.session_state.get('credit_whatif_generation', 0) + 1
-        st.rerun()
+    render_credit_account_table(frame.to_dict('records'), whatif_values)
     st.caption('Card charges raise credit owed without reducing checking. Scheduled card and loan payments affect checking on their dates and reduce debt only when marked complete. Card statement interest can be included through a balance correction; loan interest is estimated daily.')
     if entries:
         st.subheader('Dated debt entries')
@@ -3783,7 +3913,21 @@ def render_credit_page():
             return (loan_names.get(int(row['federal_loan_id']), 'Unavailable loan')
                 if row.get('federal_loan_id') is not None else
                 names.get(row.get('credit_account_id'), 'Unavailable account'))
-        ordered = sorted(entries,key=lambda e:(str(e['date']),int(e['id'])),reverse=True)
+        selected_account = st.session_state.get('debt_account_filter')
+        if selected_account:
+            title = next((r['Account'] for r in rows if r['_key']==selected_account), 'Selected account')
+            st.caption('Showing ' + title)
+            if st.button('Show all accounts'):
+                st.session_state.pop('debt_account_filter',None)
+                st.session_state.pop('credit_edit_id',None)
+                st.rerun()
+        def row_account_key(row):
+            return ('loan:' + str(row['federal_loan_id']) if row.get('federal_loan_id') is not None
+                else 'credit:' + str(row.get('credit_account_id')))
+        ordered = sorted([e for e in entries if not selected_account or row_account_key(e)==selected_account],key=lambda e:int(e['id']),reverse=True)
+        if not ordered:
+            st.info('No dated entries for this account.')
+
         st.dataframe(pd.DataFrame([{'Date':r['date'],
             'Account':debt_name(r),
             'Action':r.get('credit_action') or 'Loan payment','Amount':float(money(r['amount'])),
@@ -3792,10 +3936,10 @@ def render_credit_page():
                 or r.get('federal_loan_applied_at')
                 else 'Scheduled'} for r in ordered]),hide_index=True,use_container_width=True,
             column_config={'Amount':st.column_config.NumberColumn(format='$%.2f')})
-        choice = st.selectbox('Credit entry to edit',ordered,
+        choice = st.selectbox('Credit entry to edit',ordered, index=0 if ordered else None,
             format_func=lambda r: str(r['date'])+' · '+debt_name(r)+
                 ' · '+(r.get('credit_action') or 'Loan payment')+' · $'+str(money(r['amount'])))
-        if st.button('Edit selected credit entry'):
+        if st.button('Edit selected credit entry',disabled=not ordered):
             st.session_state['credit_edit_id'] = choice['id']
         selected_edit = next((r for r in ordered
             if r['id'] == st.session_state.get('credit_edit_id')), None)
@@ -4451,6 +4595,8 @@ elif account_selection == "Archived Accounts":
 
 elif account_selection in savings_names:
     render_savings_page()
+
+
 
 
 
