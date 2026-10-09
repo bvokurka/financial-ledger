@@ -1176,7 +1176,14 @@ def edit_transaction_dialog():
     cash_names = {k:v['name'] for k,v in cash_accounts().items()}
     credit_names = {a['id']:a['name'] for a in load_budget_table('LedgerCreditAccounts')}
     loan_names = {int(a['id']):a['name'] for a in load_budget_table('LedgerFederalLoans')}
-    tx_list = sorted(transactions, key=lambda row:int(row['id']), reverse=True)
+    requested_id = st.session_state.pop('calendar_edit_id', None)
+    today = datetime.now(LOCAL_TZ).date()
+    requested_row = next((r for r in transactions if str(r['id'])==str(requested_id)),None) if requested_id is not None else None
+    if requested_row and not editor_entry_visible(requested_row,today):
+        st.session_state['edit_show_future'] = True
+    show_future = st.checkbox('Show future transactions',value=False,key='edit_show_future')
+    tx_list = sorted((r for r in transactions if show_future or editor_entry_visible(r,today)),
+        key=lambda row:int(row['id']), reverse=True)
     tx_options = {}
     for row in tx_list:
         account_name = (credit_names.get(row.get('credit_account_id')) or
@@ -1191,19 +1198,18 @@ def edit_transaction_dialog():
     # so keep them below the transaction IDs rather than mixing ID sequences.
     represented = {int(r['transfer_id']) for r in transactions if r.get('transfer_id') is not None}
     for transfer in sorted(load_budget_table('LedgerTransfers'),key=lambda r:int(r['id']),reverse=True):
-        if int(transfer['id']) not in represented:
+        if int(transfer['id']) not in represented and (show_future or editor_entry_visible(transfer,today)):
             tx_options[f"Savings transfer {transfer['id']} | {transfer['date']} | ${money(transfer['amount']):,.2f} | {transfer.get('description','')}"] = dict(transfer,_editor_kind='transfer')
     for plan in sorted(load_budget_table('LedgerManualSavingsPlans'),key=lambda r:int(r['id']),reverse=True):
-        if not plan.get('cancelled') and plan.get('transfer_id') is None:
+        if not plan.get('cancelled') and plan.get('transfer_id') is None and (show_future or editor_entry_visible(plan,today)):
             tx_options[f"Pending savings transfer {plan['id']} | {plan['date']} | ${money(plan['amount']):,.2f} | {plan.get('description','')}"] = dict(plan,_editor_kind='manual')
     for occurrence in sorted(load_budget_table('LedgerUnifiedBudgetOccurrences'),key=lambda r:int(r['id']),reverse=True):
-        if occurrence['transaction_type']=='Transfer' and not occurrence['cancelled'] and occurrence.get('transfer_id') is None:
+        if occurrence['transaction_type']=='Transfer' and not occurrence['cancelled'] and occurrence.get('transfer_id') is None and (show_future or editor_entry_visible(occurrence,today)):
             tx_options[f"Budget savings transfer {occurrence['id']} | {occurrence['actual_date']} | {occurrence['name']} | ${money(occurrence['amount']):,.2f}"] = dict(occurrence,_editor_kind='budget-transfer')
     if not tx_options:
-        st.info('No transactions found to edit.')
+        st.info('No transactions through the current month. Enable Show future transactions to view later entries.')
         return
 
-    requested_id = st.session_state.pop('calendar_edit_id', None)
     if requested_id is not None:
         match = next((label for label, row in tx_options.items() if not row.get('_editor_kind') and str(row['id']) == str(requested_id)), None)
         if match is None:
@@ -1467,6 +1473,83 @@ def edit_transaction_dialog():
 from calendar import Calendar, monthrange
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
+
+def editor_entry_visible(row,today):
+    """Keep all of the current month, including later days; only hide later months."""
+    value=row.get('date') or row.get('actual_date') or row.get('due_date')
+    try:
+        day=date.fromisoformat(str(value)[:10])
+    except (ValueError,TypeError):
+        return True  # Leave malformed older records available for review.
+    return day<=date(today.year,today.month,monthrange(today.year,today.month)[1])
+
+
+def calendar_month_shift(first,delta):
+    offset=first.year*12+first.month-1+delta
+    year,month=divmod(offset,12)
+    return date(year,month+1,1) if 1900<=year<=2100 else None
+
+
+def compact_calendar_picker_html(first,today):
+    parts=['<style>.compact-calendar-picker{max-width:320px;font:inherit;color:inherit}.compact-calendar-picker .picker-nav{display:flex;align-items:center;gap:4px;margin-bottom:8px}.compact-calendar-picker .picker-title{flex:1;text-align:center;font-weight:600}.compact-calendar-picker button{font:inherit;color:inherit;background:transparent;border:1px solid #8a96a5;border-radius:4px;cursor:pointer;min-height:30px;padding:3px 5px}.compact-calendar-picker button:disabled{opacity:.3;cursor:default}.compact-calendar-picker button:focus-visible{outline:2px solid #1370c3;outline-offset:1px}.compact-calendar-picker .picker-days{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:3px}.compact-calendar-picker .picker-weekday{text-align:center;font-size:.8rem}.compact-calendar-picker .picker-outside{opacity:.45}.compact-calendar-picker .picker-today{border:2px solid #1670c5;font-weight:700}</style><div class="picker-nav">']
+    for delta,label,symbol in ((-12,'Previous year','«'),(-1,'Previous month','‹')):
+        target=calendar_month_shift(first,delta)
+        parts.append(f'<button type="button" aria-label="{label}" title="{label}"'+(f' data-picker-month="{target.isoformat()}"' if target else ' disabled')+f'>{symbol}</button>')
+    parts.append('<span class="picker-title">'+first.strftime('%B %Y')+'</span>')
+    for delta,label,symbol in ((1,'Next month','›'),(12,'Next year','»')):
+        target=calendar_month_shift(first,delta)
+        parts.append(f'<button type="button" aria-label="{label}" title="{label}"'+(f' data-picker-month="{target.isoformat()}"' if target else ' disabled')+f'>{symbol}</button>')
+    parts.append('</div><div class="picker-days">')
+    parts+=['<span class="picker-weekday">'+day+'</span>' for day in ('Su','Mo','Tu','We','Th','Fr','Sa')]
+    for week in Calendar(firstweekday=6).monthdatescalendar(first.year,first.month):
+        for day in week:
+            classes=('picker-outside ' if day.month!=first.month else '')+('picker-today' if day==today else '')
+            allowed=1900<=day.year<=2100
+            parts.append(f'<button type="button" class="{classes.strip()}" aria-label="Show {day:%B %d, %Y}"'+(f' data-picker-month="{day.isoformat()}"' if allowed else ' disabled')+f'>{day.day}</button>')
+    parts.append('</div>')
+    return ''.join(parts)
+
+
+COMPACT_CALENDAR_PICKER_JS=r"""
+export default function({parentElement,data,setTriggerValue}) {
+    const root=parentElement.querySelector('.compact-calendar-picker');
+    root.innerHTML=data.html;
+    root.onclick=e=>{
+        const button=e.target.closest('button[data-picker-month]');
+        if(button && root.contains(button) && !button.disabled)
+            setTriggerValue('action',{month:button.dataset.pickerMonth});
+    };
+}
+"""
+compact_calendar_picker_component=component('ledger_compact_calendar_picker_'+sha256(COMPACT_CALENDAR_PICKER_JS.encode()).hexdigest()[:16],html='<div class="compact-calendar-picker"></div>',js=COMPACT_CALENDAR_PICKER_JS)
+
+
+def calendar_month_picker():
+    today=datetime.now(LOCAL_TZ).date()
+    saved=st.session_state.get('calendar_picker_month')
+    if saved is None:
+        year=int(st.session_state.get('calendar_year',today.year))
+        month=int(st.session_state.get('calendar_month',today.month))
+        first=date(year,month,1) if 1900<=year<=2100 and 1<=month<=12 else today.replace(day=1)
+    else:
+        try: first=date.fromisoformat(saved).replace(day=1)
+        except (ValueError,TypeError): first=today.replace(day=1)
+        if not 1900<=first.year<=2100: first=today.replace(day=1)
+    with st.popover('Choose month',icon='📅'):
+        action=compact_calendar_picker_component(data={'html':compact_calendar_picker_html(first,today)},key='calendar_month_picker',on_action_change=lambda:None).action
+        if isinstance(action,dict) and action.get('month'):
+            try:
+                selected=date.fromisoformat(str(action['month'])).replace(day=1)
+                if not 1900<=selected.year<=2100: raise ValueError('Choose a supported year.')
+            except ValueError:
+                st.error('Choose a date from the calendar picker.')
+            else:
+                if selected!=first:
+                    st.session_state['calendar_picker_month']=selected.isoformat()
+                    st.rerun()
+    return first
+
 
 def month_year_picker(label, key):
     """Default to the actual local month; preserve a manual choice during this session."""
@@ -2395,15 +2478,14 @@ def calendar_entry_html(row):
     displayed = f"{'+' if is_income else '−'}${amount:,.2f}"
     if row.get("planned"):
         displayed += " ◦"
-    if row.get('credit_budget_month'):
-        displayed += ' · ' + str(row.get('merchant') or 'Credit payment')
-        if not row.get('credit_applied_at'):
-            spent = money(row.get('credit_month_spent'))
-            remaining = max(money(row.get('credit_budget_amount'))-spent,Decimal(0))
-            displayed += f' · Spent ${spent:,.2f} · Remaining ${remaining:,.2f}'
     description = str(row.get('description') or 'Not provided')
     merchant = str(row.get('merchant') or 'Not provided')
     tooltip = f"Amount: {displayed}\nDescription: {description}\nMerchant: {merchant}"
+    if row.get('credit_budget_month'):
+        tooltip += f"\nMonthly budget: ${money(row['credit_budget_amount']):,.2f}"
+        spent = money(row.get('credit_month_spent',0))
+        remaining = max(money(row['credit_budget_amount'])-spent,Decimal(0))
+        tooltip += f"\nSpent: ${spent:,.2f}\nRemaining budget: ${remaining:,.2f}"
     if row.get('pending_transfer_id') is not None:
         return (f'<button type="button" data-pending-transfer="{escape(str(row["pending_transfer_id"]), quote=True)}" '
                 f'title="{escape(tooltip, quote=True)}" aria-label="{escape("Confirm transfer: " + tooltip, quote=True)}" '
@@ -2450,7 +2532,7 @@ def calendar_entry_html(row):
 
 
 def calendar_grid_html(first, balances, direct, settings, show_cards=True, markers=None):
-    """One CSS grid gives every day the height required by the busiest day."""
+    """Uniform day cells with compact horizontal transaction rows."""
     markers = markers or {}
     cells = []
     for week in Calendar(firstweekday=6).monthdatescalendar(first.year, first.month):
@@ -2469,6 +2551,7 @@ def calendar_grid_html(first, balances, direct, settings, show_cards=True, marke
                     'merchant': 'Credit card payment',
                     'description': f"Reconciled budget week ending {payment['week_ending']}",
                 }))
+            content = ['<div class="ledger-amounts">' + ''.join('<div class="ledger-amount">'+entry+'</div>' for entry in content) + '</div>']
             if show_cards and day.weekday() == 5:
                 if values['completed']:
                     if values['surplus'] > 0:
@@ -2497,17 +2580,22 @@ def calendar_grid_html(first, balances, direct, settings, show_cards=True, marke
     .ledger-weekdays,.ledger-days {display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px;}
     .ledger-weekdays {font-weight:600;margin-bottom:6px;text-align:center;}
     .ledger-days {grid-auto-rows:1fr;}
-    .ledger-day {display:flex;flex-direction:column;min-height:240px;min-width:0;border:1px solid #8a96a5;border-radius:6px;overflow:hidden;}
-    .ledger-day header {display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:7px;border-bottom:1px solid #8a96a5;background:rgba(127,150,180,.12);}
+    .ledger-day {display:flex;flex-direction:column;min-height:130px;min-width:0;border:1px solid #8a96a5;border-radius:6px;overflow:hidden;}
+    .ledger-day header {display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:5px;border-bottom:1px solid #8a96a5;background:rgba(127,150,180,.12);}
     .ledger-day header.ledger-header-low {background:#ffed9e;border-top:5px solid #d5a500;color:#302500;}
     .ledger-day header.ledger-header-negative {background:#ffd4d4;border-top:5px solid #c12626;color:#510f0f;}
-    .ledger-date {display:inline-flex;align-items:center;justify-content:center;min-width:30px;min-height:30px;padding:2px 5px;box-sizing:border-box;border:1px solid #8a96a5;border-radius:3px;background:rgba(127,150,180,.2);font-weight:700;}
+    .ledger-date {display:inline-flex;align-items:center;justify-content:center;min-width:26px;min-height:26px;padding:2px 5px;box-sizing:border-box;border:1px solid #8a96a5;border-radius:3px;background:rgba(127,150,180,.2);font-weight:700;}
     button.ledger-date {color:inherit;cursor:pointer;font:inherit;font-weight:700;}
     .ledger-date-green {background:#36b75e!important;color:#092b13!important;border-color:#287e42!important;}
     .ledger-date-yellow {background:#f7d75c!important;color:#392c00!important;border-color:#b79622!important;}
     .ledger-balance {font-weight:600;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;}
-    .ledger-body {padding:8px;flex:1;overflow-wrap:anywhere;}
-    .ledger-day footer {padding:7px;border-top:1px solid #8a96a5;background:rgba(127,150,180,.12);font-size:.85rem;font-variant-numeric:tabular-nums;}
+    .ledger-body {padding:6px;flex:1;overflow-wrap:anywhere;}
+    .ledger-amounts {display:flex;flex-wrap:wrap;align-items:flex-start;gap:3px 8px;}
+    .ledger-amount {flex:0 0 auto;max-width:100%;white-space:nowrap;}
+    .ledger-amount>button,.ledger-amount>span {display:inline-flex!important;width:auto!important;align-items:center;min-height:26px;box-sizing:border-box;padding:3px 2px!important;margin:0!important;}
+    .ledger-amount>button:focus-visible {outline:2px solid #1370c3;outline-offset:2px;}
+    .ledger-card-spent,.ledger-card-budget,.ledger-note {box-sizing:border-box;width:100%;}
+    .ledger-day footer {padding:5px;border-top:1px solid #8a96a5;background:rgba(127,150,180,.12);font-size:.85rem;font-variant-numeric:tabular-nums;}
     .ledger-card-spent {background:#00b4e6;color:#002b36;padding:6px;border-radius:3px;font-weight:600;margin-top:6px;}
     .ledger-card-budget {display:block;width:100%;border:0;background:transparent;color:#d14343;text-align:left;padding:3px 0;font:inherit;cursor:pointer;text-decoration:underline;}
     .ledger-card-budget:focus-visible {outline:2px solid #1370c3;outline-offset:2px;}
@@ -2530,7 +2618,7 @@ def render_editable_calendar():
     with st.container(key='calendar_heading'):
         st.title(cash_accounts()[active_cash_id()]['name'] + ': Cash Flow Calendar')
         summary_slot = st.empty()
-        first = month_year_picker('Calendar', 'calendar')
+        first = calendar_month_picker()
     last = date(first.year, first.month, monthrange(first.year, first.month)[1])
     summary_slot.html('<div class="ledger-calendar-summary"><h2>' + first.strftime('%B %Y') + '</h2></div>')
     try:
@@ -4532,6 +4620,7 @@ with st.sidebar.container(key='sidebar_add_transaction'):
 if st.sidebar.button('✏️ Edit Transaction', use_container_width=True,
     disabled=st.session_state.get('ledger_view') in ('Archived Accounts','Manage Account')):
     st.session_state.pop('edit_loaded_tx_id', None)
+    st.session_state['edit_show_future'] = False
     edit_transaction_dialog()
 if st.sidebar.button('Transaction Categories', use_container_width=True):
     st.session_state['ledger_view'] = 'Categories'
@@ -4595,6 +4684,8 @@ elif account_selection == "Archived Accounts":
 
 elif account_selection in savings_names:
     render_savings_page()
+
+
 
 
 
