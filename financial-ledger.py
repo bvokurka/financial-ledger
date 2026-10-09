@@ -183,6 +183,139 @@ st.markdown(
 )
 
 
+TRACK_FONT_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Roboto+Condensed:ital,wght@0,400;0,500;0,600;1,700;1,800&display=swap');
+"""
+
+TRACK_APP_CSS = TRACK_FONT_CSS + """
+[data-testid="stAppViewContainer"], [data-testid="stSidebar"], [role="dialog"] {
+    font-family:'Roboto Condensed','Arial Narrow',Arial,sans-serif;
+}
+[data-testid="stAppViewContainer"] h1, [data-testid="stAppViewContainer"] h2,
+[data-testid="stAppViewContainer"] h3, [role="dialog"] h1, [role="dialog"] h2 {
+    font-family:'Roboto Condensed','Arial Narrow',Arial,sans-serif;
+    font-style:italic;font-weight:700;letter-spacing:.015em;
+}
+[data-testid="stButton"] button, [data-testid="stFormSubmitButton"] button,
+[data-testid="stPopover"] button, [data-testid="stTextInput"] input,
+[data-testid="stNumberInput"] input, [data-testid="stTextArea"] textarea,
+[data-baseweb="select"]>div, [data-baseweb="input"], [data-testid="stExpander"] {
+    border-radius:0!important;
+}
+[data-testid="stButton"] button, [data-testid="stFormSubmitButton"] button,
+[data-testid="stPopover"] button, [data-testid="stTextInput"] input,
+[data-testid="stNumberInput"] input, [data-testid="stTextArea"] textarea {
+    font-family:'Roboto Condensed','Arial Narrow',Arial,sans-serif;
+}
+[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {gap:.6rem;}
+[data-testid="stSidebar"] button {min-height:2.1rem;}
+.st-key-calendar_heading {
+    background:#172537;color:#f1f6ff;border-left:5px solid #237de1;
+    padding:10px 12px;border-radius:0;margin-bottom:.25rem;
+}
+.st-key-calendar_heading h1 {font-size:1.7rem!important;color:#f1f6ff!important;text-transform:uppercase;}
+.st-key-calendar_heading h2 {color:#f1f6ff!important;text-transform:uppercase;}
+.st-key-calendar_heading .ledger-calendar-summary {gap:1.4rem!important;}
+.st-key-calendar_heading .summary-value {font-style:italic;font-weight:700;}
+.st-key-calendar_heading button {
+    background:#24394f;color:#f1f6ff;border-color:#8198b1;border-radius:0;
+}
+"""
+
+TRACK_LEDGER_CSS = """
+.ledger-interactive-root {
+    font-family:'Roboto Condensed','Arial Narrow',Arial,sans-serif;
+}
+.ledger-interactive-root button, .ledger-interactive-root table,
+.ledger-interactive-root input, .ledger-interactive-root select {
+    font-family:'Roboto Condensed','Arial Narrow',Arial,sans-serif;
+}
+.ledger-interactive-root button {border-radius:0!important;}
+.ledger-calendar {font-size:14px;}
+.ledger-days {gap:4px;}
+.ledger-day {border-radius:0;min-height:120px;}
+.ledger-day header {padding:4px 5px;}
+.ledger-day header:not(.ledger-header-low):not(.ledger-header-negative) {
+    border-top:3px solid #237de1;
+}
+.ledger-weekdays {font-weight:600;font-style:italic;letter-spacing:.025em;text-transform:uppercase;}
+.ledger-date {border-radius:0;min-width:24px;min-height:24px;font-style:italic;}
+.ledger-balance {font-style:italic;font-weight:700;}
+.ledger-body {padding:5px;}
+.ledger-amounts {gap:2px 7px;}
+.ledger-amount>button,.ledger-amount>span {
+    font-family:'Roboto Condensed','Arial Narrow',Arial,sans-serif!important;
+    font-style:italic!important;font-weight:700!important;min-height:24px;
+}
+.ledger-card-spent {border-radius:0;font-style:italic;font-weight:700;}
+.ledger-card-budget {font-style:italic;font-weight:700;}
+.ledger-note {font-style:normal;}
+.ledger-day footer {padding:4px 5px;}
+"""
+
+TRACK_CREDIT_CSS = """
+.credit-account-table, .credit-account-table button, .credit-account-table input {
+    font-family:'Roboto Condensed','Arial Narrow',Arial,sans-serif;
+}
+.credit-account-table button, .credit-account-table input {border-radius:0!important;}
+"""
+
+TRACK_PICKER_CSS = """
+.compact-calendar-picker, .compact-calendar-picker button {
+    font-family:'Roboto Condensed','Arial Narrow',Arial,sans-serif;
+}
+.compact-calendar-picker button {border-radius:0!important;}
+.compact-calendar-picker .picker-title {font-style:italic;font-weight:700;}
+"""
+
+# One entry per named appearance. Future themes add their styles here;
+# no financial actions or component event handlers belong in this registry.
+LEDGER_APPEARANCES = {
+    'Classic': {'slug':'classic','app_css':'','component_css':{}},
+    'Track': {'slug':'track','app_css':TRACK_APP_CSS,
+              'component_css':{'ledger':TRACK_LEDGER_CSS,
+                               'credit':TRACK_CREDIT_CSS,
+                               'picker':TRACK_PICKER_CSS}},
+}
+
+
+def selected_appearance():
+    name=st.session_state.get('ledger_appearance','Track')
+    return LEDGER_APPEARANCES.get(name,LEDGER_APPEARANCES['Classic'])
+
+
+def remember_appearance():
+    # A presentation-only URL preference survives refresh and bookmarked links.
+    st.query_params['appearance']=selected_appearance()['slug']
+
+
+def render_appearance_controls():
+    if st.session_state.get('ledger_appearance') not in LEDGER_APPEARANCES:
+        slug=st.query_params.get('appearance','track')
+        st.session_state['ledger_appearance']=next(
+            (name for name,theme in LEDGER_APPEARANCES.items() if theme['slug']==slug),'Classic')
+    st.sidebar.selectbox('Appearance',list(LEDGER_APPEARANCES),key='ledger_appearance',
+        on_change=remember_appearance)
+    # Always replace the style slot, including when restoring Classic.
+    st.html('<style>'+selected_appearance()['app_css']+'</style>')
+
+
+def appearance_markup(markup,area):
+    css=selected_appearance()['component_css'].get(area,'')
+    return markup+'<style>'+css+'</style>' if css else markup
+
+
+def themed_component(renderer,area,options):
+    # Copy only presentation data; actions, keys, callbacks and payloads remain intact.
+    options=dict(options)
+    data=dict(options.get('data') or {})
+    data['html']=appearance_markup(str(data.get('html','')),area)
+    options['data']=data
+    return renderer(**options)
+
+
+render_appearance_controls()
+
 # ============================================================
 # DATABASE / CACHE HELPERS
 # ============================================================
@@ -1522,7 +1655,11 @@ export default function({parentElement,data,setTriggerValue}) {
     };
 }
 """
-compact_calendar_picker_component=component('ledger_compact_calendar_picker_'+sha256(COMPACT_CALENDAR_PICKER_JS.encode()).hexdigest()[:16],html='<div class="compact-calendar-picker"></div>',js=COMPACT_CALENDAR_PICKER_JS)
+compact_calendar_picker_renderer=component('ledger_compact_calendar_picker_'+sha256(COMPACT_CALENDAR_PICKER_JS.encode()).hexdigest()[:16],html='<div class="compact-calendar-picker"></div>',js=COMPACT_CALENDAR_PICKER_JS)
+
+
+def compact_calendar_picker_component(**options):
+    return themed_component(compact_calendar_picker_renderer,'picker',options)
 
 
 def calendar_month_picker():
@@ -1754,7 +1891,7 @@ export default function({parentElement, data, setTriggerValue}) {
     };
 }
 """
-ledger_interaction = component('ledger_interaction',
+ledger_interaction_renderer = component('ledger_interaction',
     html='<div class="ledger-interactive-root"></div>', js=LEDGER_INTERACTION_JS)
 
 
@@ -1855,6 +1992,10 @@ def render_transaction_completion(row):
         except Exception:
             clear_transaction_caches()
             st.error('Completion could not be confirmed. Close and reopen the transaction before retrying.')
+
+
+def ledger_interaction(**options):
+    return themed_component(ledger_interaction_renderer,'ledger',options)
 
 
 def render_check_calendar(first, balances, direct, settings):
@@ -3756,7 +3897,7 @@ export default function({parentElement,data,setTriggerValue}) {
     });
 }
 """
-credit_table_component=component('ledger_credit_account_table_'+sha256(CREDIT_TABLE_JS.encode('utf-8')).hexdigest()[:16],html='<div class="credit-account-table"></div>',js=CREDIT_TABLE_JS)
+credit_table_renderer=component('ledger_credit_account_table_'+sha256(CREDIT_TABLE_JS.encode('utf-8')).hexdigest()[:16],html='<div class="credit-account-table"></div>',js=CREDIT_TABLE_JS)
 
 
 def credit_account_table_html(rows, selected=None):
@@ -3784,6 +3925,10 @@ def credit_account_table_html(rows, selected=None):
         parts.append('</tr>')
     parts.append('</tbody></table>')
     return ''.join(parts)
+
+
+def credit_table_component(**options):
+    return themed_component(credit_table_renderer,'credit',options)
 
 
 def render_credit_account_table(rows, whatif_values):
