@@ -178,6 +178,10 @@ def apply_appearance_styles():
     st.html('<style>'+selected_appearance()['app_css']+'</style>')
 
 
+TRACK_APP_CSS += '\n/* Square the visible inner surfaces, including newer Base Web nesting. */\n:is([data-testid="stSelectbox"], [data-testid="stMultiselect"],\n    [data-testid="stDateInput"], [data-testid="stTimeInput"],\n    [data-testid="stTextInput"], [data-testid="stNumberInput"],\n    [data-testid="stTextArea"], [data-testid="stCheckbox"],\n    [data-testid="stDataFrame"], [data-testid="stDataEditor"],\n    [data-baseweb="select"], [data-baseweb="input"],\n    [data-baseweb="base-input"], [data-baseweb="datepicker"],\n    [data-baseweb="timepicker"], [data-baseweb="popover"],\n    [data-baseweb="checkbox"], [data-baseweb="menu"]),\n:is([data-testid="stSelectbox"], [data-testid="stMultiselect"],\n    [data-testid="stDateInput"], [data-testid="stTimeInput"],\n    [data-testid="stTextInput"], [data-testid="stNumberInput"],\n    [data-testid="stTextArea"], [data-testid="stCheckbox"],\n    [data-testid="stDataFrame"], [data-testid="stDataEditor"],\n    [data-baseweb="select"], [data-baseweb="input"],\n    [data-baseweb="base-input"], [data-baseweb="datepicker"],\n    [data-baseweb="timepicker"], [data-baseweb="popover"],\n    [data-baseweb="checkbox"], [data-baseweb="menu"]) * {\n    border-radius:0!important;\n}\n'
+
+TRACK_APP_CSS += '\n/* React Aria dialog backing frame and dropdown popup surfaces. */\n[data-testid="stDialog"], [data-testid="stDialog"]>div,\n[data-testid="stDialog"] button,\n[role="listbox"], [role="listbox"] * {\n    border-radius:0!important;\n}\n'
+
 # One entry per named appearance. Future themes add their styles here;
 # no financial actions or component event handlers belong in this registry.
 LEDGER_APPEARANCES = {
@@ -4806,6 +4810,11 @@ if account_selection in account_names:
 elif account_selection in savings_names:
     st.session_state['savings_account_id'] = savings_names[account_selection]
 
+if st.sidebar.button('Manage selected account', use_container_width=True):
+    st.session_state['ledger_view'] = 'Manage Account'
+    st.session_state.pop('account_confirm_stage', None)
+if st.sidebar.button('Archived Accounts', use_container_width=True):
+    st.session_state['ledger_view'] = 'Archived Accounts'
 with st.sidebar.expander('Add new account'):
     with st.form('create_financial_account'):
         account_type = st.selectbox('Account type', ['Checking', 'Savings'])
@@ -4817,11 +4826,6 @@ with st.sidebar.expander('Add new account'):
         else:
             account_action('ledger_create_savings_account', {'p_name': name})
 
-if st.sidebar.button('Manage selected account', use_container_width=True):
-    st.session_state['ledger_view'] = 'Manage Account'
-    st.session_state.pop('account_confirm_stage', None)
-if st.sidebar.button('Archived Accounts', use_container_width=True):
-    st.session_state['ledger_view'] = 'Archived Accounts'
 st.sidebar.divider()
 
 with st.sidebar.container(key='sidebar_add_transaction'):
@@ -4896,9 +4900,6 @@ elif account_selection == "Archived Accounts":
 
 elif account_selection in savings_names:
     render_savings_page()
-
-
-
 
 
 
