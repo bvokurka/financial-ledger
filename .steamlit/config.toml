@@ -1,1 +1,7 @@
+[theme]
+font = "Ledger UI"
+headingFont = "Ledger UI"
 
+[theme.sidebar]
+font = "Ledger UI"
+headingFont = "Ledger UI"
