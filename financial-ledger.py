@@ -168,9 +168,10 @@ TRACK_PICKER_CSS += """
 
 def initialize_appearance():
     if st.session_state.get('ledger_appearance') not in LEDGER_APPEARANCES:
-        slug=st.query_params.get('appearance','track')
-        st.session_state['ledger_appearance']=next(
-            (name for name,theme in LEDGER_APPEARANCES.items() if theme['slug']==slug),'Classic')
+        slug = st.query_params.get('appearance', 'track-red-bull')
+        st.session_state['ledger_appearance'] = next(
+            (name for name, theme in LEDGER_APPEARANCES.items() if theme['slug'] == slug),
+            'Track — Red Bull')
 
 
 def apply_appearance_styles():
@@ -194,8 +195,8 @@ LEDGER_APPEARANCES = {
 
 
 def selected_appearance():
-    name=st.session_state.get('ledger_appearance','Track')
-    return LEDGER_APPEARANCES.get(name,LEDGER_APPEARANCES['Classic'])
+    name = st.session_state.get('ledger_appearance', 'Track — Red Bull')
+    return LEDGER_APPEARANCES.get(name, LEDGER_APPEARANCES['Track — Red Bull'])
 
 
 def remember_appearance():
@@ -651,43 +652,17 @@ def get_existing_categories() -> list[str]:
 
 
 def get_merchant_category_map() -> dict[str, str]:
-    """
-    Return merchant -> most recently used category.
-
-    The source rows are sorted newest-first by date and time, then the first
-    occurrence for each merchant is retained. Matching is case-insensitive.
-    """
-    transactions = get_transactions_cached()
-
+    """Use the latest dated merchant category across the ledger, with ID as a tie-breaker."""
     rows = []
-    for row in transactions:
-        merchant = row.get("merchant")
-        category = row.get("category")
-
-        if not merchant or not category:
-            continue
-
-        rows.append(
-            {
-                "merchant": str(merchant).strip(),
-                "category": str(category).strip(),
-                "date": str(row.get("date", "")),
-                "time": str(row.get("time", "")),
-            }
-        )
-
-    rows.sort(
-        key=lambda item: (item["date"], item["time"]),
-        reverse=True,
-    )
-
+    for row in get_all_transactions_cached():
+        merchant = str(row.get('merchant') or '').strip()
+        category = str(row.get('category') or '').strip()
+        if merchant and category:
+            rows.append((str(row.get('date') or ''), str(row.get('time') or ''),
+                         int(row.get('id') or 0), merchant.casefold(), category))
     mapping: dict[str, str] = {}
-
-    for row in rows:
-        merchant_key = row["merchant"].casefold()
-        if merchant_key not in mapping:
-            mapping[merchant_key] = row["category"]
-
+    for _, _, _, merchant, category in sorted(rows, reverse=True):
+        mapping.setdefault(merchant, category)
     return mapping
 
 
@@ -1005,6 +980,24 @@ def merchant_selector(prefix: str, current_merchant: str = "") -> str:
 # ============================================================
 
 
+def sync_new_transaction_category(merchant_name, prefix, categories, *, fallback_to_first=False):
+    """Apply a merchant default once per selection; preserve subsequent user overrides."""
+    signature = str(merchant_name or '').strip().casefold()
+    signature_key = f'{prefix}_last_merchant_signature'
+    if (st.session_state.get(signature_key) == signature
+            and f'{prefix}_category' in st.session_state):
+        return
+    latest = get_last_category_for_merchant(merchant_name)
+    active_names = {str(name).strip().casefold(): name for name in categories}
+    category = active_names.get(str(latest or '').strip().casefold())
+    if category is not None:
+        st.session_state[f'{prefix}_category'] = category
+    elif fallback_to_first and categories:
+        st.session_state[f'{prefix}_category'] = categories[0]
+    st.session_state[f'{prefix}_custom_category'] = ''
+    st.session_state[signature_key] = signature
+
+
 def category_selector(
     merchant_name: str,
     prefix: str,
@@ -1141,6 +1134,7 @@ def add_credit_transaction_form():
     categories = list(get_existing_categories())
     if 'Credit payment' not in categories:
         categories.append('Credit payment')
+    sync_new_transaction_category(merchant, 'new_credit', categories)
     category = st.selectbox('Category', sorted(categories, key=str.casefold),
         index=None, placeholder='Select or enter a category', accept_new_options=True,
         key='new_credit_category')
@@ -1346,21 +1340,8 @@ def add_transaction_dialog():
 
     merchant_name = merchant_selector("add")
 
-    # Apply category defaults only when the accepted merchant changes.
-    merchant_signature = str(merchant_name or "").strip().casefold()
-    previous_signature = st.session_state.get("add_last_merchant_signature")
-
-    if previous_signature != merchant_signature:
-        latest_category = get_last_category_for_merchant(merchant_name)
-        categories = list(get_existing_categories())
-
-        if latest_category and latest_category in categories:
-            st.session_state["add_category"] = latest_category
-        elif categories:
-            st.session_state["add_category"] = categories[0]
-
-        st.session_state["add_custom_category"] = ""
-        st.session_state["add_last_merchant_signature"] = merchant_signature
+    sync_new_transaction_category(
+        merchant_name, 'add', list(get_existing_categories()), fallback_to_first=True)
 
     selected_cat_option, custom_category = category_selector(
         merchant_name=merchant_name,
@@ -5062,10 +5043,6 @@ elif account_selection == "Archived Accounts":
 
 elif account_selection in savings_names:
     render_savings_page()
-
-
-
-
 
 
 
