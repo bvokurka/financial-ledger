@@ -3642,7 +3642,7 @@ def render_budget_snapshot(rules, paydays, first):
         remaining.metric('Combined budget left', f'${snapshot["remaining"]:,.2f}')
         st.caption('Moving money between your checking accounts does not add money to the household. '
                    'Those transfers are excluded here; transfers to savings remain part of checking outflow.')
-    st.caption('Uses included recurring items and this month’s saved payday amounts. '
+    st.caption('Uses included recurring items and the selected month’s saved payday amounts. '
                'One-off calendar edits and actual spending are separate. Display filters do not change these totals.')
     if snapshot['unset_paydays']:
         st.warning(f'{snapshot["unset_paydays"]} included payday amount(s) are unset and excluded from income totals.')
@@ -3746,10 +3746,27 @@ def render_budget_rule_table(rows, inclusion):
 def render_budget_page():
     require_session()
     st.title('View / Edit Budget')
-    selected_month = datetime.now(LOCAL_TZ).date().replace(day=1)
+    current_month = datetime.now(LOCAL_TZ).date().replace(day=1)
+    month_col, year_col, current_col = st.columns([2, 1, 1], vertical_alignment='bottom')
+    with current_col:
+        use_current_month = st.button('Current month', key='budget_preview_current')
+    if use_current_month:
+        st.session_state['budget_preview_month'] = current_month.month
+        st.session_state['budget_preview_year'] = current_month.year
+    with month_col:
+        preview_month = st.selectbox('Budget month', list(range(1, 13)),
+            index=current_month.month - 1,
+            format_func=lambda value: date(2000, value, 1).strftime('%B'),
+            key='budget_preview_month')
+    with year_col:
+        preview_year = st.number_input('Budget year', min_value=1900, max_value=2100,
+            value=current_month.year, step=1, key='budget_preview_year')
+    selected_month = date(int(preview_year), int(preview_month), 1)
+    st.caption('Choose a month to preview its totals using your current recurring budget rules. '
+               'Editing a budget item still changes its recurring rule; individual dates are edited on the calendar.')
     try:
         response = conn.rpc('ledger_prepare_unified_budget_month',
-            {'p_month': selected_month.isoformat()}).execute()
+            {'p_month': current_month.isoformat()}).execute()
         if response.data is not True:
             raise RuntimeError('The budget month was not prepared.')
         rules = load_budget_table('LedgerUnifiedBudgetRules')
@@ -3791,11 +3808,11 @@ def render_budget_page():
     st.caption('Amount each time is one payment. Monthly total counts its repeats in ' + selected_month.strftime('%B') + '. Excluded items contribute $0.00. Click an ID# to edit; payday income is managed below.')
     selected_id = render_budget_rule_table(rows, inclusion)
     if st.button('Add budget item', type='primary'):
-        unified_budget_item_dialog(None, selected_month)
+        unified_budget_item_dialog(None, current_month)
     elif selected_id is not None:
         selected_rule = next((r for r in visible if int(r['id']) == selected_id), None)
         if selected_rule:
-            unified_budget_item_dialog(selected_rule, selected_month)
+            unified_budget_item_dialog(selected_rule, current_month)
     savings_entries = [o for o in occurrences if not o['cancelled']
         and o['paid_from'].startswith('s:') and o['transaction_type'] != 'Transfer']
     if savings_entries:
