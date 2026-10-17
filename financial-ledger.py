@@ -3562,21 +3562,24 @@ def visible_current_budget_versions(rules):
 
 """Read-only monthly budget summaries and a theme-aware budget table."""
 
-def monthly_budget_snapshot(rules, paydays, checking, first):
-    """Current recurring budget for the actual month; internal cash transfers cancel."""
+def budget_rule_monthly_amount(rule, first):
+    """Use the same repeat count in the table and account summaries."""
     last = first.replace(day=monthrange(first.year, first.month)[1])
-    by_account = {int(i): dict(income=Decimal(0), expenses=Decimal(0)) for i in checking}
+    if not rule['enabled'] or str(rule['effective_from'])[:10] > last.isoformat():
+        return Decimal(0)
+    count = (sum(date(first.year, first.month, n).weekday() == int(rule['weekday'])
+                 for n in range(1, last.day + 1)) if rule['schedule'] == 'Weekly' else 1)
+    return money(rule['amount']) * count
+
+def monthly_budget_snapshot(rules, paydays, checking, first):
+    """Per-account cash flow includes transfers; combined figures cancel internal moves."""
+    last = first.replace(day=monthrange(first.year, first.month)[1])
+    by_account = {int(i): dict(income=Decimal(0), expenses=Decimal(0),
+                            transfer_in=Decimal(0), transfer_out=Decimal(0)) for i in checking}
     total_income = Decimal(0)
     total_expenses = Decimal(0)
     for rule in visible_current_budget_versions(rules):
-        if not rule['enabled'] or str(rule['effective_from'])[:10] > last.isoformat():
-            continue
-        if rule['schedule'] == 'Weekly':
-            count = sum(date(first.year, first.month, n).weekday() == int(rule['weekday'])
-                        for n in range(1, last.day + 1))
-        else:
-            count = 1  # Included monthly and As needed rows follow the existing monthly schedule.
-        amount = money(rule['amount']) * count
+        amount = budget_rule_monthly_amount(rule, first)
         source = str(rule['paid_from'])
         destination = str(rule['paid_to']) if rule['transaction_type'] == 'Transfer' else ''
         source_id = int(source[2:]) if source.startswith('c:') else None
@@ -3585,10 +3588,12 @@ def monthly_budget_snapshot(rules, paydays, checking, first):
             by_account[source_id]['expenses'] += amount
         if destination_id in by_account:
             by_account[destination_id]['income'] += amount
-        # Moving between two checking accounts is not new income or external outflow.
-        if source_id in by_account and destination_id not in by_account:
+        if source_id in by_account and destination_id in by_account:
+            by_account[source_id]['transfer_out'] += amount
+            by_account[destination_id]['transfer_in'] += amount
+        elif source_id in by_account:
             total_expenses += amount
-        if destination_id in by_account and source_id not in by_account:
+        elif destination_id in by_account:
             total_income += amount
     unset = 0
     for row in paydays:
@@ -3610,19 +3615,35 @@ def monthly_budget_snapshot(rules, paydays, checking, first):
 def render_budget_snapshot(rules, paydays, first):
     checking = cash_accounts()
     snapshot = monthly_budget_snapshot(rules, paydays, checking, first)
-    st.subheader('Monthly checking budget · ' + first.strftime('%B %Y'))
-    expense, income, difference = st.columns(3)
-    expense.metric('Budgeted expenses', f'${snapshot["expenses"]:,.2f}')
-    income.metric('Budgeted income', f'${snapshot["income"]:,.2f}')
-    difference.metric('Budget remaining', f'${snapshot["remaining"]:,.2f}')
-    st.caption('Current included recurring amounts, using this month’s weekly schedule and saved payday amounts. '
-               'One-off calendar edits and actual spending are separate. Checking-to-checking transfers are '
-               'shown per account and excluded from the combined totals; transfers to savings count as outflow.')
-    with st.expander('Budget by checking account'):
-        rows = [{'Account': checking[i]['name'], 'Budgeted expenses': v['expenses'],
-                 'Budgeted income': v['income'], 'Budget remaining': v['remaining']}
-                for i, v in snapshot['accounts'].items()]
-        st.html(themed_table_html(rows, ['Budgeted expenses', 'Budgeted income', 'Budget remaining']))
+    st.subheader('Budget for ' + first.strftime('%B %Y'))
+    st.caption('Your monthly plan for each checking account. Transfers count as money out of the source '
+               'account and money into the receiving account. Budget left is income minus planned outflow; '
+               'it does not include your starting account balance.')
+    ordered = sorted(snapshot['accounts'], key=lambda i: (i != 1, checking[i]['name'].casefold()))
+    for account_id in ordered:
+        values = snapshot['accounts'][account_id]
+        with st.container(key='budget_account_' + str(account_id)):
+            st.markdown('#### ' + checking[account_id]['name'])
+            income, outflow, remaining = st.columns(3)
+            income.metric('Money in', f'${values["income"]:,.2f}')
+            outflow.metric('Money out', f'${values["expenses"]:,.2f}')
+            remaining.metric('Budget left', f'${values["remaining"]:,.2f}')
+            notes = []
+            if values['transfer_out']:
+                notes.append(f'Includes ${values["transfer_out"]:,.2f} sent to other checking accounts.')
+            if values['transfer_in']:
+                notes.append(f'Includes ${values["transfer_in"]:,.2f} received from other checking accounts.')
+            if notes:
+                st.caption(' '.join(notes))
+    with st.expander('Combined totals — transfers between checking accounts excluded', expanded=False):
+        income, outflow, remaining = st.columns(3)
+        income.metric('Combined budgeted income', f'${snapshot["income"]:,.2f}')
+        outflow.metric('Combined budgeted expenses', f'${snapshot["expenses"]:,.2f}')
+        remaining.metric('Combined budget left', f'${snapshot["remaining"]:,.2f}')
+        st.caption('Moving money between your checking accounts does not add money to the household. '
+                   'Those transfers are excluded here; transfers to savings remain part of checking outflow.')
+    st.caption('Uses included recurring items and this month’s saved payday amounts. '
+               'One-off calendar edits and actual spending are separate. Display filters do not change these totals.')
     if snapshot['unset_paydays']:
         st.warning(f'{snapshot["unset_paydays"]} included payday amount(s) are unset and excluded from income totals.')
 
@@ -3713,7 +3734,7 @@ def render_budget_rule_table(rows, inclusion):
         st.info('No budget items match this filter.')
         return None
     event = budget_table_renderer(**dict(
-        data={'html': themed_table_html(rows, ['Amount'], rule_links=True)},
+        data={'html': themed_table_html(rows, ['Amount each time', 'Monthly total'], rule_links=True)},
         key='budget_rules_' + inclusion + '_' + str(st.session_state.get('unified_budget_generation', 0)),
         on_action_change=lambda: None))
     action = event.action
@@ -3761,12 +3782,13 @@ def render_budget_page():
             'Paid to': credit_names.get(rule.get('credit_account_id'),
                 loan_names.get(int(rule['federal_loan_id']) if rule.get('federal_loan_id') else None,
                     accounts.get(rule['paid_to'], rule['paid_to']))),
-            'Amount': float(money(rule['amount'])), 'Day': day,
+            'Amount each time': float(money(rule['amount'])),
+            'Monthly total': float(budget_rule_monthly_amount(rule, selected_month)), 'Day': day,
             'Schedule': rule['schedule'], 'Include': bool(rule['enabled']),
             'Description': rule['description'],
              'Apply change': 'Future occurrences',
              'Status': 'Current' if rule['enabled'] else 'Excluded'})
-    st.caption('These recurring items apply in every month while Include is checked. Payday income is managed below. Click an ID# to edit an item.')
+    st.caption('Amount each time is one payment. Monthly total counts its repeats in ' + selected_month.strftime('%B') + '. Excluded items contribute $0.00. Click an ID# to edit; payday income is managed below.')
     selected_id = render_budget_rule_table(rows, inclusion)
     if st.button('Add budget item', type='primary'):
         unified_budget_item_dialog(None, selected_month)
