@@ -185,6 +185,7 @@ TRACK_APP_CSS += '\n/* React Aria dialog backing frame and dropdown popup surfac
 
 # One entry per named appearance. Future themes add their styles here;
 # no financial actions or component event handlers belong in this registry.
+TRACK_APP_CSS += '\n[data-testid="stFileUploader"], [data-testid="stFileUploader"] *, [data-testid="stToggle"], [data-testid="stToggle"] * {border-radius:0!important;}\n'
 LEDGER_APPEARANCES = {
     'Classic': {'slug':'classic','app_css':CLASSIC_FONT_CSS,'component_css':{}},
     'Track': {'slug':'track','app_css':TRACK_APP_CSS,
@@ -3843,7 +3844,29 @@ def render_budget_page():
         st.session_state['cash_account_id'] = previous_account
 
 
-TAX_RULES_VERSION = '2026-mfjo-2026-10-19-v1'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+TAX_RULES_VERSION = '2026-mfjo-2026-10-19-v2'
 TAX_FEDERAL_BRACKETS = (('24800', '.10'), ('100800', '.12'), ('211400', '.22'),
                         ('403550', '.24'), ('512450', '.32'), ('768700', '.35'), (None, '.37'))
 TAX_MONEY_LIMIT = Decimal('999999999.99')
@@ -3860,10 +3883,10 @@ def tax_default_inputs(year):
         bill_age=52 if year == 2026 else None, spouse_age=None, bill_blind=False, spouse_blind=False,
         jobs=[job('Bill'), job('Spouse')], ira=[],
         bonus=dict(include=False, person='Bill', gross='0', federal_withheld='0', ohio_withheld='0',
-                   additional_medicare_withheld='0', federal_taxable=None, ohio_taxable=None, medicare_taxable=None),
+                   additional_medicare_withheld='0', federal_taxable=None, ohio_taxable=None, medicare_taxable=None, estimate=dict(federal_auto=False, medicare_auto=False, flat_eligible=False, prior_supplemental='0', medicare_before='0', regular_medicare_manual='0')),
         interest='0', interest_federal_withheld='0', interest_ohio_withheld='0',
         federal_adjustments='0', ohio_additions='0', ohio_deductions='0', ohio_dependents=0,
-        deduction_choice='Larger deduction', allowed_itemized='0', itemized_salt_addback='0',
+        deduction_choice='Standard', allowed_itemized='0', itemized_salt_addback='0',
         other_federal_deductions='0', standard_cash_charity='0',
         federal_nonrefundable_credits='0', federal_refundable_credits='0', other_federal_taxes='0',
         ohio_credits_before_joint='0', ohio_credits_after_joint='0', ohio_refundable_credits='0',
@@ -3890,6 +3913,10 @@ def tax_validate_inputs(payload, year):
         raise ValueError('This saved projection uses a different year or input format.')
     if not isinstance(year, int) or isinstance(year, bool) or not 2026 <= year <= 2100:
         raise ValueError('Choose a tax year from 2026 through 2100.')
+    # Upgrade only the new optional settings; preserve all existing saved choices.
+    payload = deepcopy(payload)
+    if isinstance(payload.get('bonus'),dict) and 'estimate' not in payload['bonus']:
+        payload['bonus']['estimate'] = deepcopy(tax_default_inputs(year)['bonus']['estimate'])
     defaults = tax_default_inputs(year)
     if set(payload) != set(defaults):
         raise ValueError('The projection has missing or unrecognized fields. Reload its saved inputs.')
@@ -3934,13 +3961,23 @@ def tax_validate_inputs(payload, year):
         raise ValueError('The bonus record is incomplete.')
     if type(bonus['include']) is not bool or bonus['person'] not in ('Bill', 'Spouse'):
         raise ValueError('Choose the bonus recipient and whether to include it.')
-    for key in set(bonus) - {'include', 'person'}:
+    estimates=bonus['estimate']
+    if not isinstance(estimates,dict) or set(estimates)!=set(defaults['bonus']['estimate']):
+        raise ValueError('The bonus estimate settings are incomplete.')
+    for key in ('federal_auto','medicare_auto','flat_eligible'):
+        if type(estimates[key]) is not bool: raise ValueError('Choose a valid bonus estimate setting.')
+    for key in ('prior_supplemental','medicare_before','regular_medicare_manual'):
+        estimates[key]=str(tax_amount(estimates[key],key.replace('_',' ')))
+    if estimates['federal_auto'] and not estimates['flat_eligible']:
+        raise ValueError('Confirm eligibility for the supplemental flat method, or use manual federal withholding.')
+    for key in set(bonus) - {'include', 'person', 'estimate'}:
         if key.endswith('_taxable') and bonus[key] is None:
             continue
         bonus[key] = str(tax_amount(bonus[key], 'Bonus ' + key.replace('_', ' ')))
         if key.endswith('_taxable') and tax_amount(bonus[key]) > tax_amount(bonus['gross']):
             raise ValueError('Taxable bonus amounts cannot exceed the gross bonus.')
-    if sum((tax_amount(bonus[k]) for k in ('federal_withheld','ohio_withheld','additional_medicare_withheld')), Decimal(0)) > tax_amount(bonus['gross']):
+    effective=tax_bonus_withholding(bonus)
+    if effective['federal']+tax_amount(bonus['ohio_withheld'])+effective['additional_medicare']+effective['regular_medicare'] > tax_amount(bonus['gross']):
         raise ValueError('Bonus withholding cannot exceed the gross bonus.')
     if not isinstance(clean['ira'], list) or len(clean['ira']) > 200:
         raise ValueError('Use no more than 200 IRA withdrawal rows per tax year.')
@@ -3970,6 +4007,28 @@ def tax_validate_inputs(payload, year):
         if exception and not row['exception_reason'].strip():
             raise ValueError('Explain the verified exception before excluding an amount from early-withdrawal tax.')
     return clean
+
+
+
+def tax_bonus_withholding(bonus):
+    settings=bonus.get('estimate',{})
+    gross=tax_amount(bonus['gross'])
+    federal=gross if bonus['federal_taxable'] is None else tax_amount(bonus['federal_taxable'])
+    medicare=gross if bonus['medicare_taxable'] is None else tax_amount(bonus['medicare_taxable'])
+    rounded=lambda value:value.quantize(Decimal('.01'),rounding=ROUND_HALF_UP)
+    if settings.get('federal_auto'):
+        prior=tax_amount(settings['prior_supplemental'])
+        excess=min(federal,max(Decimal(0),prior+federal-Decimal('1000000')))
+        fed=rounded((federal-excess)*Decimal('.22')+excess*Decimal('.37'))
+    else: fed=tax_amount(bonus['federal_withheld'])
+    if settings.get('medicare_auto'):
+        before=tax_amount(settings['medicare_before'])
+        regular=rounded(medicare*Decimal('.0145'))
+        additional=rounded((max(Decimal(0),before+medicare-Decimal('200000'))-max(Decimal(0),before-Decimal('200000')))*Decimal('.009'))
+    else:
+        regular=tax_amount(settings.get('regular_medicare_manual','0'))
+        additional=tax_amount(bonus['additional_medicare_withheld'])
+    return dict(federal=fed,regular_medicare=regular,additional_medicare=additional)
 
 
 def tax_progressive_income_tax(taxable):
@@ -4011,7 +4070,10 @@ def tax_calculate(payload, include_bonus=None):
         qualifying[job['person']] = oh
         actual_withheld += get('federal_withheld_ytd') + get('ohio_withheld_ytd') + get('additional_medicare_withheld_ytd')
         planned_withheld += n * (get('federal_withheld_per_check') + get('ohio_withheld_per_check')) + get('additional_medicare_withheld_remaining')
-    bonus = p['bonus']
+    bonus = deepcopy(p['bonus'])
+    bonus_estimate=tax_bonus_withholding(bonus)
+    bonus['federal_withheld']=str(bonus_estimate['federal'])
+    bonus['additional_medicare_withheld']=str(bonus_estimate['additional_medicare'])
     if bonus['include'] if include_bonus is None else include_bonus:
         gross = tax_amount(bonus['gross'])
         bonus_wage = lambda field: gross if bonus[field] is None else tax_amount(bonus[field])
@@ -4084,6 +4146,254 @@ def tax_calculate(payload, include_bonus=None):
         planned_payroll_ira_withheld=planned_withheld,
         combined_balance=federal_tax + ohio_tax - federal_payments - ohio_payments)
 
+TAX_STUB_FIELDS = (
+    ('federal_wages_ytd', 'Federal taxable wages — YTD'),
+    ('federal_withheld_ytd', 'Federal income tax withheld — YTD'),
+    ('ohio_wages_ytd', 'Ohio taxable wages — YTD'),
+    ('ohio_withheld_ytd', 'Ohio income tax withheld — YTD'),
+    ('medicare_wages_ytd', 'Medicare wages — YTD'),
+    ('additional_medicare_withheld_ytd', 'Additional Medicare withheld — YTD'),
+    ('federal_wages_per_check', 'Federal taxable wages — this check'),
+    ('federal_withheld_per_check', 'Federal income tax withheld — this check'),
+    ('ohio_wages_per_check', 'Ohio taxable wages — this check'),
+    ('ohio_withheld_per_check', 'Ohio income tax withheld — this check'),
+    ('medicare_wages_per_check', 'Medicare wages — this check'))
+
+
+def tax_stub_lines(words):
+    # Keep positions so Current and YTD cannot be swapped by PDF reading order.
+    lines = []
+    for word in sorted(words, key=lambda w: (w['top'], w['x0'])):
+        middle = (word['top'] + word['bottom']) / 2
+        line = next((r for r in reversed(lines[-4:]) if abs(r['middle']-middle) <= max(3, (word['bottom']-word['top'])*.4)), None)
+        if line is None:
+            line = dict(middle=middle, words=[]); lines.append(line)
+        line['words'].append(word)
+    return [sorted(r['words'], key=lambda w:w['x0']) for r in lines]
+
+
+def tax_stub_parse(words, year):
+    import re
+    lines = tax_stub_lines(words)
+    found, dates, other_years = {}, set(), set()
+    headers = None
+    money_pattern = r'(?<![\w./-])\$?\s*(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}(?!\d)'
+    def normalized(text):
+        return re.sub(r'[^a-z0-9]+', ' ', text.lower()).strip()
+    def field_name(label):
+        label = normalized(label)
+        wages = any(w in label for w in ('wage','taxable','subject to'))
+        tax_line=any(w in label for w in ('tax','withhold','withheld','fitw')) or label == 'fit'
+        if 'additional' in label and ('medicare' in label or 'med ' in label):
+            return None if wages else 'additional_medicare_withheld'
+        if any(w in label for w in ('medicare','fed med','med wages')):
+            return 'medicare_wages' if wages else None
+        if any(w in label for w in ('federal','fed income','fed tax','fitw','fit ')) or label == 'fit':
+            return 'federal_wages' if wages else 'federal_withheld' if tax_line else None
+        if any(w in label for w in ('ohio','oh tax','oh state','oh income','oh withholding','oh taxable','sit oh')):
+            return 'ohio_wages' if wages else 'ohio_withheld' if tax_line else None
+        return None
+    def add(field, amount, confidence):
+        if field not in dict(TAX_STUB_FIELDS) or confidence < .90:
+            return
+        try: value = str(tax_amount(amount.replace('$','').replace(',','').replace(' ','')))
+        except ValueError: return
+        found.setdefault(field,set()).add(value)
+    for line in lines:
+        text = ' '.join(w['text'] for w in line)
+        low = normalized(text)
+        if re.search(r'\b(pay date|check date|payment date)\b', low):
+            for token in re.findall(r'\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})\b',text):
+                try:
+                    stamp = date.fromisoformat(token) if '-' in token else datetime.strptime(token,'%m/%d/%Y').date()
+                    if stamp.year==year: dates.add(stamp.isoformat())
+                    else: other_years.add(stamp.year)
+                except ValueError: pass
+        current = [w for w in line if normalized(w['text']) in ('current','this check','this period')]
+        ytd = [w for w in line if normalized(w['text']) in ('ytd','year to date','year-to-date')]
+        if current and ytd:
+            headers = {'current': (current[-1]['x0']+current[-1]['x1'])/2,
+                       'ytd': (ytd[-1]['x0']+ytd[-1]['x1'])/2}
+            continue
+        # Explicit field + YTD/Current label on one line is also supported.
+        matches = list(re.finditer(money_pattern,text))
+        field = field_name(text.split('$')[0] if '$' in text else text)
+        if not field or not matches: continue
+        # Refunds/negative corrections cannot be represented by these nonnegative payroll fields.
+        if re.search(r'[-−–]\s*\$?\d|\(\s*\$?[\d,]+\.\d{2}\s*\)',text): continue
+        if len(matches)==1:
+            period = 'ytd' if re.search(r'\b(ytd|year to date)\b',low) else 'current' if re.search(r'\b(current|this check|this period)\b',low) else None
+            if period:
+                suffix = '_ytd' if period=='ytd' else '_per_check'
+                add(field+suffix,matches[0].group(),min(w.get('confidence',1) for w in line))
+            continue
+        if headers and len(matches)==2:
+            numeric = [w for w in line if re.fullmatch(r'\$?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}',w['text'])]
+            if len(numeric)!=2: continue
+            assigned = {}
+            for word in numeric:
+                # Numeric columns are normally right aligned, headers centered.
+                center=(word['x0']+word['x1'])/2
+                period=min(headers,key=lambda key:abs(headers[key]-center))
+                if period in assigned: assigned={};break
+                assigned[period]=word
+            for period,word in assigned.items():
+                suffix='_ytd' if period=='ytd' else '_per_check'
+                add(field+suffix,word['text'],min(w.get('confidence',1) for w in line))
+    values={key:next(iter(items)) for key,items in found.items() if len(items)==1}
+    conflicts=[key for key,items in found.items() if len(items)>1]
+    return dict(values=values, as_of=next(iter(dates)) if len(dates)==1 else None, wrong_year=bool(other_years),
+                conflicts=conflicts, unresolved=len(TAX_STUB_FIELDS)-len(values))
+
+
+@st.cache_resource(show_spinner=False)
+def tax_stub_ocr_engine():
+    import rapidocr
+    import threading
+    from pathlib import Path
+    from rapidocr import RapidOCR
+    # Model files ship with the installed package. No remote inference or uploads.
+    models=Path(rapidocr.__file__).resolve().parent/'models'
+    names={'Det':'PP-OCRv6_det_small.onnx','Cls':'ch_ppocr_mobile_v2.0_cls_mobile.onnx','Rec':'PP-OCRv6_rec_small.onnx'}
+    if not all((models/name).is_file() for name in names.values()):
+        raise ValueError('The installed recognition models are missing. Reinstall the included import dependencies.')
+    params={section+'.model_path':str(models/name) for section,name in names.items()}
+    params.update({'Global.log_level':'error','EngineConfig.onnxruntime.intra_op_num_threads':1,
+                   'EngineConfig.onnxruntime.inter_op_num_threads':1})
+    return RapidOCR(params=params),threading.Lock()
+
+
+def tax_stub_ocr_words(image):
+    import re
+    engine,lock=tax_stub_ocr_engine()
+    with lock: result=engine(image)
+    words=[]
+    for box,text,score in zip(result.boxes if result.boxes is not None else [],result.txts or [],result.scores or []):
+        left,right=min(p[0] for p in box),max(p[0] for p in box)
+        for token in re.finditer(r'\S+',text):
+            words.append(dict(text=token.group(),x0=left+(right-left)*token.start()/len(text),
+                x1=left+(right-left)*token.end()/len(text),top=min(p[1] for p in box),
+                bottom=max(p[1] for p in box),confidence=float(score)))
+    return words
+
+
+def tax_stub_extract(data, filename, year, page_number=1, force_ocr=False):
+    from io import BytesIO
+    if not data or len(data)>10*1024*1024:
+        raise ValueError('Choose a nonempty paystub no larger than 10 MB.')
+    if filename.lower().endswith('.pdf'):
+        import pdfplumber
+        import pypdfium2 as pdfium
+        try:
+            with pdfplumber.open(BytesIO(data)) as document:
+                if not 1 <= len(document.pages) <= 5:
+                    raise ValueError('Use a paystub PDF with one to five pages.')
+                if not 1 <= page_number <= len(document.pages):
+                    raise ValueError('That page is not in the PDF. Choose an existing page.')
+                page=document.pages[page_number-1]
+                words=page.extract_words() if not force_ocr else []
+            method='PDF text'
+            if not words:
+                with pdfium.PdfDocument(data) as document:
+                    page=document[page_number-1]
+                    width,height=page.get_size()
+                    if width<=0 or height<=0 or width*height>16000000:
+                        raise ValueError('That PDF page is too large to scan. Use a smaller copy.')
+                    scale=min(2.5,(16000000/(width*height))**.5)
+                    bitmap=page.render(scale=scale)
+                    image=bitmap.to_pil().copy()
+                    words=tax_stub_ocr_words(image)
+                    image.close();bitmap.close();page.close()
+                method='Image recognition'
+        except ValueError: raise
+        except Exception:
+            raise ValueError('Could not read this PDF. Use an unlocked PDF or a clear PNG/JPG image.') from None
+    else:
+        from PIL import Image, ImageOps
+        try:
+            with Image.open(BytesIO(data)) as source:
+                if source.format not in ('PNG','JPEG') or source.width*source.height>16000000:
+                    raise ValueError('Use a PNG/JPG image with no more than 16 million pixels.')
+                image=ImageOps.exif_transpose(source).convert('RGB')
+                words=tax_stub_ocr_words(image)
+                image.close()
+            method='Image recognition'
+        except ValueError: raise
+        except Exception:
+            raise ValueError('Could not recognize this image. Check the import dependencies and use a clear PNG/JPG.') from None
+    result=tax_stub_parse(words,year)
+    result['method']=method
+    return result
+
+
+def tax_stub_clear_review(prefix):
+    st.session_state.pop(prefix+'review',None)
+
+
+def tax_render_stub_import(job, prefix, year):
+    # Called before payroll widgets, so applying a review can safely set their state.
+    import_key=prefix+'import_'
+    generation=st.session_state.setdefault(import_key+'generation',0)
+    st.markdown('**Import a paystub**')
+    st.caption('PDF, PNG or JPG · processed on this ledger’s host, without an external recognition service. '
+               'The document stays in this session; only reviewed payroll numbers are saved with the projection. '
+               'Review every value against the original, especially Current versus YTD.')
+    upload=st.file_uploader('Upload '+job['person']+' paystub',type=['pdf','png','jpg','jpeg'],
+        max_upload_size=10,key=import_key+'file_'+str(generation),on_change=tax_stub_clear_review,args=(import_key,))
+    page=int(st.number_input('PDF page to read',min_value=1,max_value=5,value=1,key=import_key+'page',
+        on_change=tax_stub_clear_review,args=(import_key,)))
+    scan=st.checkbox('Use image recognition for this PDF page',key=import_key+'scan',
+        help='Use this if the PDF text layer is incomplete. Scanned PDFs and images are recognized automatically.',
+        on_change=tax_stub_clear_review,args=(import_key,))
+    if st.button('Read paystub',disabled=upload is None,key=import_key+'read'):
+        try:
+            with st.spinner('Reading paystub on the ledger host…'):
+                review=tax_stub_extract(upload.getvalue(),upload.name,year,page,scan)
+            st.session_state[import_key+'review']=review
+            st.session_state[import_key+'review_id']=st.session_state.get(import_key+'review_id',0)+1
+        except Exception as exc:
+            st.session_state.pop(import_key+'review',None)
+            st.error(str(exc) if isinstance(exc,ValueError) else 'Import could not run. Check the included dependency install steps.')
+    review=st.session_state.get(import_key+'review')
+    if review:
+        if review.get('wrong_year'):
+            st.error('The recognized pay date is in another tax year. Choose the correct projection year and read the paystub again.')
+        st.caption(review['method']+' · '+str(len(review['values']))+' recognized fields. '
+                   'Blank or conflicting values are unresolved; they will not replace your existing values.')
+        frame=pd.DataFrame([{'Use':key in review['values'] and key.endswith('_ytd'),
+            'Payroll field':label,'Amount':float(review['values'][key]) if key in review['values'] else None,
+            'Recognition':'Review' if key in review['values'] else 'Unresolved'} for key,label in TAX_STUB_FIELDS])
+        edited=st.data_editor(frame,hide_index=True,disabled=['Payroll field','Recognition'],
+            column_config={'Use':st.column_config.CheckboxColumn(),
+                           'Amount':st.column_config.NumberColumn(min_value=0,max_value=999999999.99,format='$%.2f')},
+            key=import_key+'review_grid_'+str(st.session_state[import_key+'review_id']))
+        stamp=st.date_input('Reviewed paystub date',value=date.fromisoformat(review['as_of']) if review['as_of'] else None,
+            min_value=date(year,1,1),max_value=date(year,12,31),key=import_key+'date_'+str(st.session_state[import_key+'review_id']))
+        confirmed=st.checkbox('I checked the selected figures and date against the original paystub',
+            key=import_key+'confirmed_'+str(st.session_state[import_key+'review_id']))
+        st.caption('Select any current-check figures only if they represent your expected remaining checks. '
+                   'Enter the remaining paycheck count and any future Additional Medicare withholding yourself. '
+                   'Regular Medicare and Social Security deductions are not income-tax withholding.')
+        if st.button('Apply reviewed paystub',disabled=not confirmed or stamp is None or review.get('wrong_year',False),key=import_key+'apply'):
+            try:
+                changes={}
+                for (key,_),row in zip(TAX_STUB_FIELDS,edited.to_dict('records')):
+                    if row['Use']:
+                        changes[key]=str(tax_amount(row['Amount'],row['Payroll field']))
+                if stamp: changes['as_of']=stamp.isoformat()
+                if not changes: raise ValueError('Select at least one value or a date to apply.')
+                for key,value in changes.items():
+                    st.session_state[prefix+key]=date.fromisoformat(value) if key=='as_of' else float(value)
+                    job[key]=value
+                st.success('Reviewed payroll fields applied. Save projection inputs below to keep them.')
+            except ValueError as exc: st.error(str(exc))
+    if upload is not None or review:
+        if st.button('Clear imported document and review',key=import_key+'clear'):
+            for key in list(st.session_state):
+                if key.startswith(import_key): st.session_state.pop(key,None)
+            st.session_state[import_key+'generation']=generation+1
+            st.rerun()
+
 
 def tax_money_input(label, value, key, help=None):
     result = st.number_input(label, min_value=0.0, max_value=999999999.99,
@@ -4097,6 +4407,8 @@ def tax_render_payroll(job, prefix, year):
     with st.expander(person + ' — paystub and remaining paychecks', expanded=False):
         st.caption('Use taxable wages and income tax withholding from this person’s latest paystub. '
                    'Amounts already included in YTD must not be entered again as a future bonus or remaining paycheck.')
+        tax_render_stub_import(result, prefix, year)
+        job = result
         stamp = st.date_input('Paystub date', value=date.fromisoformat(job['as_of']),
             min_value=date(year, 1, 1), max_value=date(year, 12, 31), key=prefix+'as_of')
         result['as_of'] = stamp.isoformat()
@@ -4265,7 +4577,8 @@ def render_tax_projection_page():
                 inputs[who+'_blind'] = st.checkbox(('Bill' if who=='bill' else 'Spouse')+' qualifies as blind for tax purposes',
                     value=original[who+'_blind'], key=prefix+who+'_blind')
         inputs['deduction_choice'] = st.selectbox('Federal deduction', ['Larger deduction', 'Standard', 'Itemized'],
-            index=['Larger deduction', 'Standard', 'Itemized'].index(original['deduction_choice']), key=prefix+'deduction_choice')
+            index=['Larger deduction', 'Standard', 'Itemized'].index(original['deduction_choice']), key=prefix+'deduction_choice',
+            format_func=lambda value:'Automatically choose the larger deduction' if value=='Larger deduction' else value)
         for key, label in [('allowed_itemized','Allowed itemized deductions after applicable limits ($)'),
                            ('itemized_salt_addback','State/local tax portion of that itemized deduction ($)'),
                            ('other_federal_deductions','Other allowed federal below-AGI deductions ($)'),
@@ -4284,25 +4597,55 @@ def render_tax_projection_page():
         return
     with st.expander('Optional year-end bonus amounts', expanded=False):
         st.caption('Only a bonus paid in this tax year and not already included in paystub YTD. '
-                   'Withholding is a tax payment, not the final tax rate on the bonus.')
-        inputs['bonus']['person'] = st.selectbox('Bonus recipient', ['Bill','Spouse'],
-            index=['Bill','Spouse'].index(original['bonus']['person']), key=prefix+'bonus_person')
-        left, right = st.columns(2)
-        for i,(key,label) in enumerate([('gross','Estimated gross bonus ($)'),
-            ('federal_withheld','Expected federal income tax withholding ($)'),
-            ('ohio_withheld','Expected Ohio withholding ($)'),
-            ('additional_medicare_withheld','Expected Additional Medicare withholding ($)')]):
-            with (left if i%2==0 else right):
-                inputs['bonus'][key] = tax_money_input(label, original['bonus'][key], prefix+'bonus_'+key)
-        st.caption('Gross bonus is assumed taxable for federal, Ohio and Medicare. If payroll deductions make those amounts '
-                   'different, enter the expected taxable portions below; leave them blank to use gross. Zero is an explicit amount.')
+                   'Withholding is a payment toward tax, not the final tax rate on the bonus.')
+        bonus=inputs['bonus'];old=original['bonus'];settings=bonus['estimate'];previous=old['estimate']
+        bonus['person']=st.selectbox('Bonus recipient',['Bill','Spouse'],
+            index=['Bill','Spouse'].index(old['person']),key=prefix+'bonus_person')
+        bonus['gross']=tax_money_input('Estimated gross bonus ($)',old['gross'],prefix+'bonus_gross')
+        st.caption('Leave taxable portions blank to use gross. Zero is an explicit amount. '
+                   'Use payroll’s expected taxable portions if pretax deductions change them.')
         for key,label in [('federal_taxable','Federal taxable portion of bonus, if different ($)'),
                           ('ohio_taxable','Ohio taxable portion of bonus, if different ($)'),
                           ('medicare_taxable','Medicare taxable portion of bonus, if different ($)')]:
-            result = st.number_input(label,min_value=0.0,max_value=999999999.99,format='%.2f',
-                value=None if original['bonus'][key] is None else float(tax_amount(original['bonus'][key])),
-                key=prefix+'bonus_'+key)
-            inputs['bonus'][key] = None if result is None else str(tax_amount(result))
+            value=st.number_input(label,min_value=0.0,max_value=999999999.99,format='%.2f',
+                value=None if old[key] is None else float(tax_amount(old[key])),key=prefix+'bonus_'+key)
+            bonus[key]=None if value is None else str(tax_amount(value))
+        st.markdown('**Federal income tax withholding**')
+        settings['federal_auto']=st.toggle('Estimate federal bonus withholding',
+            value=previous['federal_auto'],key=prefix+'bonus_federal_auto')
+        if settings['federal_auto']:
+            st.caption('Flat supplemental-wage method: 22% up to $1 million in annual supplemental wages from this employer; '
+                       '37% on the excess. Employer aggregation with regular pay can produce a different amount. '
+                       'Choose manual withholding below if payroll uses aggregation or you do not know its method.')
+            settings['flat_eligible']=st.checkbox('Employer will separately identify this bonus and can use the flat supplemental method (income tax withheld from regular pay this year or last year)',
+                value=previous['flat_eligible'],key=prefix+'bonus_flat_eligible')
+            settings['prior_supplemental']=tax_money_input('Other supplemental wages from this employer earlier this year ($)',
+                previous['prior_supplemental'],prefix+'bonus_prior_supplemental',
+                help='Include earlier bonuses and other supplemental wages, including those from commonly controlled employers where applicable. This is a threshold input only; do not add it to income again.')
+        else:
+            bonus['federal_withheld']=tax_money_input('Expected federal income tax withholding ($)',old['federal_withheld'],prefix+'bonus_federal_withheld')
+        bonus['ohio_withheld']=tax_money_input('Expected Ohio withholding ($)',old['ohio_withheld'],prefix+'bonus_ohio_withheld')
+        st.markdown('**Medicare withholding**')
+        settings['medicare_auto']=st.toggle('Estimate Medicare bonus withholding',value=previous['medicare_auto'],key=prefix+'bonus_medicare_auto')
+        if settings['medicare_auto']:
+            settings['medicare_before']=tax_money_input('Medicare wages from this employer before the bonus ($)',
+                previous['medicare_before'],prefix+'bonus_medicare_before',
+                help='Include all wages expected before this bonus from this same employer, including remaining regular pay before it. Do not combine spouses or unrelated employers. This threshold input does not add income.')
+            st.caption('Regular Medicare: 1.45%. Additional Medicare: 0.9% of the part crossing this employer’s 200,000-dollar withholding threshold. '
+                       'The joint return’s annual Additional Medicare liability still uses the separate 250,000-dollar threshold.')
+        else:
+            settings['regular_medicare_manual']=tax_money_input('Expected regular Medicare withholding ($)',previous['regular_medicare_manual'],prefix+'bonus_regular_medicare')
+            bonus['additional_medicare_withheld']=tax_money_input('Expected Additional Medicare withholding ($)',old['additional_medicare_withheld'],prefix+'bonus_additional_medicare_withheld')
+        estimate=tax_bonus_withholding(bonus)
+        a,b,c=st.columns(3)
+        a.metric('Bonus federal withholding',f'${estimate["federal"]:,.2f}')
+        b.metric('Bonus regular Medicare',f'${estimate["regular_medicare"]:,.2f}')
+        c.metric('Bonus Additional Medicare',f'${estimate["additional_medicare"]:,.2f}')
+        st.caption('Regular Medicare is informational and is not credited against income tax. '
+                   'Turn either estimate off to enter a manual override; your previous manual entries are retained. '
+                   'Only a checked Include year-end bonus adds bonus wages and withholding to the projection.')
+        st.markdown('[IRS supplemental wage methods](https://www.irs.gov/publications/p15) · '
+                    '[IRS Medicare withholding](https://www.irs.gov/taxtopics/tc751)')
     with st.expander('Bank interest, adjustments, credits and payments', expanded=False):
         st.caption('Use full-year totals. Enter zero for items that do not apply. Income tax withholding excludes '
                    'regular Social Security and Medicare. Credits and deductions must be eligible after their income limits.')
