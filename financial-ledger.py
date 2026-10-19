@@ -3866,10 +3866,111 @@ def render_budget_page():
 
 
 
-TAX_RULES_VERSION = '2026-mfjo-2026-10-19-v2'
+TAX_RULES_VERSION = '2026-mfjo-2026-10-19-v3'
 TAX_FEDERAL_BRACKETS = (('24800', '.10'), ('100800', '.12'), ('211400', '.22'),
                         ('403550', '.24'), ('512450', '.32'), ('768700', '.35'), (None, '.37'))
 TAX_MONEY_LIMIT = Decimal('999999999.99')
+
+
+TAX_FORECAST_FIELDS = (
+    ('federal_wages_ytd','federal_wages_per_check','Federal taxable wages'),
+    ('federal_withheld_ytd','federal_withheld_per_check','Federal income tax withheld'),
+    ('ohio_wages_ytd','ohio_wages_per_check','Ohio taxable wages'),
+    ('ohio_withheld_ytd','ohio_withheld_per_check','Ohio income tax withheld'),
+    ('medicare_wages_ytd','medicare_wages_per_check','Medicare wages'))
+
+def tax_forecast_defaults():
+    return dict(checks_received=None, applied_basis=None, excluded={key:'0' for key,_,_ in TAX_FORECAST_FIELDS})
+def tax_validate_forecast(job):
+    settings=job['forecast']
+    if not isinstance(settings,dict) or set(settings)!={'checks_received','excluded','applied_basis'}:
+        raise ValueError('The remaining-pay estimate settings are incomplete.')
+    basis=settings['applied_basis']
+    if basis is not None and (not isinstance(basis,str) or len(basis)!=16 or any(c not in '0123456789abcdef' for c in basis)):
+        raise ValueError('The saved remaining-pay estimate marker is invalid.')
+    count=settings['checks_received']
+    if count is not None and (type(count) is not int or not 1<=count<=366):
+        raise ValueError('Enter how many regular paychecks are included in YTD, from 1 through 366.')
+    exclusions=settings['excluded']
+    if not isinstance(exclusions,dict) or set(exclusions)!={key for key,_,_ in TAX_FORECAST_FIELDS}:
+        raise ValueError('The one-off payroll amounts are incomplete.')
+    for key,_,label in TAX_FORECAST_FIELDS:
+        value=tax_amount(exclusions[key],label+' excluded from average')
+        if value>tax_amount(job[key],label+' YTD'):
+            raise ValueError(label+': the one-off amount cannot exceed its YTD total.')
+        exclusions[key]=str(value)
+def tax_estimate_remaining_pay(job):
+    candidate=deepcopy(job)
+    tax_validate_forecast(candidate)
+    count=candidate['forecast']['checks_received']
+    if count is None:
+        raise ValueError('Enter the number of regular paychecks included in YTD to calculate an average.')
+    remaining=candidate['remaining_checks']
+    if type(remaining) is not int or not 0<=remaining<=366:
+        raise ValueError('Enter a valid remaining paycheck count.')
+    per_check={};totals={}
+    for source,target,label in TAX_FORECAST_FIELDS:
+        regular=tax_amount(candidate[source],label+' YTD')-tax_amount(candidate['forecast']['excluded'][source])
+        average=(regular/Decimal(count)).quantize(Decimal('.01'),rounding=ROUND_HALF_UP)
+        per_check[target]=str(average)
+        totals[target]=str(average*remaining)
+    return dict(per_check=per_check,totals=totals)
+def tax_forecast_basis(job):
+    import json
+    from hashlib import sha256
+    content=dict(ytd={key:str(tax_amount(job[key])) for key,_,_ in TAX_FORECAST_FIELDS},
+        excluded={key:str(tax_amount(job['forecast']['excluded'][key])) for key,_,_ in TAX_FORECAST_FIELDS},
+        received=job['forecast']['checks_received'],remaining=job['remaining_checks'],as_of=job['as_of'])
+    return sha256(json.dumps(content,sort_keys=True).encode()).hexdigest()[:16]
+def tax_render_payroll_forecast(job,prefix):
+    with st.expander('Estimate remaining pay from year-to-date figures',expanded=False):
+        st.caption('Average regular amounts already earned or withheld, divided by the regular paychecks received, '
+                   'then applied to your remaining paycheck count above. Check the counts against your pay schedule. '
+                   'Raises, overtime, unpaid leave and deduction changes may make a different estimate more appropriate.')
+        settings=deepcopy(job['forecast'])
+        settings['checks_received']=st.number_input('Regular paychecks included in these YTD figures',
+            min_value=1,max_value=366,value=settings['checks_received'],step=1,key=prefix+'forecast_received',
+            help='Count the regular checks covered by these YTD wages, not an off-cycle bonus. No paid checks yet? Enter future per-check amounts manually instead.')
+        with st.expander('One-off amounts already in YTD — exclude from the average',expanded=False):
+            st.caption('Enter any already-paid bonus or other nonrecurring wages and their withholding that are included in YTD. '
+                       'These amounts remain in your tax-year income and withholding; they are removed only from this average. '
+                       'Do not enter that already-paid bonus again in the optional future-bonus section.')
+            left,right=st.columns(2)
+            for i,(key,_,label) in enumerate(TAX_FORECAST_FIELDS):
+                with (left if i%2==0 else right):
+                    settings['excluded'][key]=tax_money_input(label+' — one-off amount in YTD ($)',
+                        settings['excluded'][key],prefix+'forecast_excluded_'+key)
+        job['forecast']=settings
+        try:
+            estimate=tax_estimate_remaining_pay(job)
+        except ValueError as exc:
+            st.info(str(exc))
+            return job
+        st.caption(str(settings['checks_received'])+' regular checks received · '+str(job['remaining_checks'])+
+                   ' remaining · through '+date.fromisoformat(job['as_of']).strftime('%b %d, %Y'))
+        rows=[{'Payroll amount':label,'Average per remaining check':Decimal(estimate['per_check'][target]),
+               'Expected for remaining checks':Decimal(estimate['totals'][target])} for _,target,label in TAX_FORECAST_FIELDS]
+        st.html(themed_table_html(rows,['Average per remaining check','Expected for remaining checks']))
+        st.warning('Additional Medicare withholding is not averaged here because it depends on wage thresholds. '
+                   'Review its remaining-year amount below. Bonus estimates and IRA withdrawals stay separate.')
+        fingerprint=tax_forecast_basis(job)
+        confirmed=st.checkbox('I reviewed the counts, one-off amounts and estimated remaining pay',
+            key=prefix+'forecast_review_'+fingerprint)
+        if st.button('Apply remaining-pay estimate',disabled=not confirmed,key=prefix+'forecast_apply'):
+            for key,value in estimate['per_check'].items():
+                job[key]=value
+                st.session_state[prefix+key]=float(value)
+            job['forecast']['applied_basis']=fingerprint
+            st.success('Estimated per-check amounts applied below. Adjust them if needed, then save projection inputs.')
+        if settings['applied_basis'] is not None and settings['applied_basis']!=fingerprint:
+            st.warning('New YTD figures, paystub date or paycheck counts differ from your last applied estimate. '
+                       'Update the counts and review this preview, then Apply again—or keep your manually adjusted remaining pay.')
+        st.caption('When a newer paystub arrives, import it for this person, update received and remaining paycheck counts, '
+                   'and review/apply the refreshed estimate. New YTD figures replace earlier YTD totals; they are never added twice.')
+        st.caption('Changing these assumptions shows a new preview; it does not replace your per-check entries until you click Apply. '
+                   'You can edit the applied amounts manually. Averages are rounded to cents per check.')
+    return job
+
 
 
 def tax_default_inputs(year):
@@ -3878,7 +3979,7 @@ def tax_default_inputs(year):
             medicare_wages_ytd='0', federal_withheld_ytd='0', ohio_withheld_ytd='0',
             additional_medicare_withheld_ytd='0', remaining_checks=0, federal_wages_per_check='0',
             ohio_wages_per_check='0', medicare_wages_per_check='0', federal_withheld_per_check='0',
-            ohio_withheld_per_check='0', additional_medicare_withheld_remaining='0')
+            ohio_withheld_per_check='0', additional_medicare_withheld_remaining='0',forecast=tax_forecast_defaults())
     return dict(schema_version=1, tax_year=int(year), reviewed=False,
         bill_age=52 if year == 2026 else None, spouse_age=None, bill_blind=False, spouse_blind=False,
         jobs=[job('Bill'), job('Spouse')], ira=[],
@@ -3917,6 +4018,12 @@ def tax_validate_inputs(payload, year):
     payload = deepcopy(payload)
     if isinstance(payload.get('bonus'),dict) and 'estimate' not in payload['bonus']:
         payload['bonus']['estimate'] = deepcopy(tax_default_inputs(year)['bonus']['estimate'])
+    if isinstance(payload.get('jobs'),list):
+        for job in payload['jobs']:
+            if isinstance(job,dict) and 'forecast' not in job:
+                job['forecast']=tax_forecast_defaults()
+            elif isinstance(job,dict) and isinstance(job.get('forecast'),dict) and 'applied_basis' not in job['forecast']:
+                job['forecast']['applied_basis']=None
     defaults = tax_default_inputs(year)
     if set(payload) != set(defaults):
         raise ValueError('The projection has missing or unrecognized fields. Reload its saved inputs.')
@@ -3954,8 +4061,9 @@ def tax_validate_inputs(payload, year):
             raise ValueError('Each paystub date must belong to the selected tax year.')
         if type(job['remaining_checks']) is not int or not 0 <= job['remaining_checks'] <= 366:
             raise ValueError('Enter the number of remaining paychecks, from zero through 366.')
-        for key in set(expected) - {'person', 'as_of', 'remaining_checks'}:
+        for key in set(expected) - {'person', 'as_of', 'remaining_checks','forecast'}:
             job[key] = str(tax_amount(job[key], job['person'] + ': ' + key.replace('_', ' ')))
+        tax_validate_forecast(job)
     bonus = clean['bonus']
     if not isinstance(bonus, dict) or set(bonus) != set(defaults['bonus']):
         raise ValueError('The bonus record is incomplete.')
@@ -4428,6 +4536,8 @@ def tax_render_payroll(job, prefix, year):
         st.markdown('**Expected for the rest of this year**')
         result['remaining_checks'] = int(st.number_input('Remaining paychecks', min_value=0, max_value=366,
             value=job['remaining_checks'], step=1, key=prefix+'remaining_checks'))
+        result = tax_render_payroll_forecast(result,prefix)
+        job = result
         fields = [('federal_wages_per_check', 'Federal taxable wages per remaining check ($)'),
                   ('federal_withheld_per_check', 'Federal income tax per remaining check ($)'),
                   ('ohio_wages_per_check', 'Ohio taxable wages per remaining check ($)'),
@@ -4546,7 +4656,15 @@ def render_tax_projection_page():
         except Exception:
             st.session_state[prefix+'loaded'] = dict(inputs=tax_default_inputs(year), revision=None, can_save=False)
     saved = st.session_state[prefix+'loaded']
-    original = deepcopy(saved['inputs'])
+    # A hot reload can retain a draft created before new optional fields existed.
+    # Apply the same upgrade as database loads before any widget indexes those fields.
+    try:
+        original = tax_validate_inputs(saved['inputs'], year)
+    except (ValueError, KeyError, TypeError):
+        st.error('This open projection could not be read. Your draft has been kept. '
+                 'Reload saved projection above to return to the last saved version.')
+        return
+    saved['inputs'] = deepcopy(original)
     if prefix+'ira_editor' not in st.session_state:
         st.session_state[prefix+'ira_baseline'] = deepcopy(original['ira'])
     inputs = deepcopy(original)
