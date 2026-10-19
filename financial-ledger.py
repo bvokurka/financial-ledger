@@ -3841,6 +3841,538 @@ def render_budget_page():
             render_payday_tables()
     finally:
         st.session_state['cash_account_id'] = previous_account
+
+
+TAX_RULES_VERSION = '2026-mfjo-2026-10-19-v1'
+TAX_FEDERAL_BRACKETS = (('24800', '.10'), ('100800', '.12'), ('211400', '.22'),
+                        ('403550', '.24'), ('512450', '.32'), ('768700', '.35'), (None, '.37'))
+TAX_MONEY_LIMIT = Decimal('999999999.99')
+
+
+def tax_default_inputs(year):
+    def job(person):
+        return dict(person=person, as_of=f'{year}-01-01', federal_wages_ytd='0', ohio_wages_ytd='0',
+            medicare_wages_ytd='0', federal_withheld_ytd='0', ohio_withheld_ytd='0',
+            additional_medicare_withheld_ytd='0', remaining_checks=0, federal_wages_per_check='0',
+            ohio_wages_per_check='0', medicare_wages_per_check='0', federal_withheld_per_check='0',
+            ohio_withheld_per_check='0', additional_medicare_withheld_remaining='0')
+    return dict(schema_version=1, tax_year=int(year), reviewed=False,
+        bill_age=52 if year == 2026 else None, spouse_age=None, bill_blind=False, spouse_blind=False,
+        jobs=[job('Bill'), job('Spouse')], ira=[],
+        bonus=dict(include=False, person='Bill', gross='0', federal_withheld='0', ohio_withheld='0',
+                   additional_medicare_withheld='0', federal_taxable=None, ohio_taxable=None, medicare_taxable=None),
+        interest='0', interest_federal_withheld='0', interest_ohio_withheld='0',
+        federal_adjustments='0', ohio_additions='0', ohio_deductions='0', ohio_dependents=0,
+        deduction_choice='Larger deduction', allowed_itemized='0', itemized_salt_addback='0',
+        other_federal_deductions='0', standard_cash_charity='0',
+        federal_nonrefundable_credits='0', federal_refundable_credits='0', other_federal_taxes='0',
+        ohio_credits_before_joint='0', ohio_credits_after_joint='0', ohio_refundable_credits='0',
+        federal_estimated_paid='0', federal_estimated_planned='0', ohio_estimated_paid='0',
+        ohio_estimated_planned='0', notes='')
+
+
+def tax_amount(value, label='Amount'):
+    if isinstance(value, bool) or value is None:
+        raise ValueError(label + ' must be a dollar amount; enter zero if none.')
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        raise ValueError(label + ' must be a dollar amount.')
+    if not result.is_finite() or result < 0 or result > TAX_MONEY_LIMIT:
+        raise ValueError(label + ' must be nonnegative and below one billion dollars.')
+    if result != result.quantize(Decimal('.01'), rounding=ROUND_HALF_UP):
+        raise ValueError(label + ' may have at most two decimal places.')
+    return result.quantize(Decimal('.01'))
+
+
+def tax_validate_inputs(payload, year):
+    if not isinstance(payload, dict) or payload.get('schema_version') != 1 or payload.get('tax_year') != year:
+        raise ValueError('This saved projection uses a different year or input format.')
+    if not isinstance(year, int) or isinstance(year, bool) or not 2026 <= year <= 2100:
+        raise ValueError('Choose a tax year from 2026 through 2100.')
+    defaults = tax_default_inputs(year)
+    if set(payload) != set(defaults):
+        raise ValueError('The projection has missing or unrecognized fields. Reload its saved inputs.')
+    clean = deepcopy(payload)
+    flags = ('reviewed', 'bill_blind', 'spouse_blind')
+    for flag in flags:
+        if not isinstance(clean[flag], bool):
+            raise ValueError('Choose a valid setting for ' + flag.replace('_', ' ') + '.')
+    for age in ('bill_age', 'spouse_age'):
+        if clean[age] is not None and (type(clean[age]) is not int or not 0 <= clean[age] <= 120):
+            raise ValueError('Age must be a whole number from zero through 120.')
+    if type(clean['ohio_dependents']) is not int or not 0 <= clean['ohio_dependents'] <= 30:
+        raise ValueError('Enter a supported number of Ohio dependents.')
+    if clean['deduction_choice'] not in ('Larger deduction', 'Standard', 'Itemized'):
+        raise ValueError('Choose a deduction method.')
+    if not isinstance(clean['notes'], str) or len(clean['notes']) > 4000:
+        raise ValueError('Keep projection notes to 4,000 characters.')
+    exempt = {'schema_version', 'tax_year', *flags, 'bill_age', 'spouse_age', 'jobs', 'ira', 'bonus',
+              'deduction_choice', 'ohio_dependents', 'notes'}
+    for name in set(defaults) - exempt:
+        clean[name] = str(tax_amount(clean[name], name.replace('_', ' ')))
+    if tax_amount(clean['itemized_salt_addback']) > tax_amount(clean['allowed_itemized']):
+        raise ValueError('The state/local tax portion cannot exceed the allowed itemized deduction.')
+    if not isinstance(clean['jobs'], list) or len(clean['jobs']) != 2:
+        raise ValueError('Provide the Bill and Spouse payroll records.')
+    for position, job in enumerate(clean['jobs']):
+        expected = defaults['jobs'][position]
+        if not isinstance(job, dict) or set(job) != set(expected) or job['person'] != expected['person']:
+            raise ValueError('The payroll record is incomplete.')
+        try:
+            stamp = date.fromisoformat(job['as_of'])
+        except (TypeError, ValueError):
+            raise ValueError('Enter a valid paystub date.')
+        if stamp.year != year:
+            raise ValueError('Each paystub date must belong to the selected tax year.')
+        if type(job['remaining_checks']) is not int or not 0 <= job['remaining_checks'] <= 366:
+            raise ValueError('Enter the number of remaining paychecks, from zero through 366.')
+        for key in set(expected) - {'person', 'as_of', 'remaining_checks'}:
+            job[key] = str(tax_amount(job[key], job['person'] + ': ' + key.replace('_', ' ')))
+    bonus = clean['bonus']
+    if not isinstance(bonus, dict) or set(bonus) != set(defaults['bonus']):
+        raise ValueError('The bonus record is incomplete.')
+    if type(bonus['include']) is not bool or bonus['person'] not in ('Bill', 'Spouse'):
+        raise ValueError('Choose the bonus recipient and whether to include it.')
+    for key in set(bonus) - {'include', 'person'}:
+        if key.endswith('_taxable') and bonus[key] is None:
+            continue
+        bonus[key] = str(tax_amount(bonus[key], 'Bonus ' + key.replace('_', ' ')))
+        if key.endswith('_taxable') and tax_amount(bonus[key]) > tax_amount(bonus['gross']):
+            raise ValueError('Taxable bonus amounts cannot exceed the gross bonus.')
+    if sum((tax_amount(bonus[k]) for k in ('federal_withheld','ohio_withheld','additional_medicare_withheld')), Decimal(0)) > tax_amount(bonus['gross']):
+        raise ValueError('Bonus withholding cannot exceed the gross bonus.')
+    if not isinstance(clean['ira'], list) or len(clean['ira']) > 200:
+        raise ValueError('Use no more than 200 IRA withdrawal rows per tax year.')
+    ira_keys = {'date', 'gross', 'taxable', 'federal_withheld', 'ohio_withheld',
+                'early_taxable', 'exception_amount', 'exception_reason', 'estimated'}
+    for row in clean['ira']:
+        if not isinstance(row, dict) or set(row) != ira_keys:
+            raise ValueError('An IRA withdrawal row is incomplete.')
+        try:
+            stamp = date.fromisoformat(row['date'])
+        except (TypeError, ValueError):
+            raise ValueError('Enter a valid date for every IRA withdrawal.')
+        if stamp.year != year:
+            raise ValueError('Every IRA withdrawal must belong to the selected tax year.')
+        if type(row['estimated']) is not bool:
+            raise ValueError('Mark whether each IRA withdrawal is estimated.')
+        for key in ira_keys - {'date', 'estimated', 'exception_reason'}:
+            row[key] = str(tax_amount(row[key], 'IRA ' + key.replace('_', ' ')))
+        gross, taxable, early, exception = [tax_amount(row[k]) for k in
+                                          ('gross', 'taxable', 'early_taxable', 'exception_amount')]
+        if taxable > gross or early > taxable or exception > early:
+            raise ValueError('IRA amounts must satisfy: exception ≤ early taxable amount ≤ taxable amount ≤ gross.')
+        if tax_amount(row['federal_withheld']) + tax_amount(row['ohio_withheld']) > gross:
+            raise ValueError('IRA withholding cannot exceed the gross withdrawal.')
+        if not isinstance(row['exception_reason'], str) or len(row['exception_reason']) > 1000:
+            raise ValueError('Keep each IRA exception explanation to 1,000 characters.')
+        if exception and not row['exception_reason'].strip():
+            raise ValueError('Explain the verified exception before excluding an amount from early-withdrawal tax.')
+    return clean
+
+
+def tax_progressive_income_tax(taxable):
+    remaining = max(Decimal(0), taxable)
+    total = lower = Decimal(0)
+    for ceiling, rate in TAX_FEDERAL_BRACKETS:
+        upper = Decimal(ceiling) if ceiling is not None else lower + remaining
+        amount = min(remaining, max(Decimal(0), upper - lower))
+        total += amount * Decimal(rate)
+        remaining -= amount
+        lower = upper
+        if remaining <= 0:
+            break
+    return total.quantize(Decimal('.01'), rounding=ROUND_HALF_UP)
+
+
+def tax_calculate(payload, include_bonus=None):
+    p = tax_validate_inputs(payload, payload.get('tax_year'))
+    if p['bill_age'] is None or p['spouse_age'] is None:
+        raise ValueError('Enter both ages at the end of the selected tax year.')
+    zero = Decimal(0)
+    amount = lambda key: tax_amount(p[key])
+    round_money = lambda value: value.quantize(Decimal('.01'), rounding=ROUND_HALF_UP)
+    federal_wages = ohio_wages = medicare_wages = zero
+    federal_withheld = ohio_withheld = extra_medicare_withheld = zero
+    qualifying = {}
+    actual_withheld = planned_withheld = zero
+    for job in p['jobs']:
+        n = job['remaining_checks']
+        get = lambda key: tax_amount(job[key])
+        fed = get('federal_wages_ytd') + n * get('federal_wages_per_check')
+        oh = get('ohio_wages_ytd') + n * get('ohio_wages_per_check')
+        federal_wages += fed
+        ohio_wages += oh
+        medicare_wages += get('medicare_wages_ytd') + n * get('medicare_wages_per_check')
+        federal_withheld += get('federal_withheld_ytd') + n * get('federal_withheld_per_check')
+        ohio_withheld += get('ohio_withheld_ytd') + n * get('ohio_withheld_per_check')
+        extra_medicare_withheld += get('additional_medicare_withheld_ytd') + get('additional_medicare_withheld_remaining')
+        qualifying[job['person']] = oh
+        actual_withheld += get('federal_withheld_ytd') + get('ohio_withheld_ytd') + get('additional_medicare_withheld_ytd')
+        planned_withheld += n * (get('federal_withheld_per_check') + get('ohio_withheld_per_check')) + get('additional_medicare_withheld_remaining')
+    bonus = p['bonus']
+    if bonus['include'] if include_bonus is None else include_bonus:
+        gross = tax_amount(bonus['gross'])
+        bonus_wage = lambda field: gross if bonus[field] is None else tax_amount(bonus[field])
+        federal_wages += bonus_wage('federal_taxable')
+        ohio_wages += bonus_wage('ohio_taxable')
+        medicare_wages += bonus_wage('medicare_taxable')
+        qualifying[bonus['person']] += bonus_wage('ohio_taxable')
+        federal_withheld += tax_amount(bonus['federal_withheld'])
+        ohio_withheld += tax_amount(bonus['ohio_withheld'])
+        extra_medicare_withheld += tax_amount(bonus['additional_medicare_withheld'])
+        planned_withheld += sum((tax_amount(bonus[k]) for k in
+            ('federal_withheld', 'ohio_withheld', 'additional_medicare_withheld')), zero)
+    ira_gross = ira_taxable = early_base = zero
+    for row in p['ira']:
+        ira_gross += tax_amount(row['gross'])
+        ira_taxable += tax_amount(row['taxable'])
+        early_base += tax_amount(row['early_taxable']) - tax_amount(row['exception_amount'])
+        federal_withheld += tax_amount(row['federal_withheld'])
+        ohio_withheld += tax_amount(row['ohio_withheld'])
+        wh = tax_amount(row['federal_withheld']) + tax_amount(row['ohio_withheld'])
+        if row['estimated']:
+            planned_withheld += wh
+        else:
+            actual_withheld += wh
+    federal_withheld += amount('interest_federal_withheld')
+    ohio_withheld += amount('interest_ohio_withheld')
+    agi = max(zero, federal_wages + ira_taxable + amount('interest') - amount('federal_adjustments'))
+    senior_count = int(p['bill_age'] >= 65) + int(p['spouse_age'] >= 65)
+    standard = Decimal('32200') + Decimal('1650') * (senior_count + int(p['bill_blind']) + int(p['spouse_blind']))
+    itemized = amount('allowed_itemized')
+    use_itemized = p['deduction_choice'] == 'Itemized' or (p['deduction_choice'] == 'Larger deduction' and itemized > standard)
+    deduction = itemized if use_itemized else standard
+    senior_deduction = (max(zero, Decimal('6000') - Decimal('.06') * max(zero, agi - Decimal('150000')))
+                        * senior_count if p['tax_year'] <= 2028 else zero)
+    cash_charity = zero if use_itemized else min(Decimal('2000'), amount('standard_cash_charity'))
+    extra_deduction = senior_deduction + amount('other_federal_deductions') + cash_charity
+    taxable = max(zero, agi - deduction - extra_deduction)
+    regular = tax_progressive_income_tax(taxable)
+    # Ordinary-income AMT calculation. No preferential gains or foreign tax credits are modeled.
+    amti = max(zero, taxable + (amount('itemized_salt_addback') if use_itemized else deduction))
+    amt_exemption = max(zero, Decimal('140200') - Decimal('.5') * max(zero, amti - Decimal('1000000')))
+    amt_base = max(zero, amti - amt_exemption)
+    tentative = round_money(min(amt_base, Decimal('244500')) * Decimal('.26') + max(zero, amt_base - Decimal('244500')) * Decimal('.28'))
+    amt = max(zero, tentative - regular)
+    early_tax = round_money(early_base * Decimal('.10'))
+    additional_medicare = round_money(max(zero, medicare_wages - Decimal('250000')) * Decimal('.009'))
+    niit = round_money(min(amount('interest'), max(zero, agi - Decimal('250000'))) * Decimal('.038'))
+    federal_tax = max(zero, regular + amt - amount('federal_nonrefundable_credits')) + early_tax + additional_medicare + niit + amount('other_federal_taxes')
+    federal_payments = federal_withheld + extra_medicare_withheld + amount('federal_estimated_paid') + amount('federal_estimated_planned') + amount('federal_refundable_credits')
+    ohio_agi = max(zero, agi + ohio_wages - federal_wages + amount('ohio_additions') - amount('ohio_deductions'))
+    # Latest verified published exemption tiers (2025); statutory 2026 eligibility ceiling.
+    exemption_each = zero if ohio_agi >= Decimal('500000') else Decimal('2400' if ohio_agi <= 40000 else '2150' if ohio_agi <= 80000 else '1900')
+    exemptions = exemption_each * (2 + p['ohio_dependents'])
+    ohio_taxable = max(zero, ohio_agi - exemptions)
+    ohio_base = round_money(Decimal('332') + Decimal('.0275') * (ohio_taxable - Decimal('26050'))) if ohio_taxable > 26050 else zero
+    before_joint = max(zero, ohio_base - amount('ohio_credits_before_joint'))
+    joint_rate = Decimal('.20' if ohio_taxable <= 25000 else '.15' if ohio_taxable <= 50000 else '.10' if ohio_taxable <= 75000 else '.05')
+    joint_credit = min(Decimal('650'), round_money(before_joint * joint_rate)) if ohio_agi < 500000 and all(v >= 500 for v in qualifying.values()) else zero
+    ohio_tax = max(zero, before_joint - joint_credit - amount('ohio_credits_after_joint'))
+    ohio_payments = ohio_withheld + amount('ohio_estimated_paid') + amount('ohio_estimated_planned') + amount('ohio_refundable_credits')
+    return dict(agi=agi, federal_wages=federal_wages, ohio_wages=ohio_wages, ira_gross=ira_gross,
+        ira_taxable=ira_taxable, deduction=deduction, use_itemized=use_itemized, senior_deduction=senior_deduction,
+        taxable_income=taxable, regular_federal=regular, amt=amt, early_tax=early_tax,
+        additional_medicare=additional_medicare, niit=niit, federal_tax=federal_tax,
+        federal_withheld=federal_withheld + extra_medicare_withheld, federal_payments=federal_payments,
+        federal_balance=federal_tax-federal_payments, ohio_agi=ohio_agi, ohio_exemptions=exemptions,
+        ohio_taxable=ohio_taxable, ohio_base=ohio_base, ohio_joint_credit=joint_credit,
+        ohio_tax=ohio_tax, ohio_withheld=ohio_withheld, ohio_payments=ohio_payments,
+        ohio_balance=ohio_tax-ohio_payments, actual_payroll_ira_withheld=actual_withheld,
+        planned_payroll_ira_withheld=planned_withheld,
+        combined_balance=federal_tax + ohio_tax - federal_payments - ohio_payments)
+
+
+def tax_money_input(label, value, key, help=None):
+    result = st.number_input(label, min_value=0.0, max_value=999999999.99,
+        value=float(tax_amount(value)), step=100.0, format='%.2f', key=key, help=help)
+    return str(tax_amount(result, label))
+
+
+def tax_render_payroll(job, prefix, year):
+    person = job['person']
+    result = deepcopy(job)
+    with st.expander(person + ' — paystub and remaining paychecks', expanded=False):
+        st.caption('Use taxable wages and income tax withholding from this person’s latest paystub. '
+                   'Amounts already included in YTD must not be entered again as a future bonus or remaining paycheck.')
+        stamp = st.date_input('Paystub date', value=date.fromisoformat(job['as_of']),
+            min_value=date(year, 1, 1), max_value=date(year, 12, 31), key=prefix+'as_of')
+        result['as_of'] = stamp.isoformat()
+        st.markdown('**Already earned / withheld this year**')
+        left, right = st.columns(2)
+        fields = [('federal_wages_ytd', 'Federal taxable wages YTD ($)'),
+                  ('federal_withheld_ytd', 'Federal income tax withheld YTD ($)'),
+                  ('ohio_wages_ytd', 'Ohio taxable wages YTD ($)'),
+                  ('ohio_withheld_ytd', 'Ohio income tax withheld YTD ($)'),
+                  ('medicare_wages_ytd', 'Medicare wages YTD ($)'),
+                  ('additional_medicare_withheld_ytd', 'Additional Medicare tax withheld YTD ($)')]
+        for i, (field, label) in enumerate(fields):
+            with (left if i % 2 == 0 else right):
+                result[field] = tax_money_input(label, job[field], prefix+field,
+                    help='Only the additional 0.9% tax; do not enter regular Medicare or Social Security withholding here.'
+                    if 'additional_medicare' in field else None)
+        st.markdown('**Expected for the rest of this year**')
+        result['remaining_checks'] = int(st.number_input('Remaining paychecks', min_value=0, max_value=366,
+            value=job['remaining_checks'], step=1, key=prefix+'remaining_checks'))
+        fields = [('federal_wages_per_check', 'Federal taxable wages per remaining check ($)'),
+                  ('federal_withheld_per_check', 'Federal income tax per remaining check ($)'),
+                  ('ohio_wages_per_check', 'Ohio taxable wages per remaining check ($)'),
+                  ('ohio_withheld_per_check', 'Ohio income tax per remaining check ($)'),
+                  ('medicare_wages_per_check', 'Medicare wages per remaining check ($)'),
+                  ('additional_medicare_withheld_remaining', 'Additional Medicare withholding for all remaining checks ($)')]
+        left, right = st.columns(2)
+        for i, (field, label) in enumerate(fields):
+            with (left if i % 2 == 0 else right):
+                result[field] = tax_money_input(label, job[field], prefix+field)
+    return result
+
+
+def tax_ira_editor(rows, prefix, year):
+    with st.expander('Traditional IRA withdrawals', expanded=False):
+        st.caption('Enter gross distributions before withholding. Taxable amount may differ if you have after-tax basis. '
+                   'For your own IRA, leave Before 59½ checked on distributions made before that age. '
+                   'A verified exception reduces only the additional 10% tax. Construction spending alone is not an exception. '
+                   'Mark future planned withdrawals Estimated; each row is counted once, never annualized.')
+        columns = ['Date', 'Gross', 'Taxable', 'Federal withheld', 'Ohio withheld', 'Before 59½',
+                   'Exception amount', 'Exception reason', 'Estimated']
+        display = [dict(zip(columns, [date.fromisoformat(r['date']), float(tax_amount(r['gross'])),
+            float(tax_amount(r['taxable'])), float(tax_amount(r['federal_withheld'])),
+            float(tax_amount(r['ohio_withheld'])), tax_amount(r['early_taxable']) > 0,
+            float(tax_amount(r['exception_amount'])), r['exception_reason'], r['estimated']])) for r in rows]
+        frame = pd.DataFrame(display, columns=columns)
+        config = {name: st.column_config.NumberColumn(min_value=0.0, max_value=999999999.99,
+                    format='$%.2f', required=True, default=None if name in ('Gross', 'Taxable') else 0.0)
+                  for name in columns if name not in ('Date', 'Exception reason', 'Estimated', 'Before 59½')}
+        config['Date'] = st.column_config.DateColumn(required=True, min_value=date(year,1,1),
+            max_value=date(year,12,31), default=date(year,1,1), format='MMM D, YYYY')
+        config['Estimated'] = st.column_config.CheckboxColumn(default=False, required=True)
+        config['Before 59½'] = st.column_config.CheckboxColumn(default=True, required=True)
+        config['Exception reason'] = st.column_config.TextColumn(max_chars=1000)
+        edited = st.data_editor(frame, num_rows='dynamic', hide_index=True, use_container_width=True,
+            column_config=config, key=prefix+'ira_editor')
+        result = []
+        for row in edited.to_dict('records'):
+            if all(value is None or (not isinstance(value, (str, bool, date)) and pd.isna(value))
+                   for value in row.values()):
+                continue
+            stamp = row['Date']
+            if isinstance(stamp, datetime):
+                stamp = stamp.date()
+            if not isinstance(stamp, date):
+                raise ValueError('Enter a date on each IRA row, or remove the unfinished row.')
+            result.append(dict(date=stamp.isoformat(), gross=str(tax_amount(row['Gross'])),
+                taxable=str(tax_amount(row['Taxable'])), federal_withheld=str(tax_amount(row['Federal withheld'])),
+                ohio_withheld=str(tax_amount(row['Ohio withheld'])),
+                early_taxable=str(tax_amount(row['Taxable'])) if bool(row['Before 59½']) else '0',
+                exception_amount=str(tax_amount(row['Exception amount'])),
+                exception_reason='' if pd.isna(row['Exception reason']) else str(row['Exception reason']),
+                estimated=bool(row['Estimated'])))
+        return result
+
+
+def tax_render_results(inputs):
+    selected = tax_calculate(inputs)
+    st.subheader('Projected year-end result')
+    st.caption('Federal and Ohio are separate returns. A refund on one does not pay the other automatically. '
+               'Figures include the remaining pay and planned tax payments entered below.')
+    for title, field in [('Federal', 'federal_balance'), ('Ohio', 'ohio_balance')]:
+        balance = selected[field]
+        with st.container(key='tax_result_'+title.lower()):
+            a, b, c = st.columns(3)
+            a.metric(title + ' projected tax', f'${selected[title.lower()+"_tax"]:,.2f}')
+            b.metric(title + ' payments and refundable credits', f'${selected[title.lower()+"_payments"]:,.2f}')
+            c.metric(title + (' estimated amount due' if balance >= 0 else ' estimated refund'), f'${abs(balance):,.2f}')
+    comparison = []
+    for include, label in [(False, 'Without bonus'), (True, 'With bonus')]:
+        r = tax_calculate(inputs, include)
+        comparison.append({'Scenario': label, 'Federal due': max(Decimal(0),r['federal_balance']),
+            'Federal refund': max(Decimal(0),-r['federal_balance']),
+            'Ohio due': max(Decimal(0),r['ohio_balance']), 'Ohio refund': max(Decimal(0),-r['ohio_balance'])})
+    st.markdown('**Bonus comparison**')
+    st.html(themed_table_html(comparison, ['Federal due', 'Federal refund', 'Ohio due', 'Ohio refund']))
+    with st.expander('Calculation details'):
+        labels = [('Federal taxable wages', 'federal_wages'), ('Gross IRA withdrawals', 'ira_gross'),
+            ('Taxable IRA withdrawals', 'ira_taxable'), ('Federal adjusted gross income', 'agi'),
+            ('Selected standard / allowed itemized deduction', 'deduction'),
+            ('Enhanced senior deduction', 'senior_deduction'), ('Federal taxable income', 'taxable_income'),
+            ('Regular federal income tax before credits', 'regular_federal'), ('Alternative minimum tax', 'amt'),
+            ('IRA early-withdrawal additional tax', 'early_tax'), ('Additional Medicare tax', 'additional_medicare'),
+            ('Net investment income tax on bank interest', 'niit'), ('Ohio adjusted gross income', 'ohio_agi'),
+            ('Ohio personal / dependent exemptions', 'ohio_exemptions'), ('Ohio taxable income', 'ohio_taxable'),
+            ('Ohio tax before credits', 'ohio_base'), ('Ohio joint filing credit', 'ohio_joint_credit'),
+            ('Federal withholding, including Additional Medicare', 'federal_withheld'),
+            ('Ohio withholding', 'ohio_withheld')]
+        st.html(themed_table_html([{'Calculation': label, 'Amount': selected[key]} for label,key in labels], ['Amount']))
+    return selected
+
+
+def render_tax_projection_page():
+    require_session()
+    st.title('Year-End Tax Projection')
+    st.caption('Married filing jointly · Ohio full-year residents · wages, traditional IRA distributions and ordinary bank interest')
+    year_col, reload_col = st.columns([1,3], vertical_alignment='bottom')
+    with year_col:
+        year = int(st.number_input('Tax year', min_value=2026, max_value=2100,
+            value=max(2026, datetime.now(LOCAL_TZ).year), step=1, key='tax_projection_year'))
+    prefix = 'tax_'+str(year)+'_'
+    with reload_col:
+        reload_saved = st.button('Reload saved projection / discard unsaved changes', key=prefix+'reload')
+    if reload_saved:
+        for key in list(st.session_state):
+            if key.startswith(prefix):
+                st.session_state.pop(key, None)
+        st.rerun()
+    if prefix+'loaded' not in st.session_state:
+        try:
+            response = conn.table('LedgerTaxProjections').select('*').eq('tax_year', year).execute()
+            record = response.data[0] if response.data else None
+            inputs = tax_validate_inputs(record['inputs'], year) if record else tax_default_inputs(year)
+            st.session_state[prefix+'loaded'] = dict(inputs=inputs, revision=record['revision'] if record else None,
+                can_save=True)
+        except Exception:
+            st.session_state[prefix+'loaded'] = dict(inputs=tax_default_inputs(year), revision=None, can_save=False)
+    saved = st.session_state[prefix+'loaded']
+    original = deepcopy(saved['inputs'])
+    if prefix+'ira_editor' not in st.session_state:
+        st.session_state[prefix+'ira_baseline'] = deepcopy(original['ira'])
+    inputs = deepcopy(original)
+    if not saved['can_save']:
+        st.warning('Saved tax inputs could not be loaded. Install the included tax SQL update, or restore the connection, '
+                   'then reload. You can explore an unsaved projection below; saving is disabled.')
+    st.caption('Rules: verified 2026 federal brackets; Ohio statutory 2026 formula with provisional exemption amounts '
+               'from the latest verified published table (2025). Update Ohio assumptions when new figures are verified.')
+    if year != 2026:
+        st.warning(f'{year} is a provisional scenario using 2026 federal brackets and current Ohio planning figures. '
+                   'It is not a confirmed '+str(year)+' tax calculation. Saved years remain separate.')
+    inputs['bonus']['include'] = st.checkbox('Include year-end bonus', value=original['bonus']['include'], key=prefix+'bonus_include')
+    results_slot = st.empty()
+    with st.expander('Start here — information to gather', expanded=False):
+        st.write('Use the latest paystub for each of you, IRA withdrawal statements showing gross amount and withholding, '
+                 'and any estimated tax payments. Enter taxable wages, not your net checking deposit. '
+                 'For a future year, enter zero YTD and all expected paychecks as remaining pay.')
+        st.write('This page calculates the income types listed above. Capital gains, qualified dividends, Social Security, '
+                 'business/rental income, foreign tax items, municipal and school-district taxes, and payment-timing penalties '
+                 'need separate calculations. They are not included by entering an ordinary-income total.')
+    with st.expander('Household and deductions', expanded=False):
+        st.caption('Enter ages at the end of the selected tax year. Federal standard deduction adjusts for age 65 and blindness.')
+        left, right = st.columns(2)
+        for side, who in [(left, 'bill'), (right, 'spouse')]:
+            with side:
+                inputs[who+'_age'] = st.number_input(('Bill' if who=='bill' else 'Spouse')+' age at year end',
+                    min_value=0, max_value=120, value=original[who+'_age'], step=1, key=prefix+who+'_age')
+                inputs[who+'_blind'] = st.checkbox(('Bill' if who=='bill' else 'Spouse')+' qualifies as blind for tax purposes',
+                    value=original[who+'_blind'], key=prefix+who+'_blind')
+        inputs['deduction_choice'] = st.selectbox('Federal deduction', ['Larger deduction', 'Standard', 'Itemized'],
+            index=['Larger deduction', 'Standard', 'Itemized'].index(original['deduction_choice']), key=prefix+'deduction_choice')
+        for key, label in [('allowed_itemized','Allowed itemized deductions after applicable limits ($)'),
+                           ('itemized_salt_addback','State/local tax portion of that itemized deduction ($)'),
+                           ('other_federal_deductions','Other allowed federal below-AGI deductions ($)'),
+                           ('standard_cash_charity','Eligible cash charity if taking standard deduction ($)')]:
+            inputs[key] = tax_money_input(label, original[key], prefix+key,
+                help='Use eligible amounts after income limits, SALT caps, and other deduction restrictions. '
+                     'Do not enter construction spending or a raw mortgage balance as a deduction.')
+        st.caption('Other allowed deductions are entered after their eligibility and phaseout calculations. '
+                   'Do not include the standard/itemized or enhanced senior deduction again. '
+                   'Eligible non-itemizer cash charity is capped at $2,000 for joint filers in this model.')
+    inputs['jobs'] = [tax_render_payroll(job, prefix+'job'+str(i)+'_', year) for i,job in enumerate(original['jobs'])]
+    try:
+        inputs['ira'] = tax_ira_editor(st.session_state[prefix+'ira_baseline'], prefix, year)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    with st.expander('Optional year-end bonus amounts', expanded=False):
+        st.caption('Only a bonus paid in this tax year and not already included in paystub YTD. '
+                   'Withholding is a tax payment, not the final tax rate on the bonus.')
+        inputs['bonus']['person'] = st.selectbox('Bonus recipient', ['Bill','Spouse'],
+            index=['Bill','Spouse'].index(original['bonus']['person']), key=prefix+'bonus_person')
+        left, right = st.columns(2)
+        for i,(key,label) in enumerate([('gross','Estimated gross bonus ($)'),
+            ('federal_withheld','Expected federal income tax withholding ($)'),
+            ('ohio_withheld','Expected Ohio withholding ($)'),
+            ('additional_medicare_withheld','Expected Additional Medicare withholding ($)')]):
+            with (left if i%2==0 else right):
+                inputs['bonus'][key] = tax_money_input(label, original['bonus'][key], prefix+'bonus_'+key)
+        st.caption('Gross bonus is assumed taxable for federal, Ohio and Medicare. If payroll deductions make those amounts '
+                   'different, enter the expected taxable portions below; leave them blank to use gross. Zero is an explicit amount.')
+        for key,label in [('federal_taxable','Federal taxable portion of bonus, if different ($)'),
+                          ('ohio_taxable','Ohio taxable portion of bonus, if different ($)'),
+                          ('medicare_taxable','Medicare taxable portion of bonus, if different ($)')]:
+            result = st.number_input(label,min_value=0.0,max_value=999999999.99,format='%.2f',
+                value=None if original['bonus'][key] is None else float(tax_amount(original['bonus'][key])),
+                key=prefix+'bonus_'+key)
+            inputs['bonus'][key] = None if result is None else str(tax_amount(result))
+    with st.expander('Bank interest, adjustments, credits and payments', expanded=False):
+        st.caption('Use full-year totals. Enter zero for items that do not apply. Income tax withholding excludes '
+                   'regular Social Security and Medicare. Credits and deductions must be eligible after their income limits.')
+        fields = [('interest','Taxable bank interest for the full year ($)'),
+            ('interest_federal_withheld','Federal income tax withheld on that interest ($)'),
+            ('interest_ohio_withheld','Ohio income tax withheld on that interest ($)'),
+            ('federal_adjustments','Allowed federal adjustments to income ($)'),
+            ('ohio_additions','Ohio additions to federal AGI ($)'), ('ohio_deductions','Ohio deductions from federal AGI ($)'),
+            ('federal_nonrefundable_credits','Allowed federal nonrefundable credits ($)'),
+            ('federal_refundable_credits','Allowed federal refundable credits ($)'),
+            ('other_federal_taxes','Other federal taxes not calculated above ($)'),
+            ('ohio_credits_before_joint','Allowed Ohio credits before joint filing credit ($)'),
+            ('ohio_credits_after_joint','Allowed Ohio credits after joint filing credit ($)'),
+            ('ohio_refundable_credits','Allowed Ohio refundable credits ($)'),
+            ('federal_estimated_paid','Federal estimated payments already paid ($)'),
+            ('federal_estimated_planned','Additional federal estimated payments planned ($)'),
+            ('ohio_estimated_paid','Ohio estimated payments already paid ($)'),
+            ('ohio_estimated_planned','Additional Ohio estimated payments planned ($)')]
+        left,right = st.columns(2)
+        for i,(key,label) in enumerate(fields):
+            with (left if i%2==0 else right):
+                inputs[key] = tax_money_input(label, original[key], prefix+key)
+        inputs['ohio_dependents'] = int(st.number_input('Eligible Ohio dependents, excluding both spouses',
+            min_value=0,max_value=30,value=original['ohio_dependents'],step=1,key=prefix+'ohio_dependents'))
+        st.caption('Ohio personal exemptions and the joint filing credit are calculated here. '
+                   'Enter other allowed Ohio credits manually; do not count the joint filing credit twice. '
+                   'Withholding on paychecks, IRA withdrawals and bonus is already included above.')
+    inputs['notes'] = st.text_area('Projection notes',value=original['notes'],max_chars=4000,key=prefix+'notes')
+    inputs['reviewed'] = st.checkbox('I have entered all expected income and reviewed deductions, credits and withholding for this scenario',
+        value=original['reviewed'],key=prefix+'reviewed')
+    try:
+        clean = tax_validate_inputs(inputs, year)
+        # Preserve valid unsaved drafts when another year's widgets replace these.
+        # The IRA editor has a separate stable baseline to avoid replaying added rows.
+        saved['inputs'] = deepcopy(clean)
+        with results_slot.container():
+            result = tax_render_results(clean) if clean['reviewed'] else None
+            if not clean['reviewed']:
+                st.info('Complete your inputs and check the review box to display the projection. You can save an unfinished draft.')
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    if st.button('Save projection inputs', type='primary', disabled=not saved['can_save'], key=prefix+'save'):
+        require_session()
+        try:
+            response = conn.rpc('ledger_save_tax_projection',dict(p_year=year,p_revision=saved['revision'],
+                p_inputs=clean,p_rules_version=TAX_RULES_VERSION)).execute()
+            record = response.data
+            if not isinstance(record,dict) or record.get('tax_year')!=year or not record.get('revision'):
+                raise ValueError('Save was not confirmed.')
+            saved['revision'] = int(record['revision'])
+            st.success('Projection inputs saved for '+str(year)+'. Ledger balances and transactions are unchanged.')
+        except Exception:
+            st.error('Projection inputs were not saved. Another session may have changed them; reload saved inputs before retrying.')
+    st.download_button('Download projection snapshot',
+        data=json.dumps(dict(tax_year=year,rules_version=TAX_RULES_VERSION,inputs=clean,result=result),indent=2,default=str),
+        file_name=f'tax_projection_{year}.json',mime='application/json',key=prefix+'download')
+    with st.expander('Calculation scope and official references'):
+        st.write('This is a planning estimate, not a filed return. It uses progressive federal brackets, '
+                 'standard or entered allowed itemized deductions, the age-based senior deduction where applicable, '
+                 'ordinary-income AMT, IRA early-distribution tax, Additional Medicare tax and net investment income tax on bank interest. '
+                 'It does not calculate underpayment penalties or their quarterly timing. Final return tables may round differently.')
+        st.markdown('[IRS 2026 rates and deductions](https://www.irs.gov/irb/2025-45_IRB) · '
+            '[IRS estimated-tax guidance](https://www.irs.gov/publications/p505) · '
+            '[IRA early-distribution exceptions](https://www.irs.gov/retirement-plans/plan-participant-employee/retirement-topics-exceptions-to-tax-on-early-distributions) · '
+            '[Ohio tax formula](https://codes.ohio.gov/ohio-revised-code/section-5747.02) · '
+            '[Ohio exemptions](https://codes.ohio.gov/ohio-revised-code/section-5747.025) · '
+            '[Ohio joint filing credit](https://codes.ohio.gov/ohio-revised-code/section-5747.05)')
+
+
 def savings_transfer_deltas(original, replacement):
     deltas = {}
     for row, multiplier in ((original, -1), (replacement, 1)):
@@ -5226,6 +5758,8 @@ if st.sidebar.button('Transaction Categories', use_container_width=True):
 if st.sidebar.button('AMZ Card Ledger', use_container_width=True):
     st.session_state['ledger_view'] = 'Reconcile'
 
+if st.sidebar.button('Year-End Tax Projection', use_container_width=True):
+    st.session_state['ledger_view'] = 'Tax Projection'
 if st.sidebar.button('View / Edit Budget', use_container_width=True):
     st.session_state['ledger_view'] = 'Budget'
 if st.sidebar.button('Lines of Credit', use_container_width=True):
@@ -5234,7 +5768,7 @@ if st.sidebar.button('Lines of Credit', use_container_width=True):
     st.session_state['ledger_view'] = 'Lines of Credit'
 
 if st.session_state.get('ledger_view') in ('Budget', 'Reconcile', 'Lines of Credit', 'Categories', 'Merchants',
-    'Archived Accounts', 'Manage Account'):
+    'Archived Accounts', 'Manage Account', 'Tax Projection'):
     account_selection = st.session_state['ledger_view']
 st.sidebar.divider()
 if st.sidebar.button('Log Out', use_container_width=True):
@@ -5266,6 +5800,9 @@ elif account_selection == "Reconcile":
         reconcile_card_dialog()
     finally:
         st.session_state['cash_account_id'] = selected_checking
+
+elif account_selection == "Tax Projection":
+    render_tax_projection_page()
 
 elif account_selection == "Budget":
     render_budget_page()
