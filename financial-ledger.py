@@ -4270,8 +4270,19 @@ TAX_STUB_FIELDS = (
 
 def tax_stub_lines(words):
     # Keep positions so Current and YTD cannot be swapped by PDF reading order.
+    import math
+    clean = []
+    for word in words:
+        try:
+            row = dict(word, text=str(word['text']))
+            for key in ('top', 'bottom', 'x0', 'x1', 'confidence'):
+                row[key] = float(word.get(key, 1) if key == 'confidence' else word[key])
+            if all(math.isfinite(row[k]) for k in ('top','bottom','x0','x1','confidence')) and row['x1'] >= row['x0'] and row['bottom'] >= row['top']:
+                clean.append(row)
+        except (TypeError, ValueError, KeyError, OverflowError):
+            continue
     lines = []
-    for word in sorted(words, key=lambda w: (w['top'], w['x0'])):
+    for word in sorted(clean, key=lambda w: (w['top'], w['x0'])):
         middle = (word['top'] + word['bottom']) / 2
         line = next((r for r in reversed(lines[-4:]) if abs(r['middle']-middle) <= max(3, (word['bottom']-word['top'])*.4)), None)
         if line is None:
@@ -4285,20 +4296,22 @@ def tax_stub_parse(words, year):
     lines = tax_stub_lines(words)
     found, dates, other_years = {}, set(), set()
     headers = None
+    amount_columns = False
     money_pattern = r'(?<![\w./-])\$?\s*(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}(?!\d)'
     def normalized(text):
         return re.sub(r'[^a-z0-9]+', ' ', text.lower()).strip()
     def field_name(label):
         label = normalized(label)
         wages = any(w in label for w in ('wage','taxable','subject to'))
-        tax_line=any(w in label for w in ('tax','withhold','withheld','fitw')) or label == 'fit'
+        withholding = bool(re.search(r'\bw h\b', label))
+        tax_line=any(w in label for w in ('tax','withhold','withheld','fitw')) or label == 'fit' or withholding
         if 'additional' in label and ('medicare' in label or 'med ' in label):
             return None if wages else 'additional_medicare_withheld'
-        if any(w in label for w in ('medicare','fed med','med wages')):
+        if any(w in label for w in ('medicare','fed med','med wages','fed mwt')):
             return 'medicare_wages' if wages else None
-        if any(w in label for w in ('federal','fed income','fed tax','fitw','fit ')) or label == 'fit':
+        if any(w in label for w in ('federal','fed income','fed tax','fitw','fit ')) or label == 'fit' or re.search(r'\bfed w h\b',label):
             return 'federal_wages' if wages else 'federal_withheld' if tax_line else None
-        if any(w in label for w in ('ohio','oh tax','oh state','oh income','oh withholding','oh taxable','sit oh')):
+        if any(w in label for w in ('ohio','oh tax','oh state','oh income','oh withholding','oh taxable','sit oh')) or re.search(r'\boh w h\b',label):
             return 'ohio_wages' if wages else 'ohio_withheld' if tax_line else None
         return None
     def add(field, amount, confidence):
@@ -4317,11 +4330,26 @@ def tax_stub_parse(words, year):
                     if stamp.year==year: dates.add(stamp.isoformat())
                     else: other_years.add(stamp.year)
                 except ValueError: pass
-        current = [w for w in line if normalized(w['text']) in ('current','this check','this period')]
-        ytd = [w for w in line if normalized(w['text']) in ('ytd','year to date','year-to-date')]
+        def phrase_words(phrases):
+            for length in (1,2,3):
+                for start in range(len(line)-length+1):
+                    group=line[start:start+length]
+                    if normalized(' '.join(w['text'] for w in group)) in phrases:
+                        yield dict(x0=group[0]['x0'],x1=group[-1]['x1'])
+        current = list(phrase_words(('current','this check','this period')))
+        ytd = list(phrase_words(('ytd','year to date')))
         if current and ytd:
             headers = {'current': (current[-1]['x0']+current[-1]['x1'])/2,
                        'ytd': (ytd[-1]['x0']+ytd[-1]['x1'])/2}
+            amount_columns = False
+            continue
+        amounts = [w for w in line if normalized(w['text']) == 'amount']
+        if headers and len(amounts)==2:
+            # Dayforce group headings span Hours/Units, Rate and Amount.
+            # The Amount subheadings, rather than the broad group centers, anchor money.
+            ordered=sorted(headers,key=headers.get)
+            headers={period:(word['x0']+word['x1'])/2 for period,word in zip(ordered,amounts)}
+            amount_columns=True
             continue
         # Explicit field + YTD/Current label on one line is also supported.
         matches = list(re.finditer(money_pattern,text))
@@ -4335,14 +4363,16 @@ def tax_stub_parse(words, year):
                 suffix = '_ytd' if period=='ytd' else '_per_check'
                 add(field+suffix,matches[0].group(),min(w.get('confidence',1) for w in line))
             continue
-        if headers and len(matches)==2:
+        if headers and (len(matches)==2 or amount_columns):
             numeric = [w for w in line if re.fullmatch(r'\$?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}',w['text'])]
-            if len(numeric)!=2: continue
+            if len(numeric)!=2 and not amount_columns: continue
             assigned = {}
             for word in numeric:
                 # Numeric columns are normally right aligned, headers centered.
                 center=(word['x0']+word['x1'])/2
                 period=min(headers,key=lambda key:abs(headers[key]-center))
+                if amount_columns and abs(headers[period]-center) > abs(headers['ytd']-headers['current'])*.32:
+                    continue
                 if period in assigned: assigned={};break
                 assigned[period]=word
             for period,word in assigned.items():
@@ -4389,33 +4419,75 @@ def tax_stub_extract(data, filename, year, page_number=1, force_ocr=False):
     from io import BytesIO
     if not data or len(data)>10*1024*1024:
         raise ValueError('Choose a nonempty paystub no larger than 10 MB.')
-    if filename.lower().endswith('.pdf'):
-        import pdfplumber
-        import pypdfium2 as pdfium
+    warnings=[]
+    diagnostics=[]
+    def failure(stage, exc):
+        # Never display or log exception messages, document text or payroll values.
+        return stage+' ('+type(exc).__name__+')'
+    def page_check(count):
+        if not 1 <= count <= 5:
+            raise ValueError('Use a paystub PDF with one to five pages.')
+        if not 1 <= page_number <= count:
+            raise ValueError('That page is not in the PDF. Choose an existing page.')
+    def recognize(image):
         try:
-            with pdfplumber.open(BytesIO(data)) as document:
-                if not 1 <= len(document.pages) <= 5:
-                    raise ValueError('Use a paystub PDF with one to five pages.')
-                if not 1 <= page_number <= len(document.pages):
-                    raise ValueError('That page is not in the PDF. Choose an existing page.')
-                page=document.pages[page_number-1]
-                words=page.extract_words() if not force_ocr else []
-            method='PDF text'
-            if not words:
-                with pdfium.PdfDocument(data) as document:
-                    page=document[page_number-1]
+            return tax_stub_parse(tax_stub_ocr_words(image),year)
+        except Exception as exc:
+            raise ValueError('Image recognition could not finish. Confirm the included requirements are installed and restart the hosted app. '
+                             'Troubleshooting: '+failure('Image recognition',exc)+'.') from None
+    if filename.lower().endswith('.pdf'):
+        native=None
+        words=[]
+        if not force_ocr:
+            try:
+                import pdfplumber
+                with pdfplumber.open(BytesIO(data)) as document:
+                    count=len(document.pages)
+                    # Check outside this exception guard so invalid page requests cannot fall back.
+                    if 1 <= count <= 5 and 1 <= page_number <= count:
+                        words=document.pages[page_number-1].extract_words()
+                page_check(count)
+            except Exception as exc:
+                diagnostics.append(failure('PDF text reading',exc))
+            else:
+                try:
+                    native=tax_stub_parse(words,year)
+                except Exception as exc:
+                    diagnostics.append(failure('PDF text layout',exc))
+                if native and native['values']:
+                    native.update(method='PDF text',warnings=warnings,diagnostics=diagnostics)
+                    return native
+        # A broken/missing text reader or unrecognized text layout does not block image reading.
+        try:
+            import pypdfium2 as pdfium
+        except ImportError:
+            raise ValueError('The PDF image reader is unavailable. Upload the included requirements.txt, commit, and restart the hosted app.') from None
+        try:
+            document=pdfium.PdfDocument(data)
+        except Exception as exc:
+            raise ValueError('Could not open this PDF. Use an unlocked PDF or a clear PNG/JPG image. '
+                             'Troubleshooting: '+failure('PDF opening',exc)+'.') from None
+        with document:
+            page_check(len(document))
+            try:
+                page=document[page_number-1]
+                try:
                     width,height=page.get_size()
                     if width<=0 or height<=0 or width*height>16000000:
                         raise ValueError('That PDF page is too large to scan. Use a smaller copy.')
-                    scale=min(2.5,(16000000/(width*height))**.5)
-                    bitmap=page.render(scale=scale)
-                    image=bitmap.to_pil().copy()
-                    words=tax_stub_ocr_words(image)
-                    image.close();bitmap.close();page.close()
-                method='Image recognition'
-        except ValueError: raise
-        except Exception:
-            raise ValueError('Could not read this PDF. Use an unlocked PDF or a clear PNG/JPG image.') from None
+                    bitmap=page.render(scale=min(2.5,(16000000/(width*height))**.5))
+                    try: image=bitmap.to_pil().copy()
+                    finally: bitmap.close()
+                finally: page.close()
+            except ValueError: raise
+            except Exception as exc:
+                raise ValueError('Could not render this PDF page. Try a clear PNG/JPG copy. '
+                                 'Troubleshooting: '+failure('PDF page rendering',exc)+'.') from None
+        try: result=recognize(image)
+        finally: image.close()
+        method='Image recognition'
+        if not force_ocr:
+            warnings.append('Image recognition was used automatically because the PDF text could not provide recognized payroll fields.')
     else:
         from PIL import Image, ImageOps
         try:
@@ -4423,14 +4495,15 @@ def tax_stub_extract(data, filename, year, page_number=1, force_ocr=False):
                 if source.format not in ('PNG','JPEG') or source.width*source.height>16000000:
                     raise ValueError('Use a PNG/JPG image with no more than 16 million pixels.')
                 image=ImageOps.exif_transpose(source).convert('RGB')
-                words=tax_stub_ocr_words(image)
-                image.close()
+                try: result=recognize(image)
+                finally: image.close()
             method='Image recognition'
         except ValueError: raise
-        except Exception:
-            raise ValueError('Could not recognize this image. Check the import dependencies and use a clear PNG/JPG.') from None
-    result=tax_stub_parse(words,year)
+        except Exception as exc:
+            raise ValueError('Could not open this image. Use a clear PNG/JPG. Troubleshooting: '+failure('Image opening',exc)+'.') from None
     result['method']=method
+    result['warnings']=warnings
+    result['diagnostics']=diagnostics
     return result
 
 
@@ -4451,7 +4524,7 @@ def tax_render_stub_import(job, prefix, year):
     page=int(st.number_input('PDF page to read',min_value=1,max_value=5,value=1,key=import_key+'page',
         on_change=tax_stub_clear_review,args=(import_key,)))
     scan=st.checkbox('Use image recognition for this PDF page',key=import_key+'scan',
-        help='Use this if the PDF text layer is incomplete. Scanned PDFs and images are recognized automatically.',
+        help='Force image recognition. If normal PDF text reading fails or finds no payroll fields, image recognition is tried automatically.',
         on_change=tax_stub_clear_review,args=(import_key,))
     if st.button('Read paystub',disabled=upload is None,key=import_key+'read'):
         try:
@@ -4461,13 +4534,20 @@ def tax_render_stub_import(job, prefix, year):
             st.session_state[import_key+'review_id']=st.session_state.get(import_key+'review_id',0)+1
         except Exception as exc:
             st.session_state.pop(import_key+'review',None)
-            st.error(str(exc) if isinstance(exc,ValueError) else 'Import could not run. Check the included dependency install steps.')
+            st.error(str(exc) if isinstance(exc,ValueError) else 'The paystub review could not open. Restart the app and try again. Troubleshooting: review setup ('+type(exc).__name__+').')
     review=st.session_state.get(import_key+'review')
     if review:
+        for message in review.get('warnings',[]): st.info(message)
+        if review.get('diagnostics'):
+            with st.expander('Import troubleshooting'):
+                st.caption(' · '.join(review['diagnostics']))
         if review.get('wrong_year'):
             st.error('The recognized pay date is in another tax year. Choose the correct projection year and read the paystub again.')
         st.caption(review['method']+' · '+str(len(review['values']))+' recognized fields. '
                    'Blank or conflicting values are unresolved; they will not replace your existing values.')
+        if not any(key.endswith('wages_ytd') for key in review['values']):
+            st.warning('No explicitly labeled taxable wage totals were recognized. Gross earnings are not automatically treated as taxable wages. '
+                       'Review the unresolved wage fields using your payroll tax summary; importing withholding alone does not complete the income projection.')
         frame=pd.DataFrame([{'Use':key in review['values'] and key.endswith('_ytd'),
             'Payroll field':label,'Amount':float(review['values'][key]) if key in review['values'] else None,
             'Recognition':'Review' if key in review['values'] else 'Unresolved'} for key,label in TAX_STUB_FIELDS])
