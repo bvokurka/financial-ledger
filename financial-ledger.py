@@ -4076,8 +4076,6 @@ def tax_validate_inputs(payload, year):
         if type(estimates[key]) is not bool: raise ValueError('Choose a valid bonus estimate setting.')
     for key in ('prior_supplemental','medicare_before','regular_medicare_manual'):
         estimates[key]=str(tax_amount(estimates[key],key.replace('_',' ')))
-    if estimates['federal_auto'] and not estimates['flat_eligible']:
-        raise ValueError('Confirm eligibility for the supplemental flat method, or use manual federal withholding.')
     for key in set(bonus) - {'include', 'person', 'estimate'}:
         if key.endswith('_taxable') and bonus[key] is None:
             continue
@@ -4179,10 +4177,13 @@ def tax_calculate(payload, include_bonus=None):
         actual_withheld += get('federal_withheld_ytd') + get('ohio_withheld_ytd') + get('additional_medicare_withheld_ytd')
         planned_withheld += n * (get('federal_withheld_per_check') + get('ohio_withheld_per_check')) + get('additional_medicare_withheld_remaining')
     bonus = deepcopy(p['bonus'])
+    use_bonus = bonus['include'] if include_bonus is None else include_bonus
+    if use_bonus and bonus['estimate']['federal_auto'] and not bonus['estimate']['flat_eligible']:
+        raise ValueError('Confirm eligibility for the supplemental flat method, or use manual federal withholding in Optional year-end bonus amounts. Your draft can still be saved.')
     bonus_estimate=tax_bonus_withholding(bonus)
     bonus['federal_withheld']=str(bonus_estimate['federal'])
     bonus['additional_medicare_withheld']=str(bonus_estimate['additional_medicare'])
-    if bonus['include'] if include_bonus is None else include_bonus:
+    if use_bonus:
         gross = tax_amount(bonus['gross'])
         bonus_wage = lambda field: gross if bonus[field] is None else tax_amount(bonus[field])
         federal_wages += bonus_wage('federal_taxable')
@@ -4688,7 +4689,13 @@ def tax_render_results(inputs):
             c.metric(title + (' estimated amount due' if balance >= 0 else ' estimated refund'), f'${abs(balance):,.2f}')
     comparison = []
     for include, label in [(False, 'Without bonus'), (True, 'With bonus')]:
-        r = tax_calculate(inputs, include)
+        try:
+            r = tax_calculate(inputs, include)
+        except ValueError as exc:
+            if include:
+                st.info('With-bonus comparison is unavailable until the bonus settings are completed. '+str(exc))
+                continue
+            raise
         comparison.append({'Scenario': label, 'Federal due': max(Decimal(0),r['federal_balance']),
             'Federal refund': max(Decimal(0),-r['federal_balance']),
             'Ohio due': max(Decimal(0),r['ohio_balance']), 'Ohio refund': max(Decimal(0),-r['ohio_balance'])})
@@ -4712,6 +4719,14 @@ def tax_render_results(inputs):
 
 def render_tax_projection_page():
     require_session()
+    # Confine the tax page to Streamlit's normal scrolling surface. This avoids
+    # relying on the browser body's height as expandable sections grow.
+    st.html("""<style>
+    section[data-testid="stMain"] {
+        height:100vh;height:100dvh;max-height:100dvh;min-height:0;
+        overflow-y:auto!important;overscroll-behavior-y:auto;
+    }
+    </style>""")
     st.title('Year-End Tax Projection')
     st.caption('Married filing jointly · Ohio full-year residents · wages, traditional IRA distributions and ordinary bank interest')
     year_col, reload_col = st.columns([1,3], vertical_alignment='bottom')
@@ -4751,6 +4766,10 @@ def render_tax_projection_page():
     if not saved['can_save']:
         st.warning('Saved tax inputs could not be loaded. Install the included tax SQL update, or restore the connection, '
                    'then reload. You can explore an unsaved projection below; saving is disabled.')
+    save_from_top = st.button('Save projection inputs', type='primary',
+        disabled=not saved['can_save'], key=prefix+'save_top')
+    save_feedback = st.empty()
+    st.caption('Save keeps the inputs for this tax year. Expanding or closing a section does not change what is included.')
     st.caption('Rules: verified 2026 federal brackets; Ohio statutory 2026 formula with provisional exemption amounts '
                'from the latest verified published table (2025). Update Ohio assumptions when new figures are verified.')
     if year != 2026:
@@ -4879,14 +4898,21 @@ def render_tax_projection_page():
         # Preserve valid unsaved drafts when another year's widgets replace these.
         # The IRA editor has a separate stable baseline to avoid replaying added rows.
         saved['inputs'] = deepcopy(clean)
-        with results_slot.container():
-            result = tax_render_results(clean) if clean['reviewed'] else None
-            if not clean['reviewed']:
-                st.info('Complete your inputs and check the review box to display the projection. You can save an unfinished draft.')
     except ValueError as exc:
-        st.error(str(exc))
+        save_feedback.error('Inputs could not be saved: '+str(exc))
         return
-    if st.button('Save projection inputs', type='primary', disabled=not saved['can_save'], key=prefix+'save'):
+    result = None
+    with results_slot.container():
+        if clean['reviewed']:
+            try:
+                result = tax_render_results(clean)
+            except ValueError as exc:
+                st.warning('Projection not displayed: '+str(exc))
+        else:
+            st.info('Complete your inputs and check the review box to display the projection. You can save an unfinished draft.')
+    save_from_bottom = st.button('Save projection inputs', type='primary',
+        disabled=not saved['can_save'], key=prefix+'save')
+    if save_from_top or save_from_bottom:
         require_session()
         try:
             response = conn.rpc('ledger_save_tax_projection',dict(p_year=year,p_revision=saved['revision'],
@@ -4895,9 +4921,9 @@ def render_tax_projection_page():
             if not isinstance(record,dict) or record.get('tax_year')!=year or not record.get('revision'):
                 raise ValueError('Save was not confirmed.')
             saved['revision'] = int(record['revision'])
-            st.success('Projection inputs saved for '+str(year)+'. Ledger balances and transactions are unchanged.')
+            save_feedback.success('Projection inputs saved for '+str(year)+'. Ledger balances and transactions are unchanged.')
         except Exception:
-            st.error('Projection inputs were not saved. Another session may have changed them; reload saved inputs before retrying.')
+            save_feedback.error('Projection inputs were not saved. Another session may have changed them; reload saved inputs before retrying.')
     st.download_button('Download projection snapshot',
         data=json.dumps(dict(tax_year=year,rules_version=TAX_RULES_VERSION,inputs=clean,result=result),indent=2,default=str),
         file_name=f'tax_projection_{year}.json',mime='application/json',key=prefix+'download')
