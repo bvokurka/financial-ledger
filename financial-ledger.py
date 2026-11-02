@@ -1610,6 +1610,8 @@ def edit_transaction_dialog():
 
     workflow_types = (["AMZ Card"] if int(selected_tx.get('cash_account_id') or 1) == 1 else []) + ["Direct", "Check"]
     if selected_tx.get('type') == 'Savings Transfer': workflow_types.append('Savings Transfer')
+    if selected_tx.get('type') in ('AMZ Card','Direct','Check'):
+        workflow_types.append('Line of credit')
     if (selected_tx.get('type') == 'Direct' and selected_tx.get('direction') == 'Expense'
             and selected_tx.get('transfer_id') is None and not paid_week):
         workflow_types.append('Transfer')
@@ -1632,16 +1634,38 @@ def edit_transaction_dialog():
     if workflow_type == 'Transfer':
         convert_direct_to_savings_form(selected_tx)
         return
-    render_transaction_completion(selected_tx)
+    if workflow_type != 'Line of credit':
+        render_transaction_completion(selected_tx)
     if workflow_type == "Savings Transfer":
         savings_transfer_form("edit", selected_tx)
         return
 
-    direction = st.selectbox(
-        "Income / Expense", ["Expense", "Income"],
-        key="edit_direction", placeholder="Classify this transaction", disabled=bool(paid_week or budget_generated),
-    )
-    st.caption("Enter a positive amount. AMZ Card income represents a refund or card credit.")
+    credit_account_id = None
+    credit_side = None
+    credit_completed = False
+    if workflow_type == 'Line of credit':
+        accounts = sorted([a for a in load_budget_table('LedgerCreditAccounts') if a['active']],
+            key=lambda a:(a['name'].casefold(),str(a['id'])))
+        account_names = {a['id']:a['name'] for a in accounts}
+        credit_account_id = st.selectbox('Line of credit',list(account_names),index=None,
+            format_func=account_names.get,placeholder='Choose the credit account',
+            key='edit_convert_credit_account_'+str(selected_tx['id']))
+        credit_side = st.radio('Credit action',['Charge','Payment'],horizontal=True,
+            key='edit_convert_credit_action_'+str(selected_tx['id']))
+        st.caption('A charge increases this credit balance and is not a checking debit. '
+                   'A payment affects checking and reduces credit only when completed. The original transaction is reclassified; no duplicate is added.')
+        if credit_side == 'Payment':
+            credit_completed = st.checkbox('Payment already completed',
+                value=bool(selected_tx.get('completed_at') or selected_tx.get('check_cleared_at')),
+                key='edit_convert_credit_completed_'+str(selected_tx['id']),
+                help='Check only if the payment has already been made. Leave unchecked for a scheduled payment.')
+        direction = 'Expense'
+    else:
+        direction = st.selectbox(
+            "Income / Expense", ["Expense", "Income"],
+            key="edit_direction", placeholder="Classify this transaction", disabled=bool(paid_week or budget_generated),
+        )
+        st.caption("Enter a positive amount. AMZ Card income represents a refund or card credit.")
 
     amount = st.number_input(
         "Amount ($)",
@@ -1758,6 +1782,25 @@ def edit_transaction_dialog():
         if paid_week:
             updated_data = {k: updated_data[k] for k in ("merchant", "category", "description")}
         try:
+            if workflow_type == 'Line of credit':
+                if credit_account_id is None or amount <= 0:
+                    st.error('Choose a credit account and enter a positive amount.')
+                    return
+                payload=dict(credit_account_id=credit_account_id,credit_action=credit_side,
+                    amount=str(money(amount)),date=str(tx_date),time=build_time_string(tx_date,tx_time),
+                    merchant=final_merchant,category=final_category,description=description,
+                    completed=credit_completed)
+                response=conn.rpc('ledger_convert_transaction_to_credit',
+                    {'p_id':selected_tx['id'],'p_revision':selected_tx['check_revision'],'p_data':payload}).execute()
+                if response.data is not True:
+                    raise RuntimeError('Conversion was not confirmed. Reload before retrying.')
+                invalidate_edited_transaction(selected_tx)
+                st.session_state.pop('edit_loaded_tx_id',None)
+                st.session_state.pop('credit_snapshot',None)
+                st.session_state['credit_generation']=st.session_state.get('credit_generation',0)+1
+                st.success('Transaction converted to line of credit.')
+                st.rerun()
+                return
             update_res = (
                 conn
                 .table("Transactions")
@@ -3973,6 +4016,178 @@ def tax_render_payroll_forecast(job,prefix):
 
 
 
+def tax_ohio_bonus_withholding(bonus):
+    if bonus['estimate'].get('ohio_auto', False):
+        taxable = bonus['gross'] if bonus['ohio_taxable'] is None else bonus['ohio_taxable']
+        return (tax_amount(taxable) * Decimal('.0275')).quantize(Decimal('.01'), rounding=ROUND_HALF_UP)
+    return tax_amount(bonus['ohio_withheld'])
+
+
+def tax_projection_pdf(payload):
+    """A session-only PDF of current entries; never writes payroll documents or ledger records."""
+    from io import BytesIO
+    from html import escape as xml_escape
+    from reportlab.lib import colors
+    from pathlib import Path
+    import reportlab
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, PageBreak
+    p = tax_validate_inputs(payload, payload['tax_year'])
+    year=p['tax_year']; generated=datetime.now(LOCAL_TZ).strftime('%B %d, %Y at %H:%M Eastern')
+    stream=BytesIO(); navy=colors.HexColor('#00162b'); red=colors.HexColor('#d92f42')
+    fonts=Path(reportlab.__file__).resolve().parent/'fonts'
+    for name,file in [('LedgerPDF','Vera.ttf'),('LedgerPDFBold','VeraBd.ttf')]:
+        if name not in pdfmetrics.getRegisteredFontNames():pdfmetrics.registerFont(TTFont(name,str(fonts/file)))
+    styles=getSampleStyleSheet()
+    styles.add(ParagraphStyle(name='LedgerTitle',fontName='LedgerPDFBold',fontSize=19,leading=24,textColor=navy,spaceAfter=10))
+    styles.add(ParagraphStyle(name='LedgerSection',fontName='LedgerPDFBold',fontSize=11,leading=15,textColor=navy,spaceBefore=14,spaceAfter=7,keepWithNext=True))
+    styles.add(ParagraphStyle(name='LedgerBody',fontName='LedgerPDF',fontSize=9,leading=13,spaceAfter=7))
+    styles.add(ParagraphStyle(name='LedgerCell',fontName='LedgerPDF',fontSize=8,leading=11))
+    styles.add(ParagraphStyle(name='LedgerHead',fontName='LedgerPDFBold',fontSize=8,leading=11,textColor=colors.white))
+    story=[]
+    def text(value,style='LedgerBody'):
+        value=str(value).translate(str.maketrans({'\u2011':'-','\u2013':'-','\u2014':'-','\u2212':'-'}))
+        return Paragraph(xml_escape(value).replace('\n','<br/>'),styles[style])
+    def money(value): return '${:,.2f}'.format(tax_amount(value))
+    def flag(value): return 'Yes' if value else 'No'
+    def heading(value): story.append(text(value,'LedgerSection'))
+    def table(headers,rows,widths=None):
+        body=[[text(v,'LedgerHead') for v in headers]]+[[text(v,'LedgerCell') for v in row] for row in rows]
+        result=Table(body,colWidths=widths or [504/len(headers)]*len(headers),repeatRows=1,hAlign='LEFT')
+        result.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),navy),('VALIGN',(0,0),(-1,-1),'TOP'),
+            ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#f2f5f8')]),
+            ('LINEBELOW',(0,0),(-1,0),1.3,red),('LINEBELOW',(0,1),(-1,-1),.3,colors.HexColor('#cbd2da')),
+            ('LEFTPADDING',(0,0),(-1,-1),7),('RIGHTPADDING',(0,0),(-1,-1),7),
+            ('TOPPADDING',(0,0),(-1,-1),4.5),('BOTTOMPADDING',(0,0),(-1,-1),4.5)]))
+        story.append(result)
+    def pairs(rows): table(['Input / assumption','Value'],rows,[340,164])
+    result=None; issue=None
+    if p['reviewed']:
+        try: result=tax_calculate(p)
+        except ValueError as exc: issue=str(exc)
+    story.append(text('YEAR-END TAX PROJECTION','LedgerTitle'))
+    story.append(text(str(year)+' | Married filing jointly | Ohio full-year residents'))
+    story.append(text('Generated '+generated+'. Snapshot of current entries; may include unsaved changes.'))
+    story.append(text('Planning estimate - not a filed return. Federal and Ohio amounts are separate.'))
+    if year!=2026:
+        story.append(text('PROVISIONAL YEAR: this scenario uses 2026 federal planning rules and the current Ohio assumptions. '+str(year)+' rules have not been verified.'))
+    if result is None:
+        story.append(text('DRAFT - results unavailable. '+(issue or 'The scenario review checkbox has not been completed. Inputs are included below.')))
+    else:
+        heading('Projected results')
+        table(['Return','Projected tax','Payments / credits','Amount due / refund'],[
+            [name,money(result[k+'_tax']),money(result[k+'_payments']),
+             money(abs(result[k+'_balance']))+(' due' if result[k+'_balance']>=0 else ' refund')]
+            for name,k in [('Federal','federal'),('Ohio','ohio')]], [82,125,138,159])
+    heading('Bonus comparison')
+    comparison=[]
+    for include,label in [(False,'Without bonus'),(True,'With bonus')]:
+        try:
+            r=tax_calculate(p,include) if p['reviewed'] else None
+            comparison.append([label]+[money(abs(r[k+'_balance']))+(' due' if r[k+'_balance']>=0 else ' refund') if r else 'Draft - not reviewed' for k in ('federal','ohio')])
+        except ValueError:
+            comparison.append([label,'Unavailable - complete bonus / household settings','Unavailable'])
+    table(['Scenario','Federal result','Ohio result'],comparison,[130,187,187])
+    story.append(text('Bonus included in selected result: '+flag(p['bonus']['include'])+'. Withholding estimates are payments toward tax, not the final tax rate.'))
+    heading('Scope and assumptions')
+    story.append(text('Includes entered wages, traditional IRA distributions, ordinary bank interest, deductions, credits and payments. Regular Medicare and Social Security withholding are not income-tax payments. Municipal and school-district taxes, underpayment timing penalties, and income types outside this page are excluded.'))
+    story.append(text('Rules: '+TAX_RULES_VERSION+'. Ohio exemption amounts use the latest verified published 2025 table; verify updated assumptions before filing.'))
+    story.append(PageBreak())
+    heading('Household and deductions')
+    pairs([['Tax year',year],['Bill age at year end',p['bill_age'] if p['bill_age'] is not None else 'Not entered'],
+        ['Spouse age at year end',p['spouse_age'] if p['spouse_age'] is not None else 'Not entered'],
+        ['Bill / spouse qualifies as blind',flag(p['bill_blind'])+' / '+flag(p['spouse_blind'])],
+        ['Federal deduction choice',p['deduction_choice']],['Allowed itemized deductions',money(p['allowed_itemized'])],
+        ['Itemized state/local tax portion',money(p['itemized_salt_addback'])],['Eligible Ohio dependents (excludes spouses)',p['ohio_dependents']],
+        ['Scenario review completed',flag(p['reviewed'])]])
+    payroll_fields=[('Federal taxable wages','federal_wages'),('Federal income tax withheld','federal_withheld'),
+        ('Ohio taxable wages','ohio_wages'),('Ohio income tax withheld','ohio_withheld'),('Medicare wages','medicare_wages')]
+    for job in p['jobs']:
+        heading(job['person']+' - payroll projection')
+        story.append(text('Paystub date: '+job['as_of']+'. Remaining paychecks: '+str(job['remaining_checks'])+'.'))
+        rows=[];n=job['remaining_checks']
+        for label,key in payroll_fields:
+            ytd=tax_amount(job[key+'_ytd']);per=tax_amount(job[key+'_per_check'])
+            rows.append([label,money(ytd),money(per),money(n*per),money(ytd+n*per)])
+        ytd=tax_amount(job['additional_medicare_withheld_ytd']);left=tax_amount(job['additional_medicare_withheld_remaining'])
+        rows.append(['Additional Medicare withheld',money(ytd),'Not averaged',money(left),money(ytd+left)])
+        table(['Payroll field','YTD','Per remaining check','Remaining total','Annual total'],rows,[144,90,90,90,90])
+        forecast=job['forecast']
+        received=forecast['checks_received']
+        pairs([['Regular checks represented by YTD',received if received is not None else 'Not entered'],
+               ['YTD estimate previously applied',flag(bool(forecast['applied_basis']))]])
+        if forecast['applied_basis'] and forecast['applied_basis']!=tax_forecast_basis(job):
+            story.append(text('Review needed: the last applied remaining-pay estimate has an older basis. The report uses the per-check inputs currently entered, not a newly calculated average.'))
+        excluded=[[label,money(forecast['excluded'][key+'_ytd'])] for label,key in payroll_fields]
+        table(['One-off amount excluded from regular-pay average','Amount'],excluded,[340,164])
+        story.append(text('Exclusions above remain part of YTD annual income/withholding. They are removed only from the regular-pay average.'))
+    story.append(PageBreak())
+    heading('Traditional IRA withdrawals')
+    if not p['ira']: story.append(text('No IRA withdrawal rows entered.'))
+    for index,row in enumerate(p['ira'],1):
+        heading('Withdrawal '+str(index)+' - '+row['date'])
+        pairs([['Gross / taxable distribution',money(row['gross'])+' / '+money(row['taxable'])],
+            ['Federal / Ohio withholding',money(row['federal_withheld'])+' / '+money(row['ohio_withheld'])],
+            ['Early-distribution taxable amount',money(row['early_taxable'])],['Amount covered by verified exception',money(row['exception_amount'])],
+            ['Estimated future withdrawal',flag(row['estimated'])]])
+        if row['exception_reason']:story.append(text('Exception explanation: '+row['exception_reason']))
+    heading('Optional year-end bonus')
+    b=p['bonus'];e=b['estimate'];amounts=tax_bonus_withholding(b)
+    pairs([['Include / recipient',flag(b['include'])+' / '+b['person']],['Gross bonus',money(b['gross'])],
+        ['Federal / Ohio / Medicare taxable portions',' / '.join(money(b['gross'] if b[k] is None else b[k]) for k in ('federal_taxable','ohio_taxable','medicare_taxable'))],
+        ['Federal automatic estimate',flag(e['federal_auto'])],['Employer flat-method eligibility confirmed',flag(e['flat_eligible'])],
+        ['Prior supplemental wages (threshold only)',money(e['prior_supplemental'])],['Federal withholding used',money(amounts['federal'])],
+        ['Ohio automatic estimate (2.75%)',flag(e.get('ohio_auto',False))],['Ohio withholding used',money(tax_ohio_bonus_withholding(b))],
+        ['Medicare automatic estimate',flag(e['medicare_auto'])],['Prior same-employer Medicare wages (threshold only)',money(e['medicare_before'])],
+        ['Regular Medicare withholding (not income-tax payment)',money(amounts['regular_medicare'])],
+        ['Additional Medicare withholding used',money(amounts['additional_medicare'])]])
+    if e['federal_auto'] and not e['flat_eligible']:
+        story.append(text('Federal bonus estimate is unconfirmed; it is not used in an included-bonus result until eligibility is confirmed or manual withholding is chosen.'))
+    story.append(text('Ohio automatic withholding uses 2.75% of the Ohio-taxable bonus. For years after 2026 this is a provisional assumption. Local and school-district withholding are not included.'))
+    pairs([['Retained manual federal withholding',money(b['federal_withheld'])],['Retained manual Ohio withholding',money(b['ohio_withheld'])],
+        ['Retained manual regular Medicare withholding',money(e['regular_medicare_manual'])],
+        ['Retained manual Additional Medicare withholding',money(b['additional_medicare_withheld'])]])
+    heading('Interest, adjustments, credits and payments')
+    fields=[('interest','Taxable bank interest'),('interest_federal_withheld','Federal withholding on interest'),
+        ('interest_ohio_withheld','Ohio withholding on interest'),('federal_adjustments','Federal adjustments to income'),
+        ('other_federal_deductions','Other federal deductions'),('standard_cash_charity','Eligible cash charity with standard deduction'),
+        ('ohio_additions','Ohio additions'),('ohio_deductions','Ohio deductions'),
+        ('federal_nonrefundable_credits','Federal nonrefundable credits'),('federal_refundable_credits','Federal refundable credits'),
+        ('other_federal_taxes','Other federal taxes'),('ohio_credits_before_joint','Ohio credits before joint filing credit'),
+        ('ohio_credits_after_joint','Ohio credits after joint filing credit'),('ohio_refundable_credits','Ohio refundable credits'),
+        ('federal_estimated_paid','Federal estimated payments already paid'),('federal_estimated_planned','Federal estimated payments planned'),
+        ('ohio_estimated_paid','Ohio estimated payments already paid'),('ohio_estimated_planned','Ohio estimated payments planned')]
+    pairs([[label,money(p[key])] for key,label in fields])
+    if result:
+        heading('Calculation detail')
+        detail=[('agi','Federal adjusted gross income'),('deduction','Selected standard / itemized deduction'),
+            ('senior_deduction','Enhanced senior deduction'),('taxable_income','Federal taxable income'),
+            ('regular_federal','Regular federal income tax'),('amt','Alternative minimum tax'),('early_tax','IRA early-withdrawal additional tax'),
+            ('additional_medicare','Additional Medicare tax'),('niit','Net investment income tax on interest'),
+            ('ohio_agi','Ohio adjusted gross income'),('ohio_exemptions','Ohio exemptions'),('ohio_taxable','Ohio taxable income'),
+            ('ohio_base','Ohio tax before credits'),('ohio_joint_credit','Ohio joint filing credit'),
+            ('federal_withheld','Federal withholding including Additional Medicare'),('ohio_withheld','Ohio withholding')]
+        pairs([[label,money(result[key])] for key,label in detail])
+    heading('Projection notes')
+    story.append(text(p['notes'] or 'No notes entered.'))
+    heading('References')
+    for title,url in [('IRS employer withholding guidance','https://www.irs.gov/publications/p15'),
+        ('Ohio employer withholding','https://tax.ohio.gov/business/employer-withholding'),
+        ('Ohio supplemental compensation rule','https://codes.ohio.gov/ohio-administrative-code/rule-5703-7-10')]:
+        story.append(text(title+': '+url))
+    def footer(canvas,doc):
+        canvas.saveState();canvas.setStrokeColor(red);canvas.line(54,43,558,43)
+        canvas.setFont('LedgerPDF',8);canvas.setFillColor(navy)
+        canvas.drawString(54,30,str(year)+' tax planning | '+('Draft' if result is None else 'Projection')+' | Current entries')
+        canvas.drawRightString(558,30,'Page '+str(doc.page));canvas.restoreState()
+    SimpleDocTemplate(stream,pagesize=letter,leftMargin=54,rightMargin=54,topMargin=45,bottomMargin=58,
+        title=str(year)+' Year-End Tax Projection',author='Financial Ledger').build(story,onFirstPage=footer,onLaterPages=footer)
+    return stream.getvalue()
+
+
 def tax_default_inputs(year):
     def job(person):
         return dict(person=person, as_of=f'{year}-01-01', federal_wages_ytd='0', ohio_wages_ytd='0',
@@ -3984,7 +4199,7 @@ def tax_default_inputs(year):
         bill_age=52 if year == 2026 else None, spouse_age=None, bill_blind=False, spouse_blind=False,
         jobs=[job('Bill'), job('Spouse')], ira=[],
         bonus=dict(include=False, person='Bill', gross='0', federal_withheld='0', ohio_withheld='0',
-                   additional_medicare_withheld='0', federal_taxable=None, ohio_taxable=None, medicare_taxable=None, estimate=dict(federal_auto=False, medicare_auto=False, flat_eligible=False, prior_supplemental='0', medicare_before='0', regular_medicare_manual='0')),
+                   additional_medicare_withheld='0', federal_taxable=None, ohio_taxable=None, medicare_taxable=None, estimate=dict(ohio_auto=False, federal_auto=False, medicare_auto=False, flat_eligible=False, prior_supplemental='0', medicare_before='0', regular_medicare_manual='0')),
         interest='0', interest_federal_withheld='0', interest_ohio_withheld='0',
         federal_adjustments='0', ohio_additions='0', ohio_deductions='0', ohio_dependents=0,
         deduction_choice='Standard', allowed_itemized='0', itemized_salt_addback='0',
@@ -4018,6 +4233,8 @@ def tax_validate_inputs(payload, year):
     payload = deepcopy(payload)
     if isinstance(payload.get('bonus'),dict) and 'estimate' not in payload['bonus']:
         payload['bonus']['estimate'] = deepcopy(tax_default_inputs(year)['bonus']['estimate'])
+    if isinstance(payload.get('bonus'),dict) and isinstance(payload['bonus'].get('estimate'),dict):
+        payload['bonus']['estimate'].setdefault('ohio_auto', False)
     if isinstance(payload.get('jobs'),list):
         for job in payload['jobs']:
             if isinstance(job,dict) and 'forecast' not in job:
@@ -4072,7 +4289,7 @@ def tax_validate_inputs(payload, year):
     estimates=bonus['estimate']
     if not isinstance(estimates,dict) or set(estimates)!=set(defaults['bonus']['estimate']):
         raise ValueError('The bonus estimate settings are incomplete.')
-    for key in ('federal_auto','medicare_auto','flat_eligible'):
+    for key in ('federal_auto','medicare_auto','ohio_auto','flat_eligible'):
         if type(estimates[key]) is not bool: raise ValueError('Choose a valid bonus estimate setting.')
     for key in ('prior_supplemental','medicare_before','regular_medicare_manual'):
         estimates[key]=str(tax_amount(estimates[key],key.replace('_',' ')))
@@ -4083,7 +4300,7 @@ def tax_validate_inputs(payload, year):
         if key.endswith('_taxable') and tax_amount(bonus[key]) > tax_amount(bonus['gross']):
             raise ValueError('Taxable bonus amounts cannot exceed the gross bonus.')
     effective=tax_bonus_withholding(bonus)
-    if effective['federal']+tax_amount(bonus['ohio_withheld'])+effective['additional_medicare']+effective['regular_medicare'] > tax_amount(bonus['gross']):
+    if effective['federal']+tax_ohio_bonus_withholding(bonus)+effective['additional_medicare']+effective['regular_medicare'] > tax_amount(bonus['gross']):
         raise ValueError('Bonus withholding cannot exceed the gross bonus.')
     if not isinstance(clean['ira'], list) or len(clean['ira']) > 200:
         raise ValueError('Use no more than 200 IRA withdrawal rows per tax year.')
@@ -4183,6 +4400,7 @@ def tax_calculate(payload, include_bonus=None):
     bonus_estimate=tax_bonus_withholding(bonus)
     bonus['federal_withheld']=str(bonus_estimate['federal'])
     bonus['additional_medicare_withheld']=str(bonus_estimate['additional_medicare'])
+    bonus['ohio_withheld']=str(tax_ohio_bonus_withholding(bonus))
     if use_bonus:
         gross = tax_amount(bonus['gross'])
         bonus_wage = lambda field: gross if bonus[field] is None else tax_amount(bonus[field])
@@ -4841,7 +5059,16 @@ def render_tax_projection_page():
                 help='Include earlier bonuses and other supplemental wages, including those from commonly controlled employers where applicable. This is a threshold input only; do not add it to income again.')
         else:
             bonus['federal_withheld']=tax_money_input('Expected federal income tax withholding ($)',old['federal_withheld'],prefix+'bonus_federal_withheld')
-        bonus['ohio_withheld']=tax_money_input('Expected Ohio withholding ($)',old['ohio_withheld'],prefix+'bonus_ohio_withheld')
+        st.markdown('**Ohio income tax withholding**')
+        settings['ohio_auto']=st.toggle('Estimate Ohio bonus withholding',value=previous['ohio_auto'],key=prefix+'bonus_ohio_auto')
+        if settings['ohio_auto']:
+            st.caption('Estimates 2.75% of the Ohio-taxable bonus. This is withholding, not the final tax rate; local and school-district taxes are separate. Turn this off to enter a manual amount.')
+            if year != 2026:
+                st.info('The Ohio bonus withholding rate for this future-year scenario uses the provisional 2026 assumption of 2.75%.')
+            st.metric('Bonus Ohio withholding', f'${tax_ohio_bonus_withholding(bonus):,.2f}')
+        else:
+            bonus['ohio_withheld']=tax_money_input('Expected Ohio withholding ($)',old['ohio_withheld'],prefix+'bonus_ohio_withheld')
+        st.markdown('[Ohio bonus withholding guidance](https://tax.ohio.gov/business/employer-withholding)')
         st.markdown('**Medicare withholding**')
         settings['medicare_auto']=st.toggle('Estimate Medicare bonus withholding',value=previous['medicare_auto'],key=prefix+'bonus_medicare_auto')
         if settings['medicare_auto']:
@@ -4859,7 +5086,7 @@ def render_tax_projection_page():
         b.metric('Bonus regular Medicare',f'${estimate["regular_medicare"]:,.2f}')
         c.metric('Bonus Additional Medicare',f'${estimate["additional_medicare"]:,.2f}')
         st.caption('Regular Medicare is informational and is not credited against income tax. '
-                   'Turn either estimate off to enter a manual override; your previous manual entries are retained. '
+                   'Turn an estimate off to enter a manual override; your previous manual entries are retained. '
                    'Only a checked Include year-end bonus adds bonus wages and withholding to the projection.')
         st.markdown('[IRS supplemental wage methods](https://www.irs.gov/publications/p15) · '
                     '[IRS Medicare withholding](https://www.irs.gov/taxtopics/tc751)')
@@ -4924,7 +5151,16 @@ def render_tax_projection_page():
             save_feedback.success('Projection inputs saved for '+str(year)+'. Ledger balances and transactions are unchanged.')
         except Exception:
             save_feedback.error('Projection inputs were not saved. Another session may have changed them; reload saved inputs before retrying.')
-    st.download_button('Download projection snapshot',
+    st.caption('The PDF contains the current entered inputs and results for this tax year, including unsaved changes. Downloading does not save the projection.')
+    try:
+        import reportlab
+    except ImportError:
+        st.warning('PDF download needs the updated requirements.txt. Install it and restart the hosted app. JSON export remains available below.')
+    else:
+        pdf_inputs = deepcopy(clean)
+        st.download_button('Download projection PDF',data=lambda:tax_projection_pdf(pdf_inputs),
+            file_name=f'tax_projection_{year}.pdf',mime='application/pdf',key=prefix+'download_pdf',on_click='ignore')
+    st.download_button('Download projection data (JSON)',
         data=json.dumps(dict(tax_year=year,rules_version=TAX_RULES_VERSION,inputs=clean,result=result),indent=2,default=str),
         file_name=f'tax_projection_{year}.json',mime='application/json',key=prefix+'download')
     with st.expander('Calculation scope and official references'):
@@ -5518,31 +5754,82 @@ def render_credit_profile_controls(account, entries, generation):
                 p_balance=str(money(corrected)), p_note=correction_note))
 
 
+def credit_entries_html(entries, account_name, reviewed):
+    css = '''<style>
+    .credit-entry-table{overflow-x:auto;font-family:inherit}
+    .credit-entry-table table{width:100%;border-collapse:collapse;font-size:13px;line-height:18px;color:inherit}
+    .credit-entry-table th,.credit-entry-table td{border:1px solid color-mix(in srgb,currentColor 28%,transparent);padding:4px 8px;height:34px;box-sizing:border-box;text-align:left;white-space:nowrap}
+    .credit-entry-table th{background:color-mix(in srgb,currentColor 7%,transparent);font-weight:700}
+    .credit-entry-table tbody tr:nth-child(even){background:color-mix(in srgb,currentColor 3%,transparent)}
+    .credit-entry-table .amount{text-align:right;font-variant-numeric:tabular-nums}
+    .credit-entry-table button{font:inherit;background:transparent;color:inherit;border:0;border-radius:0;padding:0;cursor:pointer;text-decoration:underline;text-underline-offset:3px}
+    .credit-entry-table button:focus-visible{outline:2px solid #287cdb;outline-offset:3px}
+    .credit-entry-table tr.credit-entry-reviewed>td{background:#b9e5c3!important;color:#17221a!important}
+    </style>'''
+    parts=[css,'<div class="credit-account-table credit-entry-table"><table><thead><tr>']
+    columns=['Date','Account','Action','Amount','Merchant','Category','Status']
+    parts.extend('<th>'+escape(name)+'</th>' for name in columns)
+    parts.append('</tr></thead><tbody>')
+    for row in entries:
+        signature=review_signature(row);marked=signature in reviewed
+        label='ID '+str(row['id'])+' - '+str(row.get('merchant') or account_name)
+        day=str(row['date'])[:10]
+        amount=f"${money(row['amount']):,.2f}"
+        status=('Applied' if row.get('credit_action')=='Charge' or row.get('credit_applied_at')
+                or row.get('federal_loan_applied_at') else 'Scheduled')
+        cells=[f'<button type="button" data-review="{signature}" aria-pressed="{str(marked).lower()}" '
+               f'aria-label="{escape("Toggle reviewed entry "+label,quote=True)}" title="Toggle green review marker">{escape(day)}</button>',
+               escape(account_name),escape(row.get('credit_action') or 'Loan payment'),
+               f'<button type="button" data-transaction="{int(row["id"])}" '
+               f'aria-label="{escape("Edit credit transaction "+label,quote=True)}" title="Edit this transaction">{amount}</button>',
+               escape(str(row.get('merchant') or '')),escape(str(row.get('category') or '')),status]
+        parts.append('<tr'+(' class="credit-entry-reviewed"' if marked else '')+'>')
+        parts.extend('<td'+(' class="amount"' if i==3 else '')+'>'+value+'</td>' for i,value in enumerate(cells))
+        parts.append('</tr>')
+    parts.append('</tbody></table></div>')
+    return appearance_markup(''.join(parts),'credit')
+
 def render_credit_entries(entries, account_key, account_name):
     st.subheader('Dated debt entries')
-    ordered = sorted(entries,key=lambda e:int(e['id']),reverse=True)
+    ordered=sorted(entries,key=lambda row:int(row['id']),reverse=True)
     if not ordered:
         st.info('No dated entries for this account.')
-
-    st.html(themed_table_html([{'Date':r['date'],
-        'Account':account_name,
-        'Action':r.get('credit_action') or 'Loan payment','Amount':float(money(r['amount'])),
-        'Merchant':r['merchant'],'Category':r['category'],
-        'Status':'Applied' if r.get('credit_action')=='Charge' or r.get('credit_applied_at')
-            or r.get('federal_loan_applied_at')
-            else 'Scheduled'} for r in ordered], ['Amount']))
-    choice = st.selectbox('Credit entry to edit',ordered, index=0 if ordered else None,
-        format_func=lambda r: str(r['date'])+' · '+account_name+
-            ' · '+(r.get('credit_action') or 'Loan payment')+' · $'+str(money(r['amount'])))
-    if st.button('Edit selected credit entry',disabled=not ordered):
-        st.session_state['credit_edit_id_' + account_key] = choice['id']
-    selected_edit = next((r for r in ordered
-        if r['id'] == st.session_state.get('credit_edit_id_' + account_key)), None)
-    if selected_edit is not None:
-        if selected_edit.get('federal_loan_id') is not None:
-            edit_federal_loan_payment_form(selected_edit)
+        return
+    marker_key='reviewed_credit_entries_'+account_key
+    valid={review_signature(row):row for row in ordered}
+    reviewed=set(st.session_state.get(marker_key,[])) & set(valid)
+    st.session_state[marker_key]=sorted(reviewed)
+    st.caption('Click Amount to edit that transaction below. Click Date to toggle its green review marker. '
+               'Review markers last for this signed-in session and do not complete payments or change balances. '
+               'Changed entries need review again. Tab to a date or amount and press Enter or Space.')
+    event=ledger_interaction(data={'html':credit_entries_html(ordered,account_name,reviewed)},
+        key='credit_entries_'+account_key,on_action_change=lambda:None).action
+    if isinstance(event,dict) and event.get('review') in valid:
+        reviewed.symmetric_difference_update({event['review']})
+        st.session_state[marker_key]=sorted(reviewed)
+        try: st.rerun(scope='fragment')
+        except st.errors.StreamlitAPIException: st.rerun()
+    elif isinstance(event,dict) and event.get('id') is not None:
+        selected=next((r for r in ordered if str(r['id'])==str(event['id'])),None)
+        if selected is None:
+            st.error('This transaction changed. Reload the account before editing.')
         else:
-            edit_credit_transaction_form(selected_edit)
+            st.session_state['credit_edit_id_'+account_key]=selected['id']
+            st.session_state['credit_entry_choice_'+account_key]=selected
+    choice=st.selectbox('Credit entry to edit',ordered,
+        key='credit_entry_choice_'+account_key,
+        format_func=lambda r:str(r['date'])+' - '+account_name+' - '+(r.get('credit_action') or 'Loan payment')+' - $'+str(money(r['amount'])))
+    if st.button('Edit selected credit entry',key='credit_entry_choose_'+account_key):
+        st.session_state['credit_edit_id_'+account_key]=choice['id']
+    selected=next((r for r in ordered if r['id']==st.session_state.get('credit_edit_id_'+account_key)),None)
+    if selected is not None:
+        st.caption('Editing entry ID '+str(selected['id'])+' dated '+str(selected['date'])[:10]+'.')
+        if st.button('Close entry editor',key='credit_entry_close_'+account_key):
+            st.session_state.pop('credit_edit_id_'+account_key,None)
+        elif selected.get('federal_loan_id') is not None:
+            edit_federal_loan_payment_form(selected)
+        else:
+            edit_credit_transaction_form(selected)
 
 
 def render_credit_account_history(account, target):
